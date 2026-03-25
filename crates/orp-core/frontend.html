@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ORP — Open Reality Protocol</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #e0e0e0; height: 100vh; overflow: hidden; }
+  .app { display: grid; grid-template-rows: 48px 1fr 36px; height: 100vh; }
+
+  /* Header */
+  .header { background: #111827; border-bottom: 1px solid #1f2937; display: flex; align-items: center; padding: 0 16px; justify-content: space-between; }
+  .header h1 { font-size: 18px; font-weight: 700; color: #60a5fa; }
+  .header .stats { font-size: 12px; color: #9ca3af; display: flex; gap: 16px; }
+  .header .stat-value { color: #60a5fa; font-weight: 600; }
+
+  /* Main content */
+  .main { display: grid; grid-template-columns: 280px 1fr 320px; overflow: hidden; }
+
+  /* Sidebar */
+  .sidebar { background: #111827; border-right: 1px solid #1f2937; overflow-y: auto; padding: 12px; }
+  .sidebar h2 { font-size: 13px; text-transform: uppercase; color: #6b7280; margin-bottom: 8px; letter-spacing: 0.5px; }
+  .sidebar .section { margin-bottom: 16px; }
+
+  /* Query bar */
+  .query-bar { padding: 8px 0; }
+  .query-bar input { width: 100%; padding: 8px 12px; background: #1f2937; border: 1px solid #374151; border-radius: 6px; color: #e0e0e0; font-size: 13px; outline: none; }
+  .query-bar input:focus { border-color: #60a5fa; }
+  .query-bar button { width: 100%; margin-top: 6px; padding: 7px; background: #2563eb; border: none; border-radius: 6px; color: white; font-size: 13px; cursor: pointer; font-weight: 500; }
+  .query-bar button:hover { background: #1d4ed8; }
+
+  /* Entity list */
+  .entity-item { padding: 8px; border-radius: 6px; cursor: pointer; margin-bottom: 4px; font-size: 13px; transition: background 0.15s; }
+  .entity-item:hover { background: #1f2937; }
+  .entity-item.selected { background: #1e3a5f; border: 1px solid #2563eb; }
+  .entity-item .name { font-weight: 500; }
+  .entity-item .meta { font-size: 11px; color: #6b7280; margin-top: 2px; }
+  .entity-type-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; text-transform: uppercase; }
+  .type-ship { background: #1e3a5f; color: #60a5fa; }
+  .type-port { background: #1a3a2a; color: #34d399; }
+
+  /* Map */
+  .map-container { position: relative; background: #0d1117; }
+  .map-canvas { width: 100%; height: 100%; }
+  #map { width: 100%; height: 100%; background: #0d1117; }
+
+  /* Inspector */
+  .inspector { background: #111827; border-left: 1px solid #1f2937; overflow-y: auto; padding: 12px; }
+  .inspector h2 { font-size: 14px; margin-bottom: 8px; color: #60a5fa; }
+  .inspector .empty { display: flex; align-items: center; justify-content: center; height: 100%; color: #6b7280; font-size: 13px; }
+  .prop-table { width: 100%; font-size: 12px; }
+  .prop-table td { padding: 4px 6px; border-bottom: 1px solid #1f2937; }
+  .prop-table .key { color: #9ca3af; width: 40%; }
+  .prop-table .value { color: #e0e0e0; font-family: monospace; }
+
+  /* Status bar */
+  .statusbar { background: #111827; border-top: 1px solid #1f2937; display: flex; align-items: center; padding: 0 16px; font-size: 11px; color: #6b7280; gap: 16px; }
+  .status-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
+  .status-dot.green { background: #34d399; }
+  .status-dot.yellow { background: #fbbf24; }
+
+  /* Query results */
+  .query-results { margin-top: 8px; max-height: 200px; overflow-y: auto; }
+  .query-results table { width: 100%; font-size: 11px; border-collapse: collapse; }
+  .query-results th, .query-results td { padding: 4px 6px; border-bottom: 1px solid #1f2937; text-align: left; }
+  .query-results th { color: #9ca3af; background: #0d1117; position: sticky; top: 0; }
+
+  /* Alert feed */
+  .alert-item { padding: 6px 8px; border-radius: 4px; margin-bottom: 4px; font-size: 12px; background: #1f2937; border-left: 3px solid #fbbf24; }
+  .alert-item.critical { border-left-color: #ef4444; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <h1>⬡ ORP — Open Reality Protocol</h1>
+    <div class="stats">
+      <span>Entities: <span class="stat-value" id="entity-count">0</span></span>
+      <span>Events: <span class="stat-value" id="event-count">0</span></span>
+      <span>Uptime: <span class="stat-value" id="uptime">--</span></span>
+    </div>
+  </div>
+
+  <div class="main">
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <div class="section">
+        <h2>🔍 Query</h2>
+        <div class="query-bar">
+          <input type="text" id="query-input" placeholder='MATCH (s:Ship) WHERE s.speed > 15 RETURN s.id, s.name, s.speed' />
+          <button onclick="executeQuery()">Execute Query</button>
+        </div>
+        <div class="query-results" id="query-results"></div>
+      </div>
+
+      <div class="section">
+        <h2>🚢 Entities</h2>
+        <div id="entity-list"></div>
+      </div>
+
+      <div class="section">
+        <h2>⚠️ Alerts</h2>
+        <div id="alert-feed">
+          <div class="alert-item">System started — demo mode active</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Map -->
+    <div class="map-container">
+      <canvas id="map"></canvas>
+    </div>
+
+    <!-- Inspector -->
+    <div class="inspector">
+      <div class="empty" id="inspector-empty">Select an entity to inspect</div>
+      <div id="inspector-content" style="display:none;">
+        <h2 id="inspector-name">Entity</h2>
+        <p style="font-size:12px;color:#6b7280;margin-bottom:12px;" id="inspector-type"></p>
+        <h3 style="font-size:12px;color:#9ca3af;margin-bottom:4px;">Properties</h3>
+        <table class="prop-table" id="inspector-props"></table>
+        <h3 style="font-size:12px;color:#9ca3af;margin:12px 0 4px;">Position</h3>
+        <table class="prop-table" id="inspector-geo"></table>
+      </div>
+    </div>
+  </div>
+
+  <div class="statusbar">
+    <span><span class="status-dot green"></span> DuckDB: healthy</span>
+    <span><span class="status-dot green"></span> Stream: running</span>
+    <span><span class="status-dot green"></span> API: ready</span>
+    <span style="margin-left:auto;">ORP v0.1.0 — localhost:9090</span>
+  </div>
+</div>
+
+<script>
+let entities = [];
+let selectedEntity = null;
+let ws = null;
+const startTime = Date.now();
+
+// Fetch entities
+async function fetchEntities() {
+  try {
+    const resp = await fetch('/api/v1/entities?type=ship&limit=50');
+    const data = await resp.json();
+    if (data.data) {
+      entities = data.data;
+      document.getElementById('entity-count').textContent = data.pagination?.total_count || entities.length;
+      renderEntityList();
+      renderMap();
+    }
+    // Also fetch ports
+    const portResp = await fetch('/api/v1/entities?type=Port&limit=50');
+    const portData = await portResp.json();
+    if (portData.data) {
+      entities = entities.concat(portData.data);
+      document.getElementById('entity-count').textContent = entities.length;
+      renderEntityList();
+      renderMap();
+    }
+  } catch (e) {
+    console.error('Fetch error:', e);
+  }
+}
+
+function renderEntityList() {
+  const list = document.getElementById('entity-list');
+  list.innerHTML = entities.slice(0, 30).map(e => {
+    const typeClass = e.type === 'Ship' ? 'type-ship' : e.type === 'Port' ? 'type-port' : '';
+    const sel = selectedEntity?.id === e.id ? 'selected' : '';
+    const speed = e.properties?.speed ? ` • ${Number(e.properties.speed).toFixed(1)} kn` : '';
+    return `<div class="entity-item ${sel}" onclick="selectEntity('${e.id}')">
+      <span class="entity-type-badge ${typeClass}">${e.type}</span>
+      <span class="name"> ${e.name || e.id}</span>
+      <div class="meta">${e.id}${speed}</div>
+    </div>`;
+  }).join('');
+}
+
+function selectEntity(id) {
+  selectedEntity = entities.find(e => e.id === id);
+  renderEntityList();
+  renderInspector();
+  renderMap();
+}
+
+function renderInspector() {
+  if (!selectedEntity) {
+    document.getElementById('inspector-empty').style.display = 'flex';
+    document.getElementById('inspector-content').style.display = 'none';
+    return;
+  }
+  document.getElementById('inspector-empty').style.display = 'none';
+  document.getElementById('inspector-content').style.display = 'block';
+  document.getElementById('inspector-name').textContent = selectedEntity.name || selectedEntity.id;
+  document.getElementById('inspector-type').textContent = `${selectedEntity.type} • ${selectedEntity.id}`;
+
+  const propsTable = document.getElementById('inspector-props');
+  propsTable.innerHTML = Object.entries(selectedEntity.properties || {}).map(([k, v]) =>
+    `<tr><td class="key">${k}</td><td class="value">${typeof v === 'object' ? JSON.stringify(v) : v}</td></tr>`
+  ).join('');
+
+  const geoTable = document.getElementById('inspector-geo');
+  if (selectedEntity.geometry) {
+    const [lon, lat] = selectedEntity.geometry.coordinates;
+    geoTable.innerHTML = `
+      <tr><td class="key">Latitude</td><td class="value">${lat.toFixed(4)}</td></tr>
+      <tr><td class="key">Longitude</td><td class="value">${lon.toFixed(4)}</td></tr>`;
+  } else {
+    geoTable.innerHTML = '<tr><td class="key" colspan="2">No position data</td></tr>';
+  }
+}
+
+function renderMap() {
+  const canvas = document.getElementById('map');
+  const ctx = canvas.getContext('2d');
+  canvas.width = canvas.parentElement.clientWidth;
+  canvas.height = canvas.parentElement.clientHeight;
+
+  // Map bounds (North Sea / Europe)
+  const bounds = { minLat: 48, maxLat: 56, minLon: -5, maxLon: 12 };
+
+  function project(lon, lat) {
+    const x = ((lon - bounds.minLon) / (bounds.maxLon - bounds.minLon)) * canvas.width;
+    const y = (1 - (lat - bounds.minLat) / (bounds.maxLat - bounds.minLat)) * canvas.height;
+    return [x, y];
+  }
+
+  // Background
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Grid
+  ctx.strokeStyle = '#1f2937';
+  ctx.lineWidth = 0.5;
+  for (let lat = bounds.minLat; lat <= bounds.maxLat; lat += 1) {
+    const [, y] = project(0, lat);
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+  }
+  for (let lon = bounds.minLon; lon <= bounds.maxLon; lon += 1) {
+    const [x, ] = project(lon, 0);
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+  }
+
+  // Draw entities
+  entities.forEach(e => {
+    if (!e.geometry) return;
+    const [lon, lat] = e.geometry.coordinates;
+    const [x, y] = project(lon, lat);
+
+    if (e.type === 'Port') {
+      ctx.fillStyle = '#34d399';
+      ctx.beginPath();
+      ctx.arc(x, y, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#34d399';
+      ctx.font = '10px sans-serif';
+      ctx.fillText(e.name || '', x + 8, y + 3);
+    } else if (e.type === 'Ship' || e.type === 'ship') {
+      const isSelected = selectedEntity?.id === e.id;
+      ctx.fillStyle = isSelected ? '#ef4444' : '#60a5fa';
+      const size = isSelected ? 6 : 4;
+
+      // Draw ship as triangle
+      const course = (e.properties?.course || 0) * Math.PI / 180;
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(course);
+      ctx.beginPath();
+      ctx.moveTo(0, -size * 1.5);
+      ctx.lineTo(-size, size);
+      ctx.lineTo(size, size);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+
+      if (isSelected) {
+        ctx.strokeStyle = '#ef4444';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(x, y, 12, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '11px sans-serif';
+        ctx.fillText(e.name || e.id, x + 14, y + 3);
+      }
+    }
+  });
+
+  // Legend
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '11px sans-serif';
+  ctx.fillText('▲ Ships  ● Ports', 10, canvas.height - 10);
+}
+
+async function executeQuery() {
+  const input = document.getElementById('query-input');
+  const query = input.value.trim();
+  if (!query) return;
+
+  try {
+    const resp = await fetch('/api/v1/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query }),
+    });
+    const data = await resp.json();
+
+    const resultsDiv = document.getElementById('query-results');
+    if (data.status === 'success' && data.results?.length > 0) {
+      const cols = Object.keys(data.results[0]);
+      resultsDiv.innerHTML = `<table>
+        <tr>${cols.map(c => `<th>${c}</th>`).join('')}</tr>
+        ${data.results.slice(0, 20).map(row =>
+          `<tr>${cols.map(c => `<td>${typeof row[c] === 'object' ? JSON.stringify(row[c]) : (row[c] ?? '')}</td>`).join('')}</tr>`
+        ).join('')}
+      </table>
+      <div style="font-size:10px;color:#6b7280;margin-top:4px;">${data.metadata?.rows_returned} rows in ${data.metadata?.execution_time_ms?.toFixed(1)}ms</div>`;
+    } else {
+      resultsDiv.innerHTML = `<div style="color:#ef4444;font-size:12px;padding:8px;">${data.error?.message || 'No results'}</div>`;
+    }
+  } catch (e) {
+    document.getElementById('query-results').innerHTML = `<div style="color:#ef4444;font-size:12px;padding:8px;">Error: ${e.message}</div>`;
+  }
+}
+
+// Update uptime
+setInterval(() => {
+  const sec = Math.floor((Date.now() - startTime) / 1000);
+  const min = Math.floor(sec / 60);
+  const hr = Math.floor(min / 60);
+  document.getElementById('uptime').textContent = hr > 0 ? `${hr}h ${min%60}m` : `${min}m ${sec%60}s`;
+}, 1000);
+
+// WebSocket for real-time updates
+function connectWS() {
+  ws = new WebSocket(`ws://${location.host}/ws/updates`);
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'subscribe', id: 'sub-1', data: { entity_type: 'ship' } }));
+  };
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'entity_update') {
+      // Update entity in local list
+      const idx = entities.findIndex(e => e.id === msg.data.entity_id);
+      if (idx >= 0 && msg.data.changes) {
+        Object.assign(entities[idx].properties, msg.data.changes);
+        if (msg.data.geometry) entities[idx].geometry = msg.data.geometry;
+      }
+    }
+  };
+  ws.onclose = () => setTimeout(connectWS, 3000);
+}
+
+// Handle canvas click
+document.getElementById('map').addEventListener('click', (e) => {
+  const canvas = e.target;
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+
+  const bounds = { minLat: 48, maxLat: 56, minLon: -5, maxLon: 12 };
+  let closest = null;
+  let closestDist = Infinity;
+
+  entities.forEach(ent => {
+    if (!ent.geometry) return;
+    const [lon, lat] = ent.geometry.coordinates;
+    const ex = ((lon - bounds.minLon) / (bounds.maxLon - bounds.minLon)) * canvas.width;
+    const ey = (1 - (lat - bounds.minLat) / (bounds.maxLat - bounds.minLat)) * canvas.height;
+    const dist = Math.sqrt((x - ex) ** 2 + (y - ey) ** 2);
+    if (dist < closestDist && dist < 20) {
+      closest = ent;
+      closestDist = dist;
+    }
+  });
+
+  if (closest) selectEntity(closest.id);
+});
+
+// Handle keyboard for query
+document.getElementById('query-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') executeQuery();
+});
+
+// Resize handler
+window.addEventListener('resize', renderMap);
+
+// Init
+fetchEntities();
+setInterval(fetchEntities, 5000);
+connectWS();
+</script>
+</body>
+</html>

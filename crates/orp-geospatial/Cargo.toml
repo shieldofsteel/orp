@@ -1,0 +1,10 @@
+[package]
+name = "orp-geospatial"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+orp-proto = { path = "../orp-proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

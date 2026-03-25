@@ -1,0 +1,34 @@
+[package]
+name = "orp-core"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "orp"
+path = "src/main.rs"
+
+[dependencies]
+orp-proto = { path = "../orp-proto" }
+orp-storage = { path = "../orp-storage" }
+orp-stream = { path = "../orp-stream" }
+orp-connector = { path = "../orp-connector" }
+orp-query = { path = "../orp-query" }
+orp-entity = { path = "../orp-entity" }
+orp-config = { path = "../orp-config" }
+orp-audit = { path = "../orp-audit" }
+orp-security = { path = "../orp-security" }
+orp-geospatial = { path = "../orp-geospatial" }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+orp-testbed = { path = "../orp-testbed" }

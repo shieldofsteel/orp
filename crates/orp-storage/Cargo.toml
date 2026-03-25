@@ -1,0 +1,16 @@
+[package]
+name = "orp-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+orp-proto = { path = "../orp-proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+duckdb = { version = "1.2", features = ["bundled"] }

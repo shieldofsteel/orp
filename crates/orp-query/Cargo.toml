@@ -1,0 +1,16 @@
+[package]
+name = "orp-query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+orp-proto = { path = "../orp-proto" }
+orp-storage = { path = "../orp-storage" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+nom = { workspace = true }

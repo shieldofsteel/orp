@@ -1,0 +1,47 @@
+server:
+  host: "0.0.0.0"
+  port: 9090
+  workers: 4
+  log_level: "info"
+
+storage:
+  duckdb:
+    path: "./data/orp.duckdb"
+    memory_limit_gb: 4
+  rocksdb:
+    path: "./data/state.db"
+    cache_size_mb: 512
+
+security:
+  signing_algorithm: "Ed25519"
+  oidc_enabled: false
+
+connectors:
+  - name: "ais_demo"
+    connector_type: "ais"
+    enabled: true
+    url: "tcp://ais.example.com:5631"
+    entity_type: "ship"
+    trust_score: 0.95
+    schedule: null
+
+monitors:
+  - rule_id: "speed_alert"
+    name: "High speed alert"
+    entity_type: "ship"
+    condition: "speed > 25"
+    action: "alert"
+    enabled: true
+
+api:
+  rate_limit_per_minute: 1000
+  cors_enabled: true
+
+frontend:
+  enabled: true
+  port: 9090
+  default_map_center: [51.92, 4.27]
+
+logging:
+  level: "info"
+  format: "json"

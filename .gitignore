@@ -1,0 +1,6 @@
+/target
+/data
+*.duckdb
+*.db
+Cargo.lock
+.DS_Store

@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/orp-core",
+    "crates/orp-storage",
+    "crates/orp-stream",
+    "crates/orp-connector",
+    "crates/orp-query",
+    "crates/orp-entity",
+    "crates/orp-config",
+    "crates/orp-audit",
+    "crates/orp-proto",
+    "crates/orp-geospatial",
+    "crates/orp-security",
+    "crates/orp-testbed",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+tokio = { version = "1.35", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.6", features = ["v4", "v7", "serde"] }
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+async-trait = "0.1"
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+clap = { version = "4", features = ["derive"] }
+nom = "7.1"
+sha2 = "0.10"
+ed25519-dalek = { version = "2.1", features = ["serde"] }
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+panic = "abort"
