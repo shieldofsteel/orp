@@ -12,3 +12,16 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+orp-query = { path = "../orp-query" }
+orp-stream = { path = "../orp-stream" }
+
+[[bench]]
+name = "query_latency"
+harness = false
+
+[[bench]]
+name = "stream_throughput"
+harness = false

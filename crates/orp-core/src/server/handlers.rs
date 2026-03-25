@@ -2,7 +2,7 @@ use crate::server::http::AppState;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse, Json},
+    response::{IntoResponse, Json},
 };
 use orp_proto::{Entity, GeoPoint, Relationship};
 use orp_stream::monitor::{
@@ -970,8 +970,4 @@ pub async fn acknowledge_alert(
     }
 }
 
-// ---- Frontend ----
-
-pub async fn serve_frontend() -> impl IntoResponse {
-    Html(include_str!("../../frontend.html").to_string())
-}
+// Frontend is now served via ServeDir in http.rs (frontend/dist/)

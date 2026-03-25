@@ -10,6 +10,7 @@ use orp_storage::traits::Storage;
 use orp_stream::{MonitorEngine, StreamProcessor};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 pub struct AppState {
@@ -84,8 +85,11 @@ pub async fn start_server(
         )
         // WebSocket
         .route("/ws/updates", get(websocket::ws_handler))
-        // Frontend (serve static files)
-        .fallback(handlers::serve_frontend)
+        // Frontend — serve built Vite assets from frontend/dist/
+        .fallback_service(
+            ServeDir::new("frontend/dist")
+                .not_found_service(ServeFile::new("frontend/dist/index.html")),
+        )
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
