@@ -13,21 +13,13 @@ pub enum SecurityError {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct OidcConfig {
     pub enabled: bool,
     pub provider_url: String,
     pub client_id: String,
 }
 
-impl Default for OidcConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            provider_url: String::new(),
-            client_id: String::new(),
-        }
-    }
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Claims {

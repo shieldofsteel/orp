@@ -11,6 +11,7 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Config {
     pub server: ServerConfig,
     pub storage: StorageConfig,
@@ -94,20 +95,6 @@ pub struct LoggingConfig {
     pub format: String,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            storage: StorageConfig::default(),
-            security: SecurityConfig::default(),
-            connectors: Vec::new(),
-            monitors: Vec::new(),
-            api: ApiConfig::default(),
-            frontend: FrontendConfig::default(),
-            logging: LoggingConfig::default(),
-        }
-    }
-}
 
 impl Default for ServerConfig {
     fn default() -> Self {

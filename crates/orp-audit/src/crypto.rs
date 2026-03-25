@@ -37,9 +37,7 @@ impl EventSigner {
         }
         let mut sig_bytes = [0u8; 64];
         sig_bytes.copy_from_slice(signature);
-        let sig = match ed25519_dalek::Signature::from_bytes(&sig_bytes) {
-            sig => sig,
-        };
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
         let verifying_key: VerifyingKey = self.signing_key.verifying_key();
         verifying_key.verify(data, &sig).is_ok()
     }

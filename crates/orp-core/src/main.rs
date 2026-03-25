@@ -31,6 +31,11 @@ async fn main() -> Result<()> {
         cli::args::Commands::Status => {
             cli::commands::run_status().await?;
         }
+        cli::args::Commands::Connectors { action } => match action {
+            cli::args::ConnectorAction::List => {
+                cli::commands::run_connectors_list().await?;
+            }
+        },
     }
 
     Ok(())

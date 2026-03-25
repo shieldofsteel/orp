@@ -7,7 +7,9 @@ use orp_proto::{EventPayload, OrpEvent};
 use orp_query::QueryExecutor;
 use orp_storage::DuckDbStorage;
 use orp_storage::traits::Storage;
-use orp_stream::StreamProcessor;
+use orp_stream::{
+    MonitorCondition, MonitorEngine, MonitorRule, StreamProcessor, ThresholdOp,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -53,15 +55,16 @@ pub async fn run_start(
     // Initialize storage
     tracing::info!("Initializing DuckDB storage...");
     let storage: Arc<dyn Storage> = Arc::new(
-        DuckDbStorage::new_in_memory().map_err(|e| anyhow::anyhow!("Storage init failed: {}", e))?,
+        DuckDbStorage::new_in_memory()
+            .map_err(|e| anyhow::anyhow!("Storage init failed: {}", e))?,
     );
 
     // Load demo data (ports)
     tracing::info!("Loading demo port data...");
     let ports = orp_testbed::generate_synthetic_ports(10);
-    for port in &ports {
+    for port_entity in &ports {
         storage
-            .insert_entity(port)
+            .insert_entity(port_entity)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to insert port: {}", e))?;
     }
@@ -72,6 +75,42 @@ pub async fn run_start(
 
     // Initialize query executor
     let query_executor = Arc::new(QueryExecutor::new(storage.clone()));
+
+    // Initialize monitor engine with default rules
+    let monitor_engine = Arc::new(MonitorEngine::new());
+    for monitor_def in &config.monitors {
+        if monitor_def.enabled {
+            // Parse simple condition syntax: "speed > 25"
+            let condition =
+                parse_simple_condition(&monitor_def.condition).unwrap_or_else(|| {
+                    MonitorCondition::PropertyThreshold {
+                        property: "speed".to_string(),
+                        operator: ThresholdOp::GreaterThan,
+                        value: 25.0,
+                    }
+                });
+
+            monitor_engine
+                .add_rule(MonitorRule {
+                    rule_id: monitor_def.rule_id.clone(),
+                    name: monitor_def.name.clone(),
+                    description: format!("Condition: {}", monitor_def.condition),
+                    entity_type: monitor_def.entity_type.clone(),
+                    condition,
+                    action: orp_stream::MonitorAction::Alert,
+                    enabled: true,
+                    cooldown_seconds: 300,
+                    severity: orp_stream::AlertSeverity::Warning,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                })
+                .await;
+        }
+    }
+    tracing::info!(
+        "Monitor engine initialized with {} rules",
+        monitor_engine.get_rules().await.len()
+    );
 
     // Start AIS connector (demo data)
     tracing::info!("Starting AIS connector (demo mode)...");
@@ -93,8 +132,22 @@ pub async fn run_start(
         .await
         .map_err(|e| anyhow::anyhow!("AIS connector failed: {}", e))?;
 
+    // Register connector data source
+    let _ = storage
+        .register_data_source(&orp_proto::DataSource {
+            source_id: "ais-demo".to_string(),
+            source_name: "AIS Demo Feed".to_string(),
+            source_type: "ais".to_string(),
+            trust_score: 0.95,
+            events_ingested: 0,
+            enabled: true,
+        })
+        .await;
+
     // Background task: process events from connector
     let processor_bg = processor.clone();
+    let monitor_bg = monitor_engine.clone();
+    let storage_bg = storage.clone();
     tokio::spawn(async move {
         while let Some(source_event) = rx.recv().await {
             let event = OrpEvent::new(
@@ -125,9 +178,20 @@ pub async fn run_start(
                 0.95,
             );
 
-            // Also set name and ship_type on the event entity
             if let Err(e) = processor_bg.process_event(event).await {
                 tracing::warn!("Failed to process event: {}", e);
+            }
+
+            // Run monitor evaluation on updated entity
+            if let Ok(Some(entity)) = storage_bg.get_entity(&source_event.entity_id).await {
+                let alerts = monitor_bg.evaluate(&entity).await;
+                for alert in &alerts {
+                    tracing::warn!(
+                        "🚨 Alert: {} — {}",
+                        alert.rule_name,
+                        alert.message
+                    );
+                }
             }
 
             // Update name/ship_type properties directly
@@ -150,28 +214,45 @@ pub async fn run_start(
     });
 
     tracing::info!("Starting HTTP server on {}:{}", config.server.host, port);
-    tracing::info!(
-        "Dashboard: http://localhost:{}/",
-        port
-    );
-    tracing::info!(
-        "API:       http://localhost:{}/api/v1/",
-        port
-    );
-    tracing::info!(
-        "Health:    http://localhost:{}/api/v1/health",
-        port
-    );
+    tracing::info!("Dashboard: http://localhost:{}/", port);
+    tracing::info!("API:       http://localhost:{}/api/v1/", port);
+    tracing::info!("Health:    http://localhost:{}/api/v1/health", port);
 
     // Start HTTP server (blocks until shutdown)
-    server::http::start_server(storage, query_executor, processor, port).await?;
+    server::http::start_server(storage, query_executor, processor, monitor_engine, port).await?;
 
     Ok(())
 }
 
+/// Parse simple condition strings like "speed > 25" into MonitorCondition
+fn parse_simple_condition(condition: &str) -> Option<MonitorCondition> {
+    let parts: Vec<&str> = condition.split_whitespace().collect();
+    if parts.len() != 3 {
+        return None;
+    }
+
+    let property = parts[0].to_string();
+    let operator = match parts[1] {
+        ">" => ThresholdOp::GreaterThan,
+        "<" => ThresholdOp::LessThan,
+        ">=" => ThresholdOp::GreaterThanOrEqual,
+        "<=" => ThresholdOp::LessThanOrEqual,
+        "=" | "==" => ThresholdOp::Equal,
+        "!=" => ThresholdOp::NotEqual,
+        _ => return None,
+    };
+
+    let value: f64 = parts[2].parse().ok()?;
+
+    Some(MonitorCondition::PropertyThreshold {
+        property,
+        operator,
+        value,
+    })
+}
+
 /// Execute an ORP-QL query
 pub async fn run_query(query: &str) -> Result<()> {
-    // Connect to running instance via HTTP
     let client = reqwest::Client::new();
     let response = client
         .post("http://localhost:9090/api/v1/query")
@@ -203,11 +284,36 @@ pub async fn run_status() -> Result<()> {
     match response {
         Ok(resp) => {
             let body = resp.text().await?;
-            println!("{}", body);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!(body));
+            println!("{}", serde_json::to_string_pretty(&parsed).unwrap_or(body));
         }
         Err(_) => {
             println!("ORP server is not running.");
             println!("Start with: orp start --template maritime");
+        }
+    }
+
+    Ok(())
+}
+
+/// List connectors
+pub async fn run_connectors_list() -> Result<()> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get("http://localhost:9090/api/v1/connectors")
+        .send()
+        .await;
+
+    match response {
+        Ok(resp) => {
+            let body = resp.text().await?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!(body));
+            println!("{}", serde_json::to_string_pretty(&parsed).unwrap_or(body));
+        }
+        Err(_) => {
+            println!("ORP server is not running.");
         }
     }
 

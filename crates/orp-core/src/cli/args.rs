@@ -26,13 +26,25 @@ pub enum Commands {
         port: Option<u16>,
     },
 
-    /// Execute an ORP-QL query
+    /// Execute an ORP-QL query against a running instance
     Query {
         /// The ORP-QL query string
         #[arg(short, long)]
         query: String,
     },
 
-    /// Show system status
+    /// Show system status and health
     Status,
+
+    /// Manage connectors
+    Connectors {
+        #[command(subcommand)]
+        action: ConnectorAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConnectorAction {
+    /// List all registered connectors
+    List,
 }

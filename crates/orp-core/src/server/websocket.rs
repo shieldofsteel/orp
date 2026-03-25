@@ -25,7 +25,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     });
 
     if socket
-        .send(Message::Text(heartbeat.to_string().into()))
+        .send(Message::Text(heartbeat.to_string()))
         .await
         .is_err()
     {
@@ -60,7 +60,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                             }
                                         });
 
-                                        if socket.send(Message::Text(confirmation.to_string().into())).await.is_err() {
+                                        if socket.send(Message::Text(confirmation.to_string())).await.is_err() {
                                             break;
                                         }
                                     }
@@ -100,7 +100,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 }
                             });
 
-                            if socket.send(Message::Text(update.to_string().into())).await.is_err() {
+                            if socket.send(Message::Text(update.to_string())).await.is_err() {
                                 return;
                             }
                         }
@@ -113,7 +113,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 });
 
-                if socket.send(Message::Text(heartbeat.to_string().into())).await.is_err() {
+                if socket.send(Message::Text(heartbeat.to_string())).await.is_err() {
                     break;
                 }
             }

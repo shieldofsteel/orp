@@ -407,7 +407,7 @@ impl Storage for DuckDbStorage {
     ) -> StorageResult<Vec<Event>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT event_id, entity_id, event_type, event_timestamp, source_id, data, confidence FROM events WHERE entity_id = ? ORDER BY event_timestamp DESC LIMIT ?")
+            .prepare("SELECT event_id, entity_id, event_type, CAST(event_timestamp AS VARCHAR), source_id, data, confidence FROM events WHERE entity_id = ? ORDER BY event_timestamp DESC LIMIT ?")
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let rows = stmt
@@ -416,7 +416,7 @@ impl Storage for DuckDbStorage {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(3).unwrap_or_default(),
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, f32>(6).unwrap_or(1.0),
@@ -435,7 +435,13 @@ impl Storage for DuckDbStorage {
                 event_type: etype,
                 event_timestamp: chrono::DateTime::parse_from_rfc3339(&ts_str)
                     .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now()),
+                    .unwrap_or_else(|_| {
+                        // Try parsing DuckDB timestamp format: "2026-03-26 14:30:00"
+                        chrono::NaiveDateTime::parse_from_str(&ts_str, "%Y-%m-%d %H:%M:%S")
+                            .or_else(|_| chrono::NaiveDateTime::parse_from_str(&ts_str, "%Y-%m-%d %H:%M:%S%.f"))
+                            .map(|ndt| ndt.and_utc())
+                            .unwrap_or_else(|_| chrono::Utc::now())
+                    }),
                 source_id: source,
                 data,
                 confidence,
@@ -755,5 +761,238 @@ mod tests {
         let storage = DuckDbStorage::new_in_memory().unwrap();
         let stats = storage.get_stats().await.unwrap();
         assert_eq!(stats.total_entities, 0);
+    }
+
+    #[tokio::test]
+    async fn test_insert_and_get_events() {
+        let storage = DuckDbStorage::new_in_memory().unwrap();
+
+        let entity = Entity {
+            entity_id: "ship-1".to_string(),
+            entity_type: "ship".to_string(),
+            ..Entity::default()
+        };
+        storage.insert_entity(&entity).await.unwrap();
+
+        for i in 0..5 {
+            let event = Event {
+                event_id: format!("evt-{}", i),
+                entity_id: "ship-1".to_string(),
+                event_type: "position_update".to_string(),
+                event_timestamp: chrono::Utc::now(),
+                source_id: "ais-1".to_string(),
+                data: serde_json::json!({"speed": 10.0 + i as f64}),
+                confidence: 0.95,
+            };
+            storage.insert_event(&event).await.unwrap();
+        }
+
+        let events = storage.get_events_for_entity("ship-1", 10).await.unwrap();
+        assert_eq!(events.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_insert_and_get_relationships() {
+        let storage = DuckDbStorage::new_in_memory().unwrap();
+
+        let ship = Entity {
+            entity_id: "ship-1".to_string(),
+            entity_type: "ship".to_string(),
+            ..Entity::default()
+        };
+        let port = Entity {
+            entity_id: "port-1".to_string(),
+            entity_type: "port".to_string(),
+            ..Entity::default()
+        };
+        storage.insert_entity(&ship).await.unwrap();
+        storage.insert_entity(&port).await.unwrap();
+
+        let rel = orp_proto::Relationship {
+            relationship_id: "rel-1".to_string(),
+            source_entity_id: "ship-1".to_string(),
+            target_entity_id: "port-1".to_string(),
+            relationship_type: "HEADING_TO".to_string(),
+            properties: HashMap::new(),
+            confidence: 0.9,
+            is_active: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        storage.insert_relationship(&rel).await.unwrap();
+
+        let rels = storage
+            .get_relationships_for_entity("ship-1")
+            .await
+            .unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].relationship_type, "HEADING_TO");
+
+        let rels2 = storage
+            .get_relationships_for_entity("port-1")
+            .await
+            .unwrap();
+        assert_eq!(rels2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_data_sources() {
+        let storage = DuckDbStorage::new_in_memory().unwrap();
+
+        let source = orp_proto::DataSource {
+            source_id: "ais-demo".to_string(),
+            source_name: "AIS Demo".to_string(),
+            source_type: "ais".to_string(),
+            trust_score: 0.95,
+            events_ingested: 0,
+            enabled: true,
+        };
+        storage.register_data_source(&source).await.unwrap();
+
+        let sources = storage.get_data_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_name, "AIS Demo");
+    }
+
+    #[tokio::test]
+    async fn test_search_entities() {
+        let storage = DuckDbStorage::new_in_memory().unwrap();
+
+        let entity = Entity {
+            entity_id: "ship-rotterdam-1".to_string(),
+            entity_type: "ship".to_string(),
+            name: Some("Rotterdam Express".to_string()),
+            ..Entity::default()
+        };
+        storage.insert_entity(&entity).await.unwrap();
+
+        let results = storage
+            .search_entities("Rotterdam", Some("ship"), 10)
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].name.as_deref(), Some("Rotterdam Express"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_entity() {
+        let storage = DuckDbStorage::new_in_memory().unwrap();
+
+        let entity = Entity {
+            entity_id: "ship-del".to_string(),
+            entity_type: "ship".to_string(),
+            ..Entity::default()
+        };
+        storage.insert_entity(&entity).await.unwrap();
+
+        assert!(storage.get_entity("ship-del").await.unwrap().is_some());
+
+        storage.delete_entity("ship-del").await.unwrap();
+
+        // Count should not include soft-deleted
+        let count = storage.count_entities().await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_entity_property() {
+        let storage = DuckDbStorage::new_in_memory().unwrap();
+
+        let entity = Entity {
+            entity_id: "ship-upd".to_string(),
+            entity_type: "ship".to_string(),
+            ..Entity::default()
+        };
+        storage.insert_entity(&entity).await.unwrap();
+
+        storage
+            .update_entity_property("ship-upd", "speed", serde_json::json!(15.0))
+            .await
+            .unwrap();
+
+        let updated = storage.get_entity("ship-upd").await.unwrap().unwrap();
+        assert_eq!(
+            updated.properties.get("speed"),
+            Some(&serde_json::json!(15.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let storage = DuckDbStorage::new_in_memory().unwrap();
+        assert!(storage.health_check().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pagination() {
+        let storage = DuckDbStorage::new_in_memory().unwrap();
+
+        for i in 0..20 {
+            let entity = Entity {
+                entity_id: format!("ship-page-{}", i),
+                entity_type: "ship".to_string(),
+                name: Some(format!("Ship {}", i)),
+                ..Entity::default()
+            };
+            storage.insert_entity(&entity).await.unwrap();
+        }
+
+        let page1 = storage.get_entities_by_type("ship", 5, 0).await.unwrap();
+        assert_eq!(page1.len(), 5);
+
+        let page2 = storage.get_entities_by_type("ship", 5, 5).await.unwrap();
+        assert_eq!(page2.len(), 5);
+
+        // No overlap
+        let ids1: Vec<_> = page1.iter().map(|e| &e.entity_id).collect();
+        let ids2: Vec<_> = page2.iter().map(|e| &e.entity_id).collect();
+        for id in &ids1 {
+            assert!(!ids2.contains(id));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_geospatial_no_type_filter() {
+        let storage = DuckDbStorage::new_in_memory().unwrap();
+
+        let entity = Entity {
+            entity_id: "ship-geo".to_string(),
+            entity_type: "ship".to_string(),
+            geometry: Some(GeoPoint {
+                lat: 51.92,
+                lon: 4.47,
+                alt: None,
+            }),
+            ..Entity::default()
+        };
+        storage.insert_entity(&entity).await.unwrap();
+
+        let results = storage
+            .get_entities_in_radius(51.92, 4.47, 10.0, None)
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_file_based_storage() {
+        let dir = std::env::temp_dir().join("orp_test_db");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.duckdb");
+        let path_str = path.to_str().unwrap();
+
+        let storage = DuckDbStorage::new_with_path(path_str).unwrap();
+        let entity = Entity {
+            entity_id: "persist-test".to_string(),
+            entity_type: "ship".to_string(),
+            ..Entity::default()
+        };
+        storage.insert_entity(&entity).await.unwrap();
+
+        let result = storage.get_entity("persist-test").await.unwrap();
+        assert!(result.is_some());
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
