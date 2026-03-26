@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback, useId } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import type { QueryMode, QueryHistoryEntry } from '../types';
 
-const API_BASE = 'http://localhost:9090/api/v1';
+const API_BASE = '/api/v1';
 
 // ORP-QL keyword suggestions
 const ORPQL_KEYWORDS = [

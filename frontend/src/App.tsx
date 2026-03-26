@@ -61,10 +61,10 @@ function Header({ onLogout }: { onLogout: () => void }) {
         <div className="flex flex-col leading-none">
           {/* h1 for app name — visually styled small but semantically correct */}
           <h1 className="text-xs font-semibold text-gray-100 tracking-tight m-0 p-0 leading-none">
-            ORP Console
+            ORP Console — Data Fusion Platform
           </h1>
-          <span className="text-[9px] text-gray-600" aria-label="Maritime Operations platform">
-            Maritime Operations
+          <span className="text-[9px] text-gray-600" aria-label="Data Fusion Platform">
+            Data Fusion Platform
           </span>
         </div>
       </div>
@@ -284,7 +284,7 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
         <main
           id="main-content"
           role="main"
-          aria-label="Maritime operations map and entity inspector"
+          aria-label="Operations map and entity inspector"
           className="flex-1 flex overflow-hidden relative"
           tabIndex={-1}
         >

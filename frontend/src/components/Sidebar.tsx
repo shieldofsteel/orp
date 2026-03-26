@@ -4,42 +4,7 @@ import { QueryBar } from './QueryBar';
 import { AlertFeed } from './AlertFeed';
 import type { Connector } from '../types';
 
-const API_BASE = 'http://localhost:9090/api/v1';
-
-const MOCK_CONNECTORS: Connector[] = [
-  {
-    id: 'ais-live',
-    name: 'AIS Live Feed',
-    type: 'ais',
-    enabled: true,
-    status: 'healthy',
-    stats: { events_per_sec: 42.1, last_event_at: new Date().toISOString(), error_count: 0, total_ingested: 1_204_880 },
-  },
-  {
-    id: 'port-db',
-    name: 'Port Database',
-    type: 'database',
-    enabled: true,
-    status: 'healthy',
-    stats: { events_per_sec: 0.3, last_event_at: new Date(Date.now() - 120_000).toISOString(), error_count: 0, total_ingested: 887 },
-  },
-  {
-    id: 'weather-api',
-    name: 'Weather API',
-    type: 'rest',
-    enabled: true,
-    status: 'degraded',
-    stats: { events_per_sec: 1.2, last_event_at: new Date(Date.now() - 5_000).toISOString(), error_count: 3, total_ingested: 12_440 },
-  },
-  {
-    id: 'sat-imagery',
-    name: 'Satellite Imagery',
-    type: 'grpc',
-    enabled: false,
-    status: 'error',
-    stats: { events_per_sec: 0, last_event_at: new Date(Date.now() - 3_600_000).toISOString(), error_count: 18, total_ingested: 0 },
-  },
-];
+const API_BASE = '/api/v1';
 
 const STATUS_CONFIG = {
   healthy: { dot: 'bg-green-500', text: 'text-green-400', label: 'Healthy' },
@@ -162,11 +127,11 @@ export const Sidebar: React.FC = () => {
   const toggleWeatherLayer = useAppStore((s) => s.toggleWeatherLayer);
   const toggleShipTracksLayer = useAppStore((s) => s.toggleShipTracksLayer);
 
-  const [connectors, setConnectors] = useState<Connector[]>(MOCK_CONNECTORS);
+  const [connectors, setConnectors] = useState<Connector[]>([]);
 
   const unackedAlerts = alerts.filter((a) => !a.acknowledged).length;
 
-  // Attempt to fetch real connectors
+  // Fetch real connectors from API
   useEffect(() => {
     fetch(`${API_BASE}/connectors`)
       .then((r) => r.ok ? r.json() : null)
@@ -175,7 +140,7 @@ export const Sidebar: React.FC = () => {
           setConnectors((data as { data: Connector[] }).data);
         }
       })
-      .catch(() => {/* use mock */});
+      .catch(() => {/* API unavailable — leave empty */});
   }, []);
 
   const section = (id: 'datasources' | 'query' | 'alerts') =>
@@ -219,9 +184,15 @@ export const Sidebar: React.FC = () => {
           onToggle={() => toggleSidebarSection('datasources')}
         >
           <div className="space-y-2 pt-1">
-            {connectors.map((c) => (
-              <ConnectorCard key={c.id} connector={c} />
-            ))}
+            {connectors.length === 0 ? (
+              <div className="text-center py-4 text-[10px] text-gray-600">
+                No connectors configured
+              </div>
+            ) : (
+              connectors.map((c) => (
+                <ConnectorCard key={c.id} connector={c} />
+              ))
+            )}
           </div>
         </Section>
 

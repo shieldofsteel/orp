@@ -13,16 +13,18 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 const MAPLIBRE_STYLE = 'https://demotiles.maplibre.org/style.json';
 
 // Speed color thresholds (RGBA)
-function shipColor(speed: number, selected: boolean): [number, number, number, number] {
+function shipColor(speed: unknown, selected: boolean): [number, number, number, number] {
   if (selected) return [255, 50, 50, 255];
-  if (speed > 20) return [255, 120, 0, 240];
-  if (speed >= 10) return [30, 140, 255, 230];
+  const s = typeof speed === 'number' && isFinite(speed) ? speed : 0;
+  if (s > 20) return [255, 120, 0, 240];
+  if (s >= 10) return [30, 140, 255, 230];
   return [60, 200, 90, 220];
 }
 
-function congestionColor(congestion: number): [number, number, number, number] {
-  if (congestion > 0.75) return [220, 50, 50, 200];
-  if (congestion > 0.4) return [255, 165, 0, 180];
+function congestionColor(congestion: unknown): [number, number, number, number] {
+  const c = typeof congestion === 'number' && isFinite(congestion) ? congestion : 0;
+  if (c > 0.75) return [220, 50, 50, 200];
+  if (c > 0.4) return [255, 165, 0, 180];
   return [50, 180, 100, 160];
 }
 
@@ -45,19 +47,49 @@ function weatherLineColor(severity: string): [number, number, number, number] {
 }
 
 function getPointCoords(d: Entity): [number, number] {
-  if (d.geometry?.type === 'Point' && Array.isArray(d.geometry.coordinates)) {
+  if (
+    d.geometry?.type === 'Point' &&
+    Array.isArray(d.geometry.coordinates) &&
+    d.geometry.coordinates.length >= 2 &&
+    typeof d.geometry.coordinates[0] === 'number' &&
+    typeof d.geometry.coordinates[1] === 'number' &&
+    isFinite(d.geometry.coordinates[0] as number) &&
+    isFinite(d.geometry.coordinates[1] as number)
+  ) {
     return [d.geometry.coordinates[0] as number, d.geometry.coordinates[1] as number];
   }
   return [0, 0];
 }
 
+/** Check if entity has valid point coordinates suitable for rendering */
+function hasValidPointCoords(d: Entity): boolean {
+  if (!d.geometry || d.geometry.type !== 'Point' || !Array.isArray(d.geometry.coordinates)) return false;
+  const coords = d.geometry.coordinates;
+  if (coords.length < 2) return false;
+  const [lon, lat] = coords as number[];
+  if (typeof lon !== 'number' || typeof lat !== 'number') return false;
+  if (!isFinite(lon) || !isFinite(lat)) return false;
+  if (lon === 0 && lat === 0) return false;
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return false;
+  return true;
+}
+
 function getWeatherPolygon(d: Entity): number[][] {
-  if (d.geometry?.type === 'Polygon') {
-    return (d.geometry.coordinates as number[][][])[0] ?? [];
+  if (d.geometry?.type === 'Polygon' && Array.isArray(d.geometry.coordinates)) {
+    const ring = (d.geometry.coordinates as number[][][])[0];
+    return Array.isArray(ring) ? ring : [];
   }
-  if (d.geometry?.type === 'Point') {
+  if (
+    d.geometry?.type === 'Point' &&
+    Array.isArray(d.geometry.coordinates) &&
+    d.geometry.coordinates.length >= 2 &&
+    typeof d.geometry.coordinates[0] === 'number' &&
+    typeof d.geometry.coordinates[1] === 'number' &&
+    isFinite(d.geometry.coordinates[0] as number) &&
+    isFinite(d.geometry.coordinates[1] as number)
+  ) {
     const [lon, lat] = d.geometry.coordinates as number[];
-    const r = ((d.properties.radius_km as number) ?? 100) / 111;
+    const r = ((d.properties?.radius_km as number) ?? 100) / 111;
     const pts: number[][] = [];
     for (let i = 0; i <= 32; i++) {
       const angle = (i / 32) * 2 * Math.PI;
@@ -104,13 +136,8 @@ export const MapView: React.FC = () => {
 
   const hasValidGeometry = (e: Entity): boolean => {
     if (!e.geometry) return false;
-    if (e.geometry.type === 'Point' && Array.isArray(e.geometry.coordinates)) {
-      const [lon, lat] = e.geometry.coordinates as number[];
-      if (lon === 0 && lat === 0) return false;
-      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return false;
-      return true;
-    }
-    if (e.geometry.type === 'Polygon') return true;
+    if (e.geometry.type === 'Point') return hasValidPointCoords(e);
+    if (e.geometry.type === 'Polygon' && Array.isArray(e.geometry.coordinates)) return true;
     return false;
   };
 
@@ -138,11 +165,12 @@ export const MapView: React.FC = () => {
     if (info.object && info.x != null && info.y != null) {
       const name = info.object.name ?? info.object.id;
       const type = info.object.type;
+      const props = info.object.properties ?? {};
       const extra =
         type === 'Ship'
-          ? ` · ${(info.object.properties.speed as number | undefined)?.toFixed(1) ?? '?'} kn`
+          ? ` · ${typeof props.speed === 'number' ? props.speed.toFixed(1) : '?'} kn`
           : type === 'Port'
-          ? ` · TEU: ${((info.object.properties.total_teu as number | undefined) ?? 0).toLocaleString()}`
+          ? ` · TEU: ${(typeof props.total_teu === 'number' ? props.total_teu : 0).toLocaleString()}`
           : '';
       setTooltip({ x: info.x, y: info.y, content: `${name}${extra}` });
     } else {
@@ -219,8 +247,8 @@ export const MapView: React.FC = () => {
           filled: true,
           extruded: false,
           getPolygon: (d: Entity) => getWeatherPolygon(d),
-          getFillColor: (d: Entity) => weatherColor(d.properties.severity as string),
-          getLineColor: (d: Entity) => weatherLineColor(d.properties.severity as string),
+          getFillColor: (d: Entity) => weatherColor((d.properties?.severity as string) ?? ''),
+          getLineColor: (d: Entity) => weatherLineColor((d.properties?.severity as string) ?? ''),
           getLineWidth: 2,
           lineWidthMinPixels: 1,
           onClick: (info) => {
@@ -244,11 +272,12 @@ export const MapView: React.FC = () => {
         radiusMaxPixels: 60,
         getPosition: (d: Entity) => getPointCoords(d),
         getRadius: (d: Entity) => {
-          const teu = (d.properties.total_teu as number | undefined) ?? 1_000_000;
+          const props = d.properties ?? {};
+          const teu = (typeof props.total_teu === 'number' ? props.total_teu : 1_000_000);
           return Math.sqrt(teu / 1_000_000) * 5;
         },
         getFillColor: (d: Entity) =>
-          congestionColor((d.properties.congestion as number | undefined) ?? 0),
+          congestionColor((d.properties ?? {}).congestion ?? 0),
         getLineColor: [255, 255, 255, 120],
         lineWidthMinPixels: 1,
         stroked: true,
@@ -272,7 +301,12 @@ export const MapView: React.FC = () => {
             const history = d.history ?? [];
             const pts = history
               .slice(-50)
-              .filter((h) => Array.isArray(h.geometry?.coordinates) && (h.geometry!.coordinates as number[]).length >= 2)
+              .filter((h) => {
+                const c = h.geometry?.coordinates;
+                return Array.isArray(c) && c.length >= 2 &&
+                  typeof c[0] === 'number' && typeof c[1] === 'number' &&
+                  isFinite(c[0]) && isFinite(c[1]);
+              })
               .map((h) => [
                 (h.geometry!.coordinates as number[])[0],
                 (h.geometry!.coordinates as number[])[1],
@@ -307,7 +341,7 @@ export const MapView: React.FC = () => {
         getRadius: (d: Entity) => (d.id === selectedEntityId ? 10 : 6),
         getFillColor: (d: Entity) =>
           shipColor(
-            (d.properties.speed as number | undefined) ?? 0,
+            (d.properties ?? {}).speed ?? 0,
             d.id === selectedEntityId
           ),
         getLineColor: (d: Entity) =>
@@ -366,7 +400,7 @@ export const MapView: React.FC = () => {
       className="relative flex-1 overflow-hidden"
       // Accessible label and role for screen readers
       role="application"
-      aria-label="Interactive map showing maritime entities — ships, ports, and weather systems. Use arrow keys to pan, + and - to zoom, Home to reset view."
+      aria-label="Interactive map showing entities. Use arrow keys to pan, + and - to zoom, Home to reset view."
       // Make the map focusable so keyboard events work
       tabIndex={0}
       onKeyDown={handleMapKeyDown}

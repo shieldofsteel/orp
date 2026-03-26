@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import type { Entity, RelationshipsResponse } from '../types';
 
-const API_BASE = 'http://localhost:9090/api/v1';
+const API_BASE = '/api/v1';
 
 async function fetchEntityFull(id: string): Promise<Entity> {
   const res = await fetch(`${API_BASE}/entities/${encodeURIComponent(id)}`);

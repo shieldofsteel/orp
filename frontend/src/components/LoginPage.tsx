@@ -77,7 +77,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
             ORP Console
           </h1>
           <p className="text-xs text-gray-500 mt-1">
-            Sign in to access Maritime Operations
+            Sign in to access ORP Console
           </p>
         </div>
 

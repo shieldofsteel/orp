@@ -10,7 +10,7 @@ import { useAppStore } from '../../store/useAppStore';
 // ── MSW Setup ─────────────────────────────────────────────────────────────────
 
 const server = setupServer(
-  http.post('http://localhost:9090/api/v1/query', async ({ request }) => {
+  http.post('/api/v1/query', async ({ request }) => {
     const body = await request.json() as { query: string };
     if (body.query.includes('FAIL')) {
       return HttpResponse.json({ error: { message: 'Syntax error in query' } }, { status: 400 });
@@ -22,7 +22,7 @@ const server = setupServer(
       ],
     });
   }),
-  http.post('http://localhost:9090/api/v1/query/natural', async () => {
+  http.post('/api/v1/query/natural', async () => {
     return HttpResponse.json({
       results: [{ id: 'e-3', name: 'Ship Caesar', speed: 18 }],
     });

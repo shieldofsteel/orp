@@ -4,7 +4,7 @@ import type { WebSocketMessage, Entity } from '../types';
 
 function getWsUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const base = `${protocol}//${window.location.hostname}:9090/ws/updates`;
+  const base = `${protocol}//${window.location.host}/ws/updates`;
   // Attach stored JWT as query param for WS auth
   const token = localStorage.getItem('orp_token') ?? sessionStorage.getItem('orp_token') ?? '';
   if (token) {

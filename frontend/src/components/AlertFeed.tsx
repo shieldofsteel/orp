@@ -243,7 +243,7 @@ export const AlertFeed: React.FC<AlertFeedProps> = ({ maxVisible = 50 }) => {
         role="log"
         aria-live="polite"
         aria-relevant="additions"
-        aria-label="Alert feed — live maritime alerts"
+        aria-label="Alert feed — live alerts"
         aria-atomic="false"
         className="flex-1 overflow-y-auto orp-scrollbar space-y-1.5 min-h-0"
         onScroll={(e) => {

@@ -72,6 +72,7 @@ pub fn print_error(msg: &str) {
     }
 }
 
+#[allow(dead_code)]
 pub fn print_warning(msg: &str) {
     if colors_enabled() {
         eprintln!("{} {}", "⚠".yellow().bold(), msg.yellow());
@@ -81,6 +82,7 @@ pub fn print_warning(msg: &str) {
 }
 
 /// Print an error and exit with code 1.
+#[allow(dead_code)]
 pub fn fatal(msg: &str) -> ! {
     print_error(msg);
     std::process::exit(1);
@@ -573,11 +575,7 @@ pub async fn run_query(host: &str, query: &str, format: OutputFormat) -> Result<
                                 .get("rows_returned")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(rows.len() as u64);
-                            if colors_enabled() {
-                                eprintln!("\n{} rows in {:.1}ms", count, time);
-                            } else {
-                                eprintln!("\n{} rows in {:.1}ms", count, time);
-                            }
+                            eprintln!("\n{} rows in {:.1}ms", count, time);
                         }
                     } else {
                         println!("{}", serde_json::to_string_pretty(&parsed)?);

@@ -64,16 +64,16 @@ const relationships = {
 // ── MSW Server ────────────────────────────────────────────────────────────────
 
 const server = setupServer(
-  http.get('http://localhost:9090/api/v1/entities/ship-alpha', () =>
+  http.get('/api/v1/entities/ship-alpha', () =>
     HttpResponse.json(fullEntity)
   ),
-  http.get('http://localhost:9090/api/v1/entities/ship-alpha/relationships', () =>
+  http.get('/api/v1/entities/ship-alpha/relationships', () =>
     HttpResponse.json(relationships)
   ),
-  http.get('http://localhost:9090/api/v1/entities/ship-broken', () =>
+  http.get('/api/v1/entities/ship-broken', () =>
     HttpResponse.json({}, { status: 503 })
   ),
-  http.get('http://localhost:9090/api/v1/entities/ship-broken/relationships', () =>
+  http.get('/api/v1/entities/ship-broken/relationships', () =>
     HttpResponse.json({}, { status: 503 })
   )
 );
