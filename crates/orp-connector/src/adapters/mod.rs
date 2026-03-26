@@ -8,5 +8,6 @@ pub mod database;
 pub mod generic_api;
 pub mod http_poller;
 pub mod mqtt;
+pub mod stix;
 pub mod syslog;
 pub mod websocket_client;
