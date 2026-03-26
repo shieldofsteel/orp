@@ -3,6 +3,9 @@ import DeckGL from '@deck.gl/react';
 import {
   ScatterplotLayer,
   PathLayer,
+
+// Safe color helper — prevents Deck.gl luma crash on null/undefined colors
+
   PolygonLayer,
 } from '@deck.gl/layers';
 import { Map } from 'react-map-gl/maplibre';
@@ -434,7 +437,7 @@ export const MapView: React.FC = () => {
       {/* Tooltip — announced via existing hover; not separately announced as it's supplemental */}
       {tooltip && (
         <div
-          className="pointer-events-none absolute z-50 rounded bg-gray-900/95 border border-gray-700 px-2.5 py-1.5 text-xs text-gray-100 shadow-lg whitespace-nowrap"
+          className="pointer-events-none absolute z-50 rounded-none bg-gray-900/95 border border-gray-700 px-2.5 py-1.5 text-xs text-gray-100 shadow-lg whitespace-nowrap"
           style={{ left: tooltip.x + 12, top: tooltip.y - 10 }}
           aria-hidden="true"
         >
@@ -445,7 +448,7 @@ export const MapView: React.FC = () => {
       {/* Keyboard instructions — visible only on focus */}
       {mapFocused && (
         <div
-          className="absolute top-3 left-3 z-10 rounded-md bg-gray-900/90 border border-blue-700 p-2 text-[10px] text-gray-300 backdrop-blur-sm"
+          className="absolute top-3 left-3 z-10 rounded-none bg-gray-900/90 border border-blue-700 p-2 text-[10px] text-gray-300 backdrop-blur-sm"
           aria-live="polite"
           role="status"
         >
@@ -456,7 +459,7 @@ export const MapView: React.FC = () => {
 
       {/* Map Legend — aria-hidden since it duplicates tooltip info */}
       <div
-        className="absolute bottom-12 right-3 z-10 rounded-md bg-gray-900/90 border border-gray-700 p-2.5 text-[10px] text-gray-400 space-y-1 backdrop-blur-sm"
+        className="absolute bottom-12 right-3 z-10 rounded-none bg-gray-900/90 border border-gray-700 p-2.5 text-[10px] text-gray-400 space-y-1 backdrop-blur-sm"
         aria-label="Map legend"
         role="img"
       >
@@ -465,28 +468,28 @@ export const MapView: React.FC = () => {
           <div className="flex items-center gap-1.5">
             <dt className="sr-only">Green dot</dt>
             <dd className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-green-500 inline-block" aria-hidden="true" />
+              <span className="w-2.5 h-2.5 rounded-none bg-green-500 inline-block" aria-hidden="true" />
               <span>&lt; 10 kn</span>
             </dd>
           </div>
           <div className="flex items-center gap-1.5">
             <dt className="sr-only">Blue dot</dt>
             <dd className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-blue-400 inline-block" aria-hidden="true" />
+              <span className="w-2.5 h-2.5 rounded-none bg-blue-400 inline-block" aria-hidden="true" />
               <span>10–20 kn</span>
             </dd>
           </div>
           <div className="flex items-center gap-1.5">
             <dt className="sr-only">Orange dot</dt>
             <dd className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-orange-400 inline-block" aria-hidden="true" />
+              <span className="w-2.5 h-2.5 rounded-none bg-orange-400 inline-block" aria-hidden="true" />
               <span>&gt; 20 kn</span>
             </dd>
           </div>
           <div className="flex items-center gap-1.5">
             <dt className="sr-only">Red dot</dt>
             <dd className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block" aria-hidden="true" />
+              <span className="w-2.5 h-2.5 rounded-none bg-red-500 inline-block" aria-hidden="true" />
               <span>Selected</span>
             </dd>
           </div>
@@ -496,21 +499,21 @@ export const MapView: React.FC = () => {
           <div className="flex items-center gap-1.5">
             <dt className="sr-only">Green port dot</dt>
             <dd className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-green-400 inline-block opacity-80" aria-hidden="true" />
+              <span className="w-2.5 h-2.5 rounded-none bg-green-400 inline-block opacity-80" aria-hidden="true" />
               <span>Low congestion</span>
             </dd>
           </div>
           <div className="flex items-center gap-1.5">
             <dt className="sr-only">Orange port dot</dt>
             <dd className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-orange-400 inline-block opacity-80" aria-hidden="true" />
+              <span className="w-2.5 h-2.5 rounded-none bg-orange-400 inline-block opacity-80" aria-hidden="true" />
               <span>Medium</span>
             </dd>
           </div>
           <div className="flex items-center gap-1.5">
             <dt className="sr-only">Red port dot</dt>
             <dd className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block opacity-80" aria-hidden="true" />
+              <span className="w-2.5 h-2.5 rounded-none bg-red-500 inline-block opacity-80" aria-hidden="true" />
               <span>High</span>
             </dd>
           </div>
@@ -520,7 +523,7 @@ export const MapView: React.FC = () => {
       {/* Entity count badge */}
       <div className="absolute top-3 right-3 z-10" aria-live="polite" aria-atomic="true">
         <span
-          className="rounded bg-gray-900/80 border border-gray-700 px-2 py-1 text-[10px] text-gray-400"
+          className="rounded-none bg-gray-900/80 border border-gray-700 px-2 py-1 text-[10px] text-gray-400"
           aria-label={`${ships.length} ships and ${ports.length} ports loaded on map`}
         >
           {ships.length} ships · {ports.length} ports

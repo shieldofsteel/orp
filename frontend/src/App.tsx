@@ -40,7 +40,7 @@ function Header({ onLogout }: { onLogout: () => void }) {
       {/* Sidebar toggle */}
       <button
         onClick={() => setSidebarOpen(!sidebarOpen)}
-        className="flex flex-col gap-1 p-1.5 rounded hover:bg-gray-800 transition-colors text-gray-400 hover:text-gray-200"
+        className="flex flex-col gap-1 p-1.5 rounded-none hover:bg-gray-800 transition-colors text-gray-400 hover:text-gray-200"
         aria-label={sidebarOpen ? 'Close sidebar navigation' : 'Open sidebar navigation'}
         aria-expanded={sidebarOpen}
         aria-controls="sidebar-nav"
@@ -53,7 +53,7 @@ function Header({ onLogout }: { onLogout: () => void }) {
       {/* Logo / App name */}
       <div className="flex items-center gap-2 select-none" aria-hidden="false">
         <div
-          className="flex items-center justify-center w-6 h-6 rounded bg-blue-700 text-white text-[10px] font-bold tracking-tight"
+          className="flex items-center justify-center w-6 h-6 rounded-none bg-blue-700 text-white text-[10px] font-bold tracking-tight"
           aria-hidden="true"
         >
           ORP
@@ -105,7 +105,7 @@ function Header({ onLogout }: { onLogout: () => void }) {
           </>
         ) : (
           <>
-            <span className="w-2 h-2 rounded-full bg-red-500" aria-hidden="true" />
+            <span className="w-2 h-2 rounded-none bg-red-500" aria-hidden="true" />
             <span className="text-[10px] text-red-400">Offline</span>
           </>
         )}
@@ -115,7 +115,7 @@ function Header({ onLogout }: { onLogout: () => void }) {
 
       {/* Settings gear */}
       <button
-        className="w-7 h-7 flex items-center justify-center rounded hover:bg-gray-800 text-gray-500 hover:text-gray-300 transition-colors"
+        className="w-7 h-7 flex items-center justify-center rounded-none hover:bg-gray-800 text-gray-500 hover:text-gray-300 transition-colors"
         aria-label="Open settings"
         title="Settings"
       >
@@ -140,7 +140,7 @@ function Header({ onLogout }: { onLogout: () => void }) {
       {/* Dark/light toggle */}
       <button
         onClick={toggleDark}
-        className="w-7 h-7 flex items-center justify-center rounded hover:bg-gray-800 text-gray-500 hover:text-gray-300 transition-colors"
+        className="w-7 h-7 flex items-center justify-center rounded-none hover:bg-gray-800 text-gray-500 hover:text-gray-300 transition-colors"
         aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
         aria-pressed={darkMode}
         title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
@@ -172,12 +172,12 @@ function Header({ onLogout }: { onLogout: () => void }) {
 
       {/* User menu */}
       <button
-        className="flex items-center gap-1.5 rounded hover:bg-gray-800 px-2 py-1 transition-colors group"
+        className="flex items-center gap-1.5 rounded-none hover:bg-gray-800 px-2 py-1 transition-colors group"
         aria-label="Open user menu for Operator"
         aria-haspopup="menu"
       >
         <div
-          className="w-6 h-6 rounded-full bg-blue-800 border border-blue-700 flex items-center justify-center text-[9px] text-blue-200 font-bold"
+          className="w-6 h-6 rounded-none bg-blue-800 border border-blue-700 flex items-center justify-center text-[9px] text-blue-200 font-bold"
           aria-hidden="true"
         >
           OP
@@ -200,7 +200,7 @@ function Header({ onLogout }: { onLogout: () => void }) {
       {/* Logout button */}
       <button
         onClick={onLogout}
-        className="w-7 h-7 flex items-center justify-center rounded hover:bg-gray-800 text-gray-500 hover:text-red-400 transition-colors"
+        className="w-7 h-7 flex items-center justify-center rounded-none hover:bg-gray-800 text-gray-500 hover:text-red-400 transition-colors"
         aria-label="Log out"
         title="Log out"
       >
@@ -262,7 +262,7 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
       {/* Skip-to-content link — visually hidden until focused */}
       <a
         href="#main-content"
-        className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:bg-blue-700 focus:text-white focus:px-3 focus:py-2 focus:rounded focus:text-sm focus:font-medium"
+        className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:bg-blue-700 focus:text-white focus:px-3 focus:py-2 focus:rounded-none focus:text-sm focus:font-medium"
       >
         Skip to main content
       </a>

@@ -68,7 +68,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
         {/* Logo */}
         <div className="flex flex-col items-center mb-8">
           <div
-            className="flex items-center justify-center w-12 h-12 rounded-lg bg-blue-700 text-white text-lg font-bold tracking-tight mb-3"
+            className="flex items-center justify-center w-12 h-12 rounded-none bg-blue-700 text-white text-lg font-bold tracking-tight mb-3"
             aria-hidden="true"
           >
             ORP
@@ -85,7 +85,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
         {error && (
           <div
             role="alert"
-            className="mb-4 px-3 py-2 rounded bg-red-900/50 border border-red-800 text-red-300 text-xs"
+            className="mb-4 px-3 py-2 rounded-none bg-red-900/50 border border-red-800 text-red-300 text-xs"
           >
             {error}
           </div>
@@ -107,7 +107,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="you@example.com"
-              className="w-full px-3 py-2 rounded bg-gray-900 border border-gray-800 text-gray-100 text-sm placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-600 focus:border-transparent"
+              className="w-full px-3 py-2 rounded-none bg-gray-900 border border-gray-800 text-gray-100 text-sm placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-600 focus:border-transparent"
               disabled={loading}
               required
             />
@@ -127,7 +127,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="••••••••"
-              className="w-full px-3 py-2 rounded bg-gray-900 border border-gray-800 text-gray-100 text-sm placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-600 focus:border-transparent"
+              className="w-full px-3 py-2 rounded-none bg-gray-900 border border-gray-800 text-gray-100 text-sm placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-600 focus:border-transparent"
               disabled={loading}
               required
             />
@@ -136,7 +136,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
           <button
             type="submit"
             disabled={loading}
-            className="w-full py-2 rounded bg-blue-700 hover:bg-blue-600 text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="w-full py-2 rounded-none bg-blue-700 hover:bg-blue-600 text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {loading ? 'Signing in…' : 'Sign in'}
           </button>
@@ -155,7 +155,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
         <button
           type="button"
           onClick={handleSSOLogin}
-          className="w-full py-2 rounded border border-gray-700 hover:border-gray-600 bg-gray-900 hover:bg-gray-800 text-gray-300 text-sm font-medium transition-colors"
+          className="w-full py-2 rounded-none border border-gray-700 hover:border-gray-600 bg-gray-900 hover:bg-gray-800 text-gray-300 text-sm font-medium transition-colors"
         >
           Login with SSO
         </button>

@@ -295,7 +295,7 @@ export const QueryBar: React.FC = () => {
             onClick={() => setQueryMode(m)}
             aria-pressed={queryMode === m}
             aria-label={m === 'structured' ? 'ORP-QL structured query mode' : 'Natural language query mode'}
-            className={`text-[10px] px-2 py-0.5 rounded border transition-colors ${
+            className={`text-[10px] px-2 py-0.5 rounded-none border transition-colors ${
               queryMode === m
                 ? 'bg-blue-900/60 border-blue-700 text-blue-300'
                 : 'border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-600'
@@ -322,7 +322,7 @@ export const QueryBar: React.FC = () => {
         <div
           role="listbox"
           aria-label="Recent queries"
-          className="rounded-md border border-gray-700 bg-gray-900 divide-y divide-gray-800 mb-1 orp-scrollbar overflow-y-auto max-h-36"
+          className="rounded-none border border-gray-700 bg-gray-900 divide-y divide-gray-800 mb-1 orp-scrollbar overflow-y-auto max-h-36"
         >
           {queryHistory.map((entry) => (
             <button
@@ -377,7 +377,7 @@ export const QueryBar: React.FC = () => {
           }
           aria-describedby={`${statusId}${queryError ? ` ${errorId}` : ''}`}
           aria-busy={queryLoading}
-          className={`w-full bg-gray-800/80 border text-[11px] font-mono rounded-md px-3 py-2 text-gray-200 placeholder-gray-600 resize-none outline-none transition-colors ${
+          className={`w-full bg-gray-800/80 border text-[11px] font-mono rounded-none px-3 py-2 text-gray-200 placeholder-gray-600 resize-none outline-none transition-colors ${
             queryError
               ? 'border-red-700 focus:border-red-500'
               : 'border-gray-700 focus:border-blue-600'
@@ -399,7 +399,7 @@ export const QueryBar: React.FC = () => {
             id={listboxId}
             role="listbox"
             aria-label={`${suggestions.length} autocomplete suggestion${suggestions.length !== 1 ? 's' : ''}`}
-            className="absolute left-0 top-full mt-1 z-50 w-full rounded-md border border-gray-700 bg-gray-900 shadow-xl overflow-hidden"
+            className="absolute left-0 top-full mt-1 z-50 w-full rounded-none border border-gray-700 bg-gray-900 shadow-xl overflow-hidden"
           >
             {suggestions.map((s, i) => (
               <div
@@ -434,7 +434,7 @@ export const QueryBar: React.FC = () => {
           disabled={!query.trim() || queryLoading}
           aria-label={queryLoading ? 'Executing query, please wait' : 'Execute query (Ctrl+Enter)'}
           aria-busy={queryLoading}
-          className="flex items-center gap-1.5 bg-blue-700 hover:bg-blue-600 disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed text-white text-[11px] font-medium px-3 py-1.5 rounded-md transition-colors"
+          className="flex items-center gap-1.5 bg-blue-700 hover:bg-blue-600 disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed text-white text-[11px] font-medium px-3 py-1.5 rounded-none transition-colors"
         >
           {queryLoading ? (
             <>
@@ -465,7 +465,7 @@ export const QueryBar: React.FC = () => {
 
       {/* Results table */}
       {queryResults.length > 0 && (
-        <div className="mt-1 rounded-md border border-gray-800 overflow-hidden">
+        <div className="mt-1 rounded-none border border-gray-800 overflow-hidden">
           <div className="flex items-center justify-between px-3 py-1 bg-gray-900 border-b border-gray-800">
             <h3 className="text-[10px] text-gray-500">Results</h3>
             <button

@@ -25,19 +25,19 @@ function ConnectorCard({ connector }: { connector: Connector }) {
   const cfg = STATUS_CONFIG[connector.status] ?? STATUS_CONFIG.error;
 
   return (
-    <div className={`rounded-md border bg-gray-800/50 p-2.5 transition-colors ${
+    <div className={`rounded-none border bg-gray-800/50 p-2.5 transition-colors ${
       connector.enabled ? 'border-gray-700' : 'border-gray-800 opacity-50'
     }`}>
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           <div className="flex items-center gap-1.5">
-            <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${cfg.dot}`} />
+            <span className={`w-1.5 h-1.5 rounded-none flex-shrink-0 ${cfg.dot}`} />
             <span className="text-[11px] font-medium text-gray-200 truncate">
               {connector.name}
             </span>
           </div>
           <div className="flex items-center gap-1.5 mt-1">
-            <span className="text-[9px] text-gray-600 bg-gray-800 border border-gray-700 rounded px-1 py-0.5">
+            <span className="text-[9px] text-gray-600 bg-gray-800 border border-gray-700 rounded-none px-1 py-0.5">
               {connector.type}
             </span>
             <span className={`text-[9px] ${cfg.text}`}>{cfg.label}</span>
@@ -52,14 +52,14 @@ function ConnectorCard({ connector }: { connector: Connector }) {
         <div className="mt-2 grid grid-cols-3 gap-1">
           <div className="text-center">
             <div className="text-[11px] font-mono text-blue-300">
-              {connector.stats.events_per_sec.toFixed(1)}
+              {connector?.stats?.events_per_sec?.toFixed(1) ?? "0"}
             </div>
             <div className="text-[8px] text-gray-600">evt/s</div>
           </div>
           <div className="text-center">
             <div className="text-[11px] font-mono text-gray-300">
-              {connector.stats.error_count > 0 ? (
-                <span className="text-red-400">{connector.stats.error_count}</span>
+              {connector?.stats?.error_count > 0 ? (
+                <span className="text-red-400">{connector?.stats?.error_count ?? 0}</span>
               ) : (
                 <span className="text-green-400">0</span>
               )}
@@ -68,7 +68,7 @@ function ConnectorCard({ connector }: { connector: Connector }) {
           </div>
           <div className="text-center">
             <div className="text-[10px] font-mono text-gray-400 truncate">
-              {formatLastEvent(connector.stats.last_event_at)}
+              {formatLastEvent(connector?.stats?.last_event_at)}
             </div>
             <div className="text-[8px] text-gray-600">last evt</div>
           </div>
@@ -99,7 +99,7 @@ function Section({ title, badge, collapsed, onToggle, children }: SectionProps) 
             {title}
           </span>
           {badge != null && badge > 0 && (
-            <span className="text-[9px] bg-red-900/70 border border-red-800/60 text-red-300 rounded-full px-1.5 min-w-[18px] text-center">
+            <span className="text-[9px] bg-red-900/70 border border-red-800/60 text-red-300 rounded-none px-1.5 min-w-[18px] text-center">
               {badge}
             </span>
           )}
@@ -164,7 +164,7 @@ export const Sidebar: React.FC = () => {
             <button
               key={label}
               onClick={toggle}
-              className={`text-[9px] px-2 py-0.5 rounded border transition-colors ${
+              className={`text-[9px] px-2 py-0.5 rounded-none border transition-colors ${
                 active
                   ? 'bg-blue-900/50 border-blue-700 text-blue-300'
                   : 'border-gray-700 text-gray-600 hover:border-gray-600 hover:text-gray-400'
@@ -220,7 +220,7 @@ export const Sidebar: React.FC = () => {
 
       {/* Footer */}
       <div className="flex-shrink-0 px-3 py-2 border-t border-gray-800 flex items-center gap-2">
-        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${wsConnected ? 'bg-green-500' : 'bg-red-500'}`} />
+        <span className={`w-1.5 h-1.5 rounded-none flex-shrink-0 ${wsConnected ? 'bg-green-500' : 'bg-red-500'}`} />
         <span className="text-[9px] text-gray-600">
           {wsConnected ? 'WS connected' : 'WS disconnected'}
         </span>

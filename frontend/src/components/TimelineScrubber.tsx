@@ -147,7 +147,7 @@ export const TimelineScrubber: React.FC = () => {
         {/* Play/Pause */}
         <button
           onClick={() => setTimelinePlaying(!playing)}
-          className="flex-shrink-0 w-7 h-7 flex items-center justify-center rounded-md bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 hover:text-white transition-colors"
+          className="flex-shrink-0 w-7 h-7 flex items-center justify-center rounded-none bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 hover:text-white transition-colors"
           aria-label={playing ? 'Pause' : 'Play'}
         >
           {playing ? (
@@ -168,7 +168,7 @@ export const TimelineScrubber: React.FC = () => {
             <button
               key={s}
               onClick={() => setTimelineSpeed(s)}
-              className={`text-[9px] w-6 h-5 rounded border transition-colors ${
+              className={`text-[9px] w-6 h-5 rounded-none border transition-colors ${
                 speed === s
                   ? 'bg-blue-900/60 border-blue-700 text-blue-300'
                   : 'border-gray-700 text-gray-600 hover:text-gray-400 hover:border-gray-600'
@@ -201,14 +201,14 @@ export const TimelineScrubber: React.FC = () => {
         </span>
 
         {/* Current time display */}
-        <div className="flex-shrink-0 font-mono text-[10px] text-gray-300 w-36 text-center bg-gray-800/60 border border-gray-700 rounded px-2 py-0.5">
+        <div className="flex-shrink-0 font-mono text-[10px] text-gray-300 w-36 text-center bg-gray-800/60 border border-gray-700 rounded-none px-2 py-0.5">
           {formatTime(currentTime)}
         </div>
 
         {/* Now button */}
         <button
           onClick={jumpToNow}
-          className="flex-shrink-0 text-[9px] text-gray-500 hover:text-blue-400 border border-gray-700 hover:border-blue-700 rounded px-2 py-1 transition-colors"
+          className="flex-shrink-0 text-[9px] text-gray-500 hover:text-blue-400 border border-gray-700 hover:border-blue-700 rounded-none px-2 py-1 transition-colors"
         >
           NOW
         </button>

@@ -73,7 +73,7 @@ function AlertCard({ alert, onAck, onSelectEntity }: AlertCardProps) {
 
   return (
     <article
-      className={`border-l-2 ${cfg.border} bg-gray-800/60 hover:bg-gray-800 rounded-r-md p-2.5 transition-colors ${
+      className={`border-l-2 ${cfg.border} bg-gray-800/60 hover:bg-gray-800 rounded-none p-2.5 transition-colors ${
         alert.acknowledged ? 'opacity-50' : ''
       }`}
       aria-label={alertSummary}
@@ -82,7 +82,7 @@ function AlertCard({ alert, onAck, onSelectEntity }: AlertCardProps) {
       <div className="flex items-start justify-between gap-2">
         <div className="flex items-start gap-2 min-w-0">
           <span
-            className={`mt-0.5 flex-shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold tracking-wider ${cfg.badge}`}
+            className={`mt-0.5 flex-shrink-0 rounded-none px-1.5 py-0.5 text-[9px] font-bold tracking-wider ${cfg.badge}`}
             aria-hidden="true" /* severity announced via article aria-label */
           >
             {cfg.label}
@@ -122,7 +122,7 @@ function AlertCard({ alert, onAck, onSelectEntity }: AlertCardProps) {
           {!alert.acknowledged && (
             <button
               onClick={() => onAck(alert.id)}
-              className="text-[9px] text-gray-500 hover:text-gray-300 border border-gray-700 hover:border-gray-500 rounded px-1.5 py-0.5 transition-colors"
+              className="text-[9px] text-gray-500 hover:text-gray-300 border border-gray-700 hover:border-gray-500 rounded-none px-1.5 py-0.5 transition-colors"
               aria-label={`Acknowledge alert: ${alert.monitor_name}`}
             >
               <span aria-hidden="true">ACK</span>

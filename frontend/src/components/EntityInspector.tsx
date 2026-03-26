@@ -44,10 +44,10 @@ function ConfidenceBar({ value }: { value: number }) {
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuetext={`${pct}% data confidence`}
-        className="h-1.5 rounded-full bg-gray-700 overflow-hidden"
+        className="h-1.5 rounded-none bg-gray-700 overflow-hidden"
       >
         <div
-          className={`h-full rounded-full transition-all ${color}`}
+          className={`h-full rounded-none transition-all ${color}`}
           style={{ width: `${pct}%` }}
         />
       </div>
@@ -118,12 +118,12 @@ function RelationList({ items, direction, onSelect }: RelationListProps) {
         return (
           <li
             key={rel.id}
-            className="flex items-start gap-2 rounded-md bg-gray-800/50 px-2 py-1.5 hover:bg-gray-800 group transition-colors"
+            className="flex items-start gap-2 rounded-none bg-gray-800/50 px-2 py-1.5 hover:bg-gray-800 group transition-colors"
           >
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-1.5">
                 <span
-                  className="text-[9px] text-blue-400 font-medium bg-blue-950/60 border border-blue-800/50 rounded px-1 py-0.5 whitespace-nowrap"
+                  className="text-[9px] text-blue-400 font-medium bg-blue-950/60 border border-blue-800/50 rounded-none px-1 py-0.5 whitespace-nowrap"
                   aria-label={`Relationship type: ${rel.type}`}
                 >
                   {rel.type}
@@ -266,13 +266,13 @@ export const EntityInspector: React.FC = () => {
                 </h2>
                 <div className="flex items-center gap-1.5 mt-0.5">
                   <span
-                    className="text-[9px] px-1.5 py-0.5 rounded bg-gray-800 border border-gray-700 text-gray-400"
+                    className="text-[9px] px-1.5 py-0.5 rounded-none bg-gray-800 border border-gray-700 text-gray-400"
                     aria-label={`Entity type: ${entity.type}`}
                   >
                     {entity.type}
                   </span>
                   <span
-                    className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                    className={`w-1.5 h-1.5 rounded-none flex-shrink-0 ${
                       entity.is_active ? 'bg-green-500' : 'bg-gray-600'
                     }`}
                     aria-label={entity.is_active ? 'Active' : 'Inactive'}
@@ -290,7 +290,7 @@ export const EntityInspector: React.FC = () => {
           <button
             ref={closeButtonRef}
             onClick={close}
-            className="text-gray-600 hover:text-gray-300 flex-shrink-0 text-sm transition-colors p-1 rounded hover:bg-gray-800"
+            className="text-gray-600 hover:text-gray-300 flex-shrink-0 text-sm transition-colors p-1 rounded-none hover:bg-gray-800"
             aria-label="Close entity inspector"
           >
             <span aria-hidden="true">✕</span>
@@ -299,7 +299,7 @@ export const EntityInspector: React.FC = () => {
 
         {error && (
           <div
-            className="mt-1.5 text-[10px] text-amber-400 bg-amber-950/30 border border-amber-800/40 rounded px-2 py-1"
+            className="mt-1.5 text-[10px] text-amber-400 bg-amber-950/30 border border-amber-800/40 rounded-none px-2 py-1"
             role="alert"
           >
             Partial data (API unavailable)
@@ -371,7 +371,7 @@ export const EntityInspector: React.FC = () => {
                   <dt className="text-gray-600">Tags</dt>
                   <dd className="flex flex-wrap gap-1 justify-end max-w-[60%]">
                     {entity.tags.map((tag) => (
-                      <span key={tag} className="text-[9px] bg-gray-800 border border-gray-700 rounded px-1 text-gray-400">
+                      <span key={tag} className="text-[9px] bg-gray-800 border border-gray-700 rounded-none px-1 text-gray-400">
                         {tag}
                       </span>
                     ))}
@@ -410,7 +410,7 @@ export const EntityInspector: React.FC = () => {
                   Geometry
                 </h3>
                 <div
-                  className="text-[10px] font-mono text-gray-500 bg-gray-800/50 rounded px-2 py-1.5 break-all"
+                  className="text-[10px] font-mono text-gray-500 bg-gray-800/50 rounded-none px-2 py-1.5 break-all"
                   aria-label={`Geometry type ${entity.geometry.type} with coordinates ${JSON.stringify(
                     (entity.geometry.coordinates as number[]).slice(0, 2).map((n) => n.toFixed(4))
                   )}`}
@@ -475,7 +475,7 @@ export const EntityInspector: React.FC = () => {
                 (entity.history ?? []).map((h, i) => (
                   <li key={i} className="flex gap-2.5">
                     <div className="flex flex-col items-center" aria-hidden="true">
-                      <div className="w-1.5 h-1.5 rounded-full bg-blue-500 mt-1 flex-shrink-0" />
+                      <div className="w-1.5 h-1.5 rounded-none bg-blue-500 mt-1 flex-shrink-0" />
                       {i < (entity.history ?? []).length - 1 && (
                         <div className="w-px flex-1 bg-gray-800 mt-0.5" />
                       )}
@@ -528,7 +528,7 @@ export const EntityInspector: React.FC = () => {
                   <ul className="space-y-1 list-none p-0 m-0" aria-label="Data sources">
                     {[...new Set((entity.history ?? []).map((h) => h.source))].map((src) => (
                       <li key={src} className="flex items-center gap-1.5">
-                        <span className="w-1.5 h-1.5 rounded-full bg-green-500 flex-shrink-0" aria-hidden="true" />
+                        <span className="w-1.5 h-1.5 rounded-none bg-green-500 flex-shrink-0" aria-hidden="true" />
                         <span className="font-mono text-gray-400">{src}</span>
                       </li>
                     ))}
