@@ -237,7 +237,9 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
   useWebSocket('Ship');
 
   useEffect(() => {
-    const all = [...(shipData?.data ?? []), ...(portData?.data ?? [])];
+    const ships = shipData?.data ?? [];
+    const ports = portData?.data ?? [];
+    const all = [...ships, ...ports];
     if (all.length > 0) setEntities(all);
   }, [shipData, portData, setEntities]);
 

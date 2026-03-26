@@ -6,6 +6,42 @@ import type { Connector } from '../types';
 
 const API_BASE = '/api/v1';
 
+/** Raw data-source shape returned by the backend `/api/v1/connectors` endpoint */
+interface RawDataSource {
+  source_id: string;
+  source_name: string;
+  source_type: string;
+  trust_score: number;
+  events_ingested: number;
+  entities_provided: number;
+  error_count: number;
+  enabled: boolean;
+  last_heartbeat: string | null;
+  certificate_fingerprint: string | null;
+}
+
+/** Convert a backend DataSource to the frontend Connector shape */
+function toConnector(ds: RawDataSource): Connector {
+  const status: Connector['status'] =
+    !ds.enabled ? 'error'
+    : ds.error_count > 0 ? 'degraded'
+    : 'healthy';
+
+  return {
+    id: ds.source_id,
+    name: ds.source_name,
+    type: ds.source_type,
+    enabled: ds.enabled,
+    status,
+    stats: {
+      events_per_sec: 0,
+      last_event_at: ds.last_heartbeat ?? new Date().toISOString(),
+      error_count: ds.error_count ?? 0,
+      total_ingested: ds.events_ingested ?? 0,
+    },
+  };
+}
+
 const STATUS_CONFIG = {
   healthy: { dot: 'bg-green-500', text: 'text-green-400', label: 'Healthy' },
   degraded: { dot: 'bg-amber-400', text: 'text-amber-400', label: 'Degraded' },
@@ -131,13 +167,14 @@ export const Sidebar: React.FC = () => {
 
   const unackedAlerts = alerts.filter((a) => !a.acknowledged).length;
 
-  // Fetch real connectors from API
+  // Fetch real connectors from API and map DataSource → Connector
   useEffect(() => {
     fetch(`${API_BASE}/connectors`)
       .then((r) => r.ok ? r.json() : null)
       .then((data) => {
-        if (Array.isArray((data as { data?: Connector[] })?.data)) {
-          setConnectors((data as { data: Connector[] }).data);
+        const raw = (data as { data?: RawDataSource[] })?.data;
+        if (Array.isArray(raw)) {
+          setConnectors(raw.map(toConnector));
         }
       })
       .catch(() => {/* API unavailable — leave empty */});

@@ -3,17 +3,10 @@ import DeckGL from '@deck.gl/react';
 import {
   ScatterplotLayer,
   PathLayer,
-
-// Safe color helper — prevents Deck.gl luma crash on null/undefined colors
-
   PolygonLayer,
 } from '@deck.gl/layers';
-import { Map } from 'react-map-gl/maplibre';
 import { useAppStore } from '../store/useAppStore';
 import type { Entity } from '../types';
-import 'maplibre-gl/dist/maplibre-gl.css';
-
-const MAPLIBRE_STYLE = 'https://demotiles.maplibre.org/style.json';
 
 // Speed color thresholds (RGBA)
 function shipColor(speed: unknown, selected: boolean): [number, number, number, number] {
@@ -145,17 +138,17 @@ export const MapView: React.FC = () => {
   };
 
   const ships = useMemo(
-    () => allEntities.filter((e) => e.type === 'Ship' && hasValidGeometry(e)),
+    () => allEntities.filter((e) => e.type?.toLowerCase() === 'ship' && hasValidGeometry(e)),
     [allEntities]
   );
 
   const ports = useMemo(
-    () => allEntities.filter((e) => e.type === 'Port' && hasValidGeometry(e)),
+    () => allEntities.filter((e) => e.type?.toLowerCase() === 'port' && hasValidGeometry(e)),
     [allEntities]
   );
 
   const weatherSystems = useMemo(
-    () => allEntities.filter((e) => e.type === 'WeatherSystem' && hasValidGeometry(e)),
+    () => allEntities.filter((e) => e.type?.toLowerCase() === 'weathersystem' && hasValidGeometry(e)),
     [allEntities]
   );
 
@@ -167,12 +160,12 @@ export const MapView: React.FC = () => {
   const handleHover = useCallback((info: { object?: Entity; x?: number; y?: number }) => {
     if (info.object && info.x != null && info.y != null) {
       const name = info.object.name ?? info.object.id;
-      const type = info.object.type;
+      const typeLower = info.object.type?.toLowerCase();
       const props = info.object.properties ?? {};
       const extra =
-        type === 'Ship'
+        typeLower === 'ship'
           ? ` · ${typeof props.speed === 'number' ? props.speed.toFixed(1) : '?'} kn`
-          : type === 'Port'
+          : typeLower === 'port'
           ? ` · TEU: ${(typeof props.total_teu === 'number' ? props.total_teu : 0).toLocaleString()}`
           : '';
       setTooltip({ x: info.x, y: info.y, content: `${name}${extra}` });
@@ -426,13 +419,8 @@ export const MapView: React.FC = () => {
         getCursor={({ isDragging, isHovering }) =>
           isDragging ? 'grabbing' : isHovering ? 'pointer' : 'grab'
         }
-      >
-        <Map
-          mapStyle={MAPLIBRE_STYLE}
-          reuseMaps
-          attributionControl={false}
-        />
-      </DeckGL>
+        style={{ background: '#0a0e17' }}
+      />
 
       {/* Tooltip — announced via existing hover; not separately announced as it's supplemental */}
       {tooltip && (
