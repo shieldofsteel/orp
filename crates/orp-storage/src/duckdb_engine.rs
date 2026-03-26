@@ -507,7 +507,7 @@ impl Storage for DuckDbStorage {
                         CAST(e.first_seen AS VARCHAR)
                  FROM entities e
                  LEFT JOIN entity_geometry g ON g.entity_id = e.entity_id
-                 WHERE e.entity_type = ? AND e.is_active = TRUE
+                 WHERE LOWER(e.entity_type) = LOWER(?) AND e.is_active = TRUE
                  ORDER BY e.last_updated DESC
                  LIMIT ? OFFSET ?",
             )
@@ -638,7 +638,7 @@ impl Storage for DuckDbStorage {
                         CAST(e.first_seen AS VARCHAR)
                  FROM entities e
                  JOIN entity_geometry g ON g.entity_id = e.entity_id
-                 WHERE e.is_active = TRUE AND e.entity_type = ?
+                 WHERE e.is_active = TRUE AND LOWER(e.entity_type) = LOWER(?)
                    AND g.latitude  BETWEEN ? AND ?
                    AND g.longitude BETWEEN ? AND ?",
                 true,
@@ -715,7 +715,7 @@ impl Storage for DuckDbStorage {
                             e.is_active
                      FROM entities e
                      JOIN entity_geometry g ON g.entity_id = e.entity_id
-                     WHERE e.is_active = TRUE AND e.entity_type = ?
+                     WHERE e.is_active = TRUE AND LOWER(e.entity_type) = LOWER(?)
                        AND ST_Contains(ST_GeomFromText(?), ST_Point(g.longitude, g.latitude))",
                     true,
                 )
@@ -753,7 +753,7 @@ impl Storage for DuckDbStorage {
                         CAST(e.first_seen AS VARCHAR)
                  FROM entities e
                  JOIN entity_geometry g ON g.entity_id = e.entity_id
-                 WHERE e.is_active = TRUE AND e.entity_type = ?",
+                 WHERE e.is_active = TRUE AND LOWER(e.entity_type) = LOWER(?)",
                 true,
             )
         } else {
@@ -1421,7 +1421,7 @@ impl Storage for DuckDbStorage {
         }
         if let Some(etype) = entity_type {
             conditions.push(
-                "ev.entity_id IN (SELECT entity_id FROM entities WHERE entity_type = ?)"
+                "ev.entity_id IN (SELECT entity_id FROM entities WHERE LOWER(entity_type) = LOWER(?))"
                     .to_string(),
             );
             param_values.push(Box::new(etype.to_string()));
@@ -1492,7 +1492,7 @@ impl Storage for DuckDbStorage {
         }
         if let Some(etype) = entity_type {
             conditions.push(
-                "ev.entity_id IN (SELECT entity_id FROM entities WHERE entity_type = ?)"
+                "ev.entity_id IN (SELECT entity_id FROM entities WHERE LOWER(entity_type) = LOWER(?))"
                     .to_string(),
             );
             param_values.push(Box::new(etype.to_string()));
@@ -1570,7 +1570,7 @@ impl Storage for DuckDbStorage {
                         CAST(e.first_seen AS VARCHAR)
                  FROM entities e
                  LEFT JOIN entity_geometry g ON g.entity_id = e.entity_id
-                 WHERE e.is_active = TRUE AND e.entity_type = ?
+                 WHERE e.is_active = TRUE AND LOWER(e.entity_type) = LOWER(?)
                    AND (e.name ILIKE ? OR e.entity_id ILIKE ?)
                  LIMIT ?",
                 true,

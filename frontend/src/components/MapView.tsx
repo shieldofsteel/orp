@@ -7,6 +7,7 @@ import {
 } from '@deck.gl/layers';
 import { useAppStore } from '../store/useAppStore';
 import type { Entity } from '../types';
+import { EUROPE_COASTLINE, generateGrid } from './mapData';
 
 // Speed color thresholds (RGBA)
 function shipColor(speed: unknown, selected: boolean): [number, number, number, number] {
@@ -230,8 +231,41 @@ export const MapView: React.FC = () => {
     [mapCenter, mapZoom]
   );
 
+  // Pre-compute grid data outside layers memo to avoid regenerating each frame
+  const gridLines = useMemo(() => generateGrid(-12, 16, 44, 66, 2), []);
+
   const layers = useMemo(() => {
     const result = [];
+
+    // ── Coordinate grid for spatial reference ──
+    result.push(
+      new PathLayer({
+        id: 'grid-layer',
+        data: gridLines,
+        pickable: false,
+        getPath: (d: { path: [number, number][] }) => d.path,
+        getColor: [255, 255, 255, 18],
+        getWidth: 1,
+        widthMinPixels: 1,
+        widthMaxPixels: 1,
+      })
+    );
+
+    // ── Coastline outlines for spatial reference ──
+    result.push(
+      new PathLayer({
+        id: 'coastline-layer',
+        data: EUROPE_COASTLINE.map((coords, i) => ({ id: i, path: coords })),
+        pickable: false,
+        getPath: (d: { path: [number, number][] }) => d.path,
+        getColor: [100, 140, 180, 80],
+        getWidth: 1.5,
+        widthMinPixels: 1,
+        widthMaxPixels: 3,
+        capRounded: true,
+        jointRounded: true,
+      })
+    );
 
     if (showWeatherLayer) {
       result.push(
@@ -388,6 +422,7 @@ export const MapView: React.FC = () => {
     showHeatmapLayer,
     selectEntity,
     handleHover,
+    gridLines,
   ]);
 
   return (

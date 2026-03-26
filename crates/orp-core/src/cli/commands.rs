@@ -314,8 +314,9 @@ pub async fn run_start(
     }
     tracing::info!("Loaded {} ports", ports.len());
 
-    // Initialize stream processor
-    let dedup_path = std::env::temp_dir().join("orp-dedup");
+    // Initialize stream processor — use a unique dedup path per run to avoid
+    // stale duplicate hashes from previous sessions blocking new events.
+    let dedup_path = std::env::temp_dir().join(format!("orp-dedup-{}", std::process::id()));
     std::fs::create_dir_all(&dedup_path).ok();
     let dedup = Arc::new(
         RocksDbDedupWindow::open(&dedup_path, 3600)
@@ -433,6 +434,32 @@ pub async fn run_start(
                 tracing::warn!("Failed to process event: {}", e);
             }
 
+            // Send property change events for name and other metadata so entity.name is set
+            for prop_key in &["name", "ship_type", "mmsi"] {
+                if let Some(val) = source_event.properties.get(*prop_key) {
+                    let prop_event = OrpEvent::new(
+                        source_event.entity_id.clone(),
+                        source_event.entity_type.clone(),
+                        EventPayload::PropertyChange {
+                            key: prop_key.to_string(),
+                            old_value: None,
+                            new_value: val.clone(),
+                            is_derived: false,
+                        },
+                        source_event.connector_id.clone(),
+                        0.95,
+                    );
+                    let prop_ctx = orp_stream::StreamContext {
+                        event: prop_event,
+                        dedup_window_seconds: 3600,
+                        batch_size: 50,
+                    };
+                    if let Err(e) = processor_bg.process_event(prop_ctx).await {
+                        tracing::warn!("Failed to process property event: {}", e);
+                    }
+                }
+            }
+
             if let Ok(Some(entity)) = storage_bg.get_entity(&source_event.entity_id).await {
                 let alerts = monitor_bg.evaluate(&entity).await;
                 for alert in &alerts {
@@ -440,9 +467,8 @@ pub async fn run_start(
                 }
             }
 
-            if source_event.properties.contains_key("name") {
-                let _ = processor_bg.flush().await;
-            }
+            // Flush immediately for the first batch to ensure entities appear quickly
+            let _ = processor_bg.flush().await;
         }
     });
 

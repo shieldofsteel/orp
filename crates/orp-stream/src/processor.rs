@@ -182,6 +182,16 @@ impl DefaultStreamProcessor {
                 key,
                 new_value,
                 ..
+            } if key == "name" => {
+                if let Some(name_str) = new_value.as_str() {
+                    entity.name = Some(name_str.to_string());
+                }
+                entity.properties.insert(key.clone(), new_value.clone());
+            }
+            EventPayload::PropertyChange {
+                key,
+                new_value,
+                ..
             } => {
                 entity.properties.insert(key.clone(), new_value.clone());
             }
