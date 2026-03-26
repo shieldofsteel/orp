@@ -80,4 +80,84 @@ mod tests {
         bad_sig[0] ^= 0xFF; // corrupt signature
         assert!(!signer.verify(data, &bad_sig));
     }
+
+    #[test]
+    fn test_hash_deterministic() {
+        let h1 = compute_hash("same input");
+        let h2 = compute_hash("same input");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_different_inputs() {
+        let h1 = compute_hash("hello");
+        let h2 = compute_hash("world");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_empty_input() {
+        let h = compute_hash("");
+        assert_eq!(h.len(), 64);
+    }
+
+    #[test]
+    fn test_public_key_bytes() {
+        let signer = EventSigner::new();
+        let pk = signer.public_key_bytes();
+        assert_eq!(pk.len(), 32); // Ed25519 public key = 32 bytes
+    }
+
+    #[test]
+    fn test_different_signers_produce_different_sigs() {
+        let s1 = EventSigner::new();
+        let s2 = EventSigner::new();
+        let data = b"test data";
+        let sig1 = s1.sign(data);
+        let sig2 = s2.sign(data);
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn test_verify_wrong_signer_fails() {
+        let s1 = EventSigner::new();
+        let s2 = EventSigner::new();
+        let data = b"test data";
+        let sig = s1.sign(data);
+        assert!(!s2.verify(data, &sig));
+    }
+
+    #[test]
+    fn test_verify_wrong_data_fails() {
+        let signer = EventSigner::new();
+        let sig = signer.sign(b"original data");
+        assert!(!signer.verify(b"different data", &sig));
+    }
+
+    #[test]
+    fn test_verify_short_signature_fails() {
+        let signer = EventSigner::new();
+        assert!(!signer.verify(b"data", &[0u8; 32]));
+    }
+
+    #[test]
+    fn test_verify_empty_signature_fails() {
+        let signer = EventSigner::new();
+        assert!(!signer.verify(b"data", &[]));
+    }
+
+    #[test]
+    fn test_default_signer() {
+        let signer = EventSigner::default();
+        let sig = signer.sign(b"test");
+        assert!(signer.verify(b"test", &sig));
+    }
+
+    #[test]
+    fn test_sign_large_data() {
+        let signer = EventSigner::new();
+        let data = vec![0xABu8; 10_000];
+        let sig = signer.sign(&data);
+        assert!(signer.verify(&data, &sig));
+    }
 }

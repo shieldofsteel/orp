@@ -32,3 +32,9 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
 orp-testbed = { path = "../orp-testbed" }
+tabled = "0.17"
+colored = "3"
+clap_complete = "4"
+csv = "1.3"
+
+

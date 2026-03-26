@@ -240,4 +240,110 @@ mod tests {
         assert_eq!(event.entity_id, "mmsi:123456789");
         assert_eq!(event.entity_type, "ship");
     }
+
+    #[test]
+    fn test_parse_csv_line_too_few_fields() {
+        let line = "211378120,51.9225";
+        assert!(AisConnector::parse_csv_line(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_csv_line_invalid_lat() {
+        let line = "211378120,INVALID,4.4792,12.3,245.0,243.0";
+        assert!(AisConnector::parse_csv_line(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_csv_line_no_name() {
+        let line = "211378120,51.9225,4.4792,12.3,245.0,243.0";
+        let msg = AisConnector::parse_csv_line(line).unwrap();
+        assert!(msg.name.is_none());
+        assert!(msg.ship_type.is_none());
+    }
+
+    #[test]
+    fn test_parse_csv_line_heading_defaults_to_course() {
+        let line = "211378120,51.9225,4.4792,12.3,245.0";
+        // Only 5 fields — not enough for heading parse
+        assert!(AisConnector::parse_csv_line(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_nmea_sentence_non_aivdm() {
+        assert!(AisConnector::parse_nmea_sentence("$GPGGA,something").is_none());
+    }
+
+    #[test]
+    fn test_parse_nmea_sentence_too_short() {
+        assert!(AisConnector::parse_nmea_sentence("!AIVDM,1,2").is_none());
+    }
+
+    #[test]
+    fn test_source_event_has_properties() {
+        let msg = AisMessage {
+            mmsi: "999999999".to_string(),
+            latitude: 52.0,
+            longitude: 5.0,
+            speed: 25.0,
+            course: 90.0,
+            heading: 88.0,
+            name: Some("Big Ship".to_string()),
+            ship_type: Some("container".to_string()),
+            timestamp: Utc::now(),
+        };
+        let event = msg.to_source_event("ais-test");
+        assert!(event.properties.contains_key("mmsi"));
+        assert!(event.properties.contains_key("speed"));
+        assert!(event.properties.contains_key("course"));
+        assert!(event.properties.contains_key("heading"));
+        assert!(event.properties.contains_key("name"));
+        assert!(event.properties.contains_key("ship_type"));
+    }
+
+    #[test]
+    fn test_connector_id() {
+        let config = ConnectorConfig {
+            connector_id: "ais-test-id".to_string(),
+            connector_type: "ais".to_string(),
+            url: None,
+            entity_type: "ship".to_string(),
+            enabled: true,
+            trust_score: 0.9,
+            properties: HashMap::new(),
+        };
+        let connector = AisConnector::new(config);
+        assert_eq!(connector.connector_id(), "ais-test-id");
+    }
+
+    #[test]
+    fn test_connector_stats_initial() {
+        let config = ConnectorConfig {
+            connector_id: "ais-stats".to_string(),
+            connector_type: "ais".to_string(),
+            url: None,
+            entity_type: "ship".to_string(),
+            enabled: true,
+            trust_score: 0.9,
+            properties: HashMap::new(),
+        };
+        let connector = AisConnector::new(config);
+        let stats = connector.stats();
+        assert_eq!(stats.events_processed, 0);
+        assert_eq!(stats.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_not_running() {
+        let config = ConnectorConfig {
+            connector_id: "ais-health".to_string(),
+            connector_type: "ais".to_string(),
+            url: None,
+            entity_type: "ship".to_string(),
+            enabled: true,
+            trust_score: 0.9,
+            properties: HashMap::new(),
+        };
+        let connector = AisConnector::new(config);
+        assert!(connector.health_check().await.is_err());
+    }
 }

@@ -568,4 +568,143 @@ mod tests {
         assert!(engine.remove_rule("test-rule").await);
         assert!(engine.get_rules().await.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent_rule() {
+        let engine = MonitorEngine::new();
+        assert!(!engine.remove_rule("nonexistent").await);
+    }
+
+    #[tokio::test]
+    async fn test_wrong_entity_type_no_alert() {
+        let engine = MonitorEngine::new();
+        engine
+            .add_rule(MonitorRule {
+                rule_id: "ship-only".to_string(),
+                name: "Ship speed".to_string(),
+                description: "".to_string(),
+                entity_type: "ship".to_string(),
+                condition: MonitorCondition::PropertyThreshold {
+                    property: "speed".to_string(),
+                    operator: ThresholdOp::GreaterThan,
+                    value: 0.0,
+                },
+                action: MonitorAction::Alert,
+                enabled: true,
+                cooldown_seconds: 0,
+                severity: AlertSeverity::Info,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await;
+
+        let aircraft = Entity {
+            entity_id: "aircraft-1".to_string(),
+            entity_type: "aircraft".to_string(),
+            properties: {
+                let mut p = HashMap::new();
+                p.insert("speed".to_string(), serde_json::json!(500.0));
+                p
+            },
+            ..Entity::default()
+        };
+        let alerts = engine.evaluate(&aircraft).await;
+        assert!(alerts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_less_than_operator() {
+        let engine = MonitorEngine::new();
+        engine
+            .add_rule(MonitorRule {
+                rule_id: "slow".to_string(),
+                name: "Slow ship".to_string(),
+                description: "".to_string(),
+                entity_type: "ship".to_string(),
+                condition: MonitorCondition::PropertyThreshold {
+                    property: "speed".to_string(),
+                    operator: ThresholdOp::LessThan,
+                    value: 5.0,
+                },
+                action: MonitorAction::Alert,
+                enabled: true,
+                cooldown_seconds: 0,
+                severity: AlertSeverity::Warning,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await;
+
+        let slow = make_ship("slow-1", 2.0, 51.92, 4.48);
+        let alerts = engine.evaluate(&slow).await;
+        assert_eq!(alerts.len(), 1);
+
+        let fast = make_ship("fast-1", 10.0, 51.92, 4.48);
+        let alerts = engine.evaluate(&fast).await;
+        assert!(alerts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_alert() {
+        let engine = MonitorEngine::new();
+        engine
+            .add_rule(MonitorRule {
+                rule_id: "ack-test".to_string(),
+                name: "Ack test".to_string(),
+                description: "".to_string(),
+                entity_type: "ship".to_string(),
+                condition: MonitorCondition::PropertyThreshold {
+                    property: "speed".to_string(),
+                    operator: ThresholdOp::GreaterThan,
+                    value: 0.0,
+                },
+                action: MonitorAction::Alert,
+                enabled: true,
+                cooldown_seconds: 0,
+                severity: AlertSeverity::Info,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await;
+
+        let ship = make_ship("ack-ship", 10.0, 51.92, 4.48);
+        let alerts = engine.evaluate(&ship).await;
+        assert!(!alerts.is_empty());
+
+        let alert_id = &alerts[0].alert_id;
+        assert!(engine.acknowledge_alert(alert_id).await);
+        assert!(!engine.acknowledge_alert("nonexistent").await);
+    }
+
+    #[tokio::test]
+    async fn test_get_alerts_limit() {
+        let engine = MonitorEngine::new();
+        engine
+            .add_rule(MonitorRule {
+                rule_id: "many".to_string(),
+                name: "Many alerts".to_string(),
+                description: "".to_string(),
+                entity_type: "ship".to_string(),
+                condition: MonitorCondition::PropertyThreshold {
+                    property: "speed".to_string(),
+                    operator: ThresholdOp::GreaterThan,
+                    value: 0.0,
+                },
+                action: MonitorAction::Alert,
+                enabled: true,
+                cooldown_seconds: 0,
+                severity: AlertSeverity::Info,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await;
+
+        for i in 0..5 {
+            let ship = make_ship(&format!("ship-{}", i), 10.0 + i as f64, 51.92, 4.48);
+            engine.evaluate(&ship).await;
+        }
+
+        let alerts = engine.get_alerts(3).await;
+        assert!(alerts.len() <= 3);
+    }
 }

@@ -33,7 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
-tower = "0.4"
+tower = "0.5"
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 clap = { version = "4", features = ["derive"] }
 nom = "7.1"

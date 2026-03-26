@@ -1838,3 +1838,1013 @@ pub async fn delete_api_key(
 }
 
 // Frontend is now served via ServeDir in http.rs (frontend/dist/)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::http::{AppState, RateLimiter};
+    use crate::server::websocket::BroadcastEvent;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::{delete, get, post, put};
+    use axum::Router;
+    use orp_audit::crypto::EventSigner;
+    use orp_query::QueryExecutor;
+    use orp_security::{AbacEngine, ApiKeyService, AuthState};
+    use orp_storage::DuckDbStorage;
+    use orp_stream::{DefaultStreamProcessor, MonitorEngine, RocksDbDedupWindow, StreamProcessor};
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+    use tower::ServiceExt;
+
+    /// Build test app state with dev mode auth (permissive)
+    async fn make_test_state() -> Arc<AppState> {
+        let storage: Arc<dyn orp_storage::traits::Storage> =
+            Arc::new(DuckDbStorage::new_in_memory().unwrap());
+
+        let dedup_path = std::env::temp_dir().join(format!("orp-test-dedup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dedup_path).ok();
+        let dedup = Arc::new(RocksDbDedupWindow::open(&dedup_path, 3600).unwrap());
+        let processor: Arc<dyn StreamProcessor> =
+            Arc::new(DefaultStreamProcessor::new(storage.clone(), dedup, None, 50));
+        let query_executor = Arc::new(QueryExecutor::new(storage.clone()));
+        let monitor_engine = Arc::new(MonitorEngine::new());
+        let auth_state = Arc::new(AuthState {
+            jwt_service: None,
+            api_key_service: None,
+            permissive_mode: true,
+        });
+        let abac_engine = Arc::new(AbacEngine::default_permissive());
+        let api_key_service = Arc::new(ApiKeyService::new());
+        let audit_signer = Arc::new(EventSigner::new());
+        let (broadcast_tx, _) = broadcast::channel::<BroadcastEvent>(256);
+
+        Arc::new(AppState {
+            storage,
+            query_executor,
+            processor,
+            monitor_engine,
+            auth_state,
+            abac_engine,
+            api_key_service,
+            audit_signer,
+            broadcast_tx,
+            started_at: std::time::Instant::now(),
+        })
+    }
+
+    /// Build a test router with all routes and dev-mode auth injected
+    async fn make_test_app() -> (Router, Arc<AppState>) {
+        let state = make_test_state().await;
+
+        // The AuthContext extractor needs AuthState in request extensions.
+        // We inject it via a simple middleware layer.
+        let state_for_middleware = state.clone();
+        let app = Router::new()
+            .route("/api/v1/health", get(health_check))
+            .route("/api/v1/entities", get(list_entities))
+            .route("/api/v1/entities", post(create_entity))
+            .route("/api/v1/entities/search", get(search_entities))
+            .route("/api/v1/entities/:id", get(get_entity))
+            .route("/api/v1/entities/:id", put(update_entity))
+            .route("/api/v1/entities/:id", delete(delete_entity))
+            .route("/api/v1/entities/:id/relationships", get(get_entity_relationships))
+            .route("/api/v1/entities/:id/events", get(get_entity_events))
+            .route("/api/v1/relationships", post(create_relationship))
+            .route("/api/v1/query", post(execute_query))
+            .route("/api/v1/graph", post(graph_query))
+            .route("/api/v1/connectors", get(list_connectors))
+            .route("/api/v1/connectors", post(create_connector))
+            .route("/api/v1/connectors/:id", put(update_connector))
+            .route("/api/v1/connectors/:id", delete(delete_connector))
+            .route("/api/v1/monitors", get(list_monitors))
+            .route("/api/v1/monitors", post(create_monitor))
+            .route("/api/v1/monitors/:id", get(get_monitor))
+            .route("/api/v1/monitors/:id", put(update_monitor))
+            .route("/api/v1/monitors/:id", delete(delete_monitor))
+            .route("/api/v1/alerts", get(list_alerts))
+            .route("/api/v1/alerts/:id/acknowledge", post(acknowledge_alert))
+            .route("/api/v1/events", get(list_events_global))
+            .route("/api/v1/api-keys", post(create_api_key))
+            .route("/api/v1/api-keys", get(list_api_keys))
+            .route("/api/v1/api-keys/:id", delete(delete_api_key))
+            .route("/api/v1/metrics", get(metrics))
+            .layer(axum::middleware::from_fn(
+                move |mut req: Request<Body>, next: axum::middleware::Next| {
+                    let auth_state = state_for_middleware.auth_state.clone();
+                    async move {
+                        // Inject an admin AuthContext so all requests are authenticated
+                        let admin_ctx = AuthContext {
+                            subject: "test-admin".to_string(),
+                            permissions: vec!["admin".to_string()],
+                            email: Some("admin@test.orp".to_string()),
+                            name: Some("Test Admin".to_string()),
+                            org_id: None,
+                            scopes: vec!["admin".to_string()],
+                            auth_method: orp_security::middleware::AuthMethod::DevMode,
+                        };
+                        req.extensions_mut().insert(admin_ctx);
+                        req.extensions_mut().insert(auth_state);
+                        next.run(req).await
+                    }
+                },
+            ))
+            .with_state(state.clone());
+
+        (app, state)
+    }
+
+    fn json_body(body: serde_json::Value) -> Body {
+        Body::from(serde_json::to_string(&body).unwrap())
+    }
+
+    // ── Health Endpoint ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_health_returns_200() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_health_response_has_components() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "healthy");
+        assert!(json["components"].is_object());
+        assert!(json["uptime_seconds"].is_number());
+    }
+
+    // ── Entity CRUD ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_entity_201() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "id": "ship-test-1",
+            "type": "ship",
+            "name": "Test Ship",
+            "confidence": 0.95,
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/entities")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_create_entity_empty_id_400() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "id": "",
+            "type": "ship",
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/entities")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_entity_duplicate_409() {
+        let (app, state) = make_test_app().await;
+        // Insert entity directly
+        let entity = orp_proto::Entity {
+            entity_id: "dup-1".to_string(),
+            entity_type: "ship".to_string(),
+            ..orp_proto::Entity::default()
+        };
+        state.storage.insert_entity(&entity).await.unwrap();
+
+        let body = serde_json::json!({ "id": "dup-1", "type": "ship" });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/entities")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_create_entity_invalid_lat_400() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "id": "ship-bad-geo",
+            "type": "ship",
+            "geometry": { "coordinates": [0.0, 999.0] },
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/entities")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_entity_200() {
+        let (app, state) = make_test_app().await;
+        let entity = orp_proto::Entity {
+            entity_id: "ship-get-1".to_string(),
+            entity_type: "ship".to_string(),
+            name: Some("Get Test".to_string()),
+            ..orp_proto::Entity::default()
+        };
+        state.storage.insert_entity(&entity).await.unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/entities/ship-get-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_entity_not_found_404() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/entities/nonexistent-entity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_update_entity_200() {
+        let (app, state) = make_test_app().await;
+        let entity = orp_proto::Entity {
+            entity_id: "ship-upd-1".to_string(),
+            entity_type: "ship".to_string(),
+            ..orp_proto::Entity::default()
+        };
+        state.storage.insert_entity(&entity).await.unwrap();
+
+        let body = serde_json::json!({
+            "name": "Updated Ship",
+            "properties": { "speed": 15.0 },
+        });
+        let resp = app
+            .oneshot(
+                Request::put("/api/v1/entities/ship-upd-1")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_update_entity_not_found_404() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({ "name": "Ghost" });
+        let resp = app
+            .oneshot(
+                Request::put("/api/v1/entities/nonexistent")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_update_entity_invalid_geo_400() {
+        let (app, state) = make_test_app().await;
+        let entity = orp_proto::Entity {
+            entity_id: "ship-bad-upd".to_string(),
+            entity_type: "ship".to_string(),
+            ..orp_proto::Entity::default()
+        };
+        state.storage.insert_entity(&entity).await.unwrap();
+
+        let body = serde_json::json!({
+            "geometry": { "coordinates": [0.0, -100.0] },
+        });
+        let resp = app
+            .oneshot(
+                Request::put("/api/v1/entities/ship-bad-upd")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_delete_entity_204() {
+        let (app, state) = make_test_app().await;
+        let entity = orp_proto::Entity {
+            entity_id: "ship-del-1".to_string(),
+            entity_type: "ship".to_string(),
+            ..orp_proto::Entity::default()
+        };
+        state.storage.insert_entity(&entity).await.unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::delete("/api/v1/entities/ship-del-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_entity_not_found_404() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::delete("/api/v1/entities/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_list_entities_200() {
+        let (app, state) = make_test_app().await;
+        for i in 0..5 {
+            let entity = orp_proto::Entity {
+                entity_id: format!("ship-list-{}", i),
+                entity_type: "ship".to_string(),
+                ..orp_proto::Entity::default()
+            };
+            state.storage.insert_entity(&entity).await.unwrap();
+        }
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/entities?type=ship&limit=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["pagination"]["total_count"].as_u64().unwrap() >= 5);
+    }
+
+    #[tokio::test]
+    async fn test_list_entities_pagination() {
+        let (app, state) = make_test_app().await;
+        for i in 0..10 {
+            let entity = orp_proto::Entity {
+                entity_id: format!("ship-page-{}", i),
+                entity_type: "ship".to_string(),
+                ..orp_proto::Entity::default()
+            };
+            state.storage.insert_entity(&entity).await.unwrap();
+        }
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/entities?type=ship&page=1&limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["pagination"]["has_next"].as_bool().unwrap_or(false));
+    }
+
+    // ── Search ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_search_near_valid() {
+        let (app, state) = make_test_app().await;
+        let entity = orp_proto::Entity {
+            entity_id: "ship-near-1".to_string(),
+            entity_type: "ship".to_string(),
+            geometry: Some(GeoPoint { lat: 51.92, lon: 4.47, alt: None }),
+            ..orp_proto::Entity::default()
+        };
+        state.storage.insert_entity(&entity).await.unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/entities/search?near=51.92,4.47,50")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_search_near_malformed_400() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/entities/search?near=bad_value")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_search_near_invalid_lat_400() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/entities/search?near=999,4.47,50")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Entity Relationships & Events ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_entity_relationships_200() {
+        let (app, state) = make_test_app().await;
+        let entity = orp_proto::Entity {
+            entity_id: "ship-rel-1".to_string(),
+            entity_type: "ship".to_string(),
+            ..orp_proto::Entity::default()
+        };
+        state.storage.insert_entity(&entity).await.unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/entities/ship-rel-1/relationships")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_entity_events_200() {
+        let (app, state) = make_test_app().await;
+        let entity = orp_proto::Entity {
+            entity_id: "ship-ev-1".to_string(),
+            entity_type: "ship".to_string(),
+            ..orp_proto::Entity::default()
+        };
+        state.storage.insert_entity(&entity).await.unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/entities/ship-ev-1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── Relationships ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_relationship_201() {
+        let (app, state) = make_test_app().await;
+        for id in &["ship-cr-1", "port-cr-1"] {
+            let entity = orp_proto::Entity {
+                entity_id: id.to_string(),
+                entity_type: "ship".to_string(),
+                ..orp_proto::Entity::default()
+            };
+            state.storage.insert_entity(&entity).await.unwrap();
+        }
+
+        let body = serde_json::json!({
+            "source_id": "ship-cr-1",
+            "target_id": "port-cr-1",
+            "type": "docked_at",
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/relationships")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // ── Query ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_query_empty_400() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({ "query": "" });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/query")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_query_valid_200() {
+        let (app, state) = make_test_app().await;
+        let entity = orp_proto::Entity {
+            entity_id: "ship-q-1".to_string(),
+            entity_type: "ship".to_string(),
+            ..orp_proto::Entity::default()
+        };
+        state.storage.insert_entity(&entity).await.unwrap();
+
+        let body = serde_json::json!({ "query": "MATCH (s:ship) RETURN s.id" });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/query")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_query_invalid_syntax_400() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({ "query": "NOT VALID ORP-QL !!!" });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/query")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Graph ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_graph_query_empty_400() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({ "query": "" });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/graph")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Connectors ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_connectors_200() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/connectors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_create_connector_201() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "name": "test-ais",
+            "connector_type": "ais",
+            "entity_type": "ship",
+            "trust_score": 0.9,
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/connectors")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_delete_connector_not_found_404() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::delete("/api/v1/connectors/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_update_connector_not_found_404() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({ "name": "updated" });
+        let resp = app
+            .oneshot(
+                Request::put("/api/v1/connectors/nonexistent")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Monitors ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_monitors_200() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/monitors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_create_monitor_201() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "name": "Speed Alert",
+            "entity_type": "ship",
+            "condition": {
+                "type": "property_threshold",
+                "property": "speed",
+                "operator": ">",
+                "value": 25.0,
+            },
+            "severity": "warning",
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/monitors")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_get_monitor_not_found_404() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/monitors/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_delete_monitor_not_found_404() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::delete("/api/v1/monitors/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Alerts ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_alerts_200() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/alerts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_alert_not_found_404() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/alerts/nonexistent/acknowledge")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── API Keys ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_api_keys_200() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/api-keys")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_create_api_key_201() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "name": "test-key",
+            "scopes": ["entities:read"],
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/api-keys")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_delete_api_key_not_found_404() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::delete("/api/v1/api-keys/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Events (global) ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_events_global_200() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_list_events_with_entity_filter() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/events?entity_id=ship-1&limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── Metrics ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_metrics_200() {
+        let (app, _) = make_test_app().await;
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("orp_entities_total"));
+    }
+
+    // ── Entity with geometry ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_entity_with_geometry() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "id": "ship-geo-1",
+            "type": "ship",
+            "name": "Geo Ship",
+            "geometry": { "coordinates": [4.47, 51.92] },
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/entities")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["geometry"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_create_entity_invalid_lon_400() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "id": "ship-bad-lon",
+            "type": "ship",
+            "geometry": { "coordinates": [999.0, 51.0] },
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/entities")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Create entity with properties ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_entity_with_properties() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "id": "ship-props-1",
+            "type": "ship",
+            "properties": {
+                "speed": 15.0,
+                "heading": 245.0,
+                "mmsi": "123456789",
+            },
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/entities")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // ── Search with text ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_search_text() {
+        let (app, state) = make_test_app().await;
+        let entity = orp_proto::Entity {
+            entity_id: "ship-search-1".to_string(),
+            entity_type: "ship".to_string(),
+            name: Some("Ever Given".to_string()),
+            ..orp_proto::Entity::default()
+        };
+        state.storage.insert_entity(&entity).await.unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/entities/search?text_search=Ever")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── Rate limiter unit tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_rate_limiter_allows_requests() {
+        let limiter = RateLimiter::new(10, 10);
+        assert!(limiter.check("127.0.0.1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_exhausts_tokens() {
+        let limiter = RateLimiter::new(3, 0);
+        assert!(limiter.check("1.2.3.4").await.is_ok());
+        assert!(limiter.check("1.2.3.4").await.is_ok());
+        assert!(limiter.check("1.2.3.4").await.is_ok());
+        assert!(limiter.check("1.2.3.4").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_different_ips() {
+        let limiter = RateLimiter::new(1, 0);
+        assert!(limiter.check("1.2.3.4").await.is_ok());
+        assert!(limiter.check("5.6.7.8").await.is_ok());
+        assert!(limiter.check("1.2.3.4").await.is_err());
+    }
+}

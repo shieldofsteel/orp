@@ -404,4 +404,108 @@ mod tests {
             .await;
         assert!(result.is_ok());
     }
+
+    // ── Name similarity edge cases ───────────────────────────────────────────
+    #[test]
+    fn test_name_similarity_empty_strings() {
+        // Empty strings are equal → returns 1.0 from the exact match path
+        assert!((name_similarity("", "") - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_name_similarity_one_empty() {
+        assert!((name_similarity("hello", "") - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_name_similarity_unicode() {
+        let sim = name_similarity("Müller", "MÜLLER");
+        assert!((sim - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_name_similarity_partial_overlap() {
+        let sim = name_similarity("Ever Given", "Ever Green");
+        assert!(sim > 0.5, "Expected > 0.5 for partial overlap, got {}", sim);
+    }
+
+    // ── Merge: missing entities ──────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_merge_entities_missing_source() {
+        let storage = make_storage();
+        let resolver = StructuralEntityResolver::new(storage.clone());
+
+        let target = Entity {
+            entity_id: "ship-tgt".to_string(),
+            entity_type: "ship".to_string(),
+            ..Entity::default()
+        };
+        storage.insert_entity(&target).await.unwrap();
+
+        // Source doesn't exist — merge should succeed (no-op)
+        let result = resolver
+            .merge_entities("ship-nonexistent", "ship-tgt", "canon-1")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // ── Resolve after merge ──────────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_resolve_after_merge() {
+        let storage = make_storage();
+        let resolver = StructuralEntityResolver::new(storage.clone());
+
+        let source = Entity {
+            entity_id: "ship-A".to_string(),
+            entity_type: "ship".to_string(),
+            name: Some("Ship A".to_string()),
+            ..Entity::default()
+        };
+        let target = Entity {
+            entity_id: "ship-B".to_string(),
+            entity_type: "ship".to_string(),
+            ..Entity::default()
+        };
+        storage.insert_entity(&source).await.unwrap();
+        storage.insert_entity(&target).await.unwrap();
+
+        resolver
+            .merge_entities("ship-A", "ship-B", "canonical-AB")
+            .await
+            .unwrap();
+
+        // Target should have canonical_id set
+        let entity = storage.get_entity("ship-B").await.unwrap().unwrap();
+        assert_eq!(entity.canonical_id, Some("canonical-AB".to_string()));
+    }
+
+    // ── Merge inherits higher confidence ─────────────────────────────────────
+    #[tokio::test]
+    async fn test_merge_takes_higher_confidence() {
+        let storage = make_storage();
+        let resolver = StructuralEntityResolver::new(storage.clone());
+
+        let source = Entity {
+            entity_id: "ship-hi".to_string(),
+            entity_type: "ship".to_string(),
+            confidence: 0.99,
+            ..Entity::default()
+        };
+        let target = Entity {
+            entity_id: "ship-lo".to_string(),
+            entity_type: "ship".to_string(),
+            confidence: 0.5,
+            ..Entity::default()
+        };
+        storage.insert_entity(&source).await.unwrap();
+        storage.insert_entity(&target).await.unwrap();
+
+        resolver
+            .merge_entities("ship-hi", "ship-lo", "canon-hi-lo")
+            .await
+            .unwrap();
+
+        let merged = storage.get_entity("ship-lo").await.unwrap().unwrap();
+        assert!(merged.confidence >= 0.99);
+    }
 }

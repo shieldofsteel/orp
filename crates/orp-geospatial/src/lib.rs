@@ -118,4 +118,81 @@ mod tests {
         assert!(dest.lat > start.lat);
         assert!((dest.lon - start.lon).abs() < 0.1);
     }
+
+    #[test]
+    fn test_destination_point_east() {
+        let start = GeoPoint { lat: 0.0, lon: 0.0, alt: None };
+        let dest = destination_point(&start, 90.0, 111.0); // ~1 degree east at equator
+        assert!((dest.lat).abs() < 0.1);
+        assert!((dest.lon - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_destination_point_zero_distance() {
+        let start = GeoPoint { lat: 51.92, lon: 4.48, alt: None };
+        let dest = destination_point(&start, 90.0, 0.0);
+        assert!((dest.lat - start.lat).abs() < 0.001);
+        assert!((dest.lon - start.lon).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_bearing_north() {
+        let a = GeoPoint { lat: 0.0, lon: 0.0, alt: None };
+        let b = GeoPoint { lat: 1.0, lon: 0.0, alt: None };
+        let brg = bearing(&a, &b);
+        assert!(brg.abs() < 1.0, "Expected ~0°, got {}", brg);
+    }
+
+    #[test]
+    fn test_bearing_south() {
+        let a = GeoPoint { lat: 1.0, lon: 0.0, alt: None };
+        let b = GeoPoint { lat: 0.0, lon: 0.0, alt: None };
+        let brg = bearing(&a, &b);
+        assert!((brg - 180.0).abs() < 1.0, "Expected ~180°, got {}", brg);
+    }
+
+    #[test]
+    fn test_bearing_west() {
+        let a = GeoPoint { lat: 0.0, lon: 1.0, alt: None };
+        let b = GeoPoint { lat: 0.0, lon: 0.0, alt: None };
+        let brg = bearing(&a, &b);
+        assert!((brg - 270.0).abs() < 1.0, "Expected ~270°, got {}", brg);
+    }
+
+    #[test]
+    fn test_point_in_radius_exact_boundary() {
+        let center = GeoPoint { lat: 0.0, lon: 0.0, alt: None };
+        let on_boundary = destination_point(&center, 0.0, 10.0);
+        assert!(point_in_radius(&on_boundary, &center, 10.1));
+    }
+
+    #[test]
+    fn test_point_outside_bbox() {
+        let point = GeoPoint { lat: 60.0, lon: 10.0, alt: None };
+        assert!(!point_in_bbox(&point, 50.0, 3.0, 53.0, 6.0));
+    }
+
+    #[test]
+    fn test_haversine_antipodal() {
+        let a = GeoPoint { lat: 0.0, lon: 0.0, alt: None };
+        let b = GeoPoint { lat: 0.0, lon: 180.0, alt: None };
+        let dist = haversine_km(&a, &b);
+        // Half Earth circumference ~20015 km
+        assert!((dist - 20015.0).abs() < 50.0);
+    }
+
+    #[test]
+    fn test_haversine_polar() {
+        let north_pole = GeoPoint { lat: 90.0, lon: 0.0, alt: None };
+        let south_pole = GeoPoint { lat: -90.0, lon: 0.0, alt: None };
+        let dist = haversine_km(&north_pole, &south_pole);
+        assert!((dist - 20015.0).abs() < 50.0);
+    }
+
+    #[test]
+    fn test_point_preserves_altitude() {
+        let start = GeoPoint { lat: 51.92, lon: 4.48, alt: Some(100.0) };
+        let dest = destination_point(&start, 0.0, 10.0);
+        assert_eq!(dest.alt, Some(100.0));
+    }
 }

@@ -328,4 +328,77 @@ mod tests {
         assert!(event.properties.contains_key("callsign"));
         assert!(event.properties.contains_key("squawk"));
     }
+
+    #[test]
+    fn test_parse_sbs_type2_surface() {
+        let line = "MSG,2,1,1,AABBCC,1,2026/03/26,14:30:00.000,2026/03/26,14:30:00.000,,0,50,90,52.3000,4.7600,0,,0,0,0,-1";
+        let msg = AdsbConnector::parse_sbs_message(line);
+        assert!(msg.is_some());
+        let msg = msg.unwrap();
+        assert_eq!(msg.icao, "AABBCC");
+        assert_eq!(msg.on_ground, Some(true));
+    }
+
+    #[test]
+    fn test_parse_sbs_empty_icao_rejected() {
+        let line = "MSG,3,1,1,,1,2026/03/26,14:30:00.000,2026/03/26,14:30:00.000,,35000,450,90,52.3,4.7,0,,0,0,0,0";
+        assert!(AdsbConnector::parse_sbs_message(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_sbs_type_4_rejected() {
+        let line = "MSG,4,1,1,A1B2C3,1,2026/03/26,14:30:00.000,2026/03/26,14:30:00.000,,35000,450,90,52.3,4.7,0,,0,0,0,0";
+        assert!(AdsbConnector::parse_sbs_message(line).is_none());
+    }
+
+    #[test]
+    fn test_adsb_source_event_no_optional_fields() {
+        let msg = AdsbMessage {
+            icao: "AABBCC".to_string(),
+            callsign: None,
+            latitude: None,
+            longitude: None,
+            altitude: None,
+            speed: None,
+            heading: None,
+            vertical_rate: None,
+            squawk: None,
+            on_ground: None,
+            timestamp: Utc::now(),
+        };
+        let event = msg.to_source_event("adsb-test");
+        assert_eq!(event.entity_id, "icao:AABBCC");
+        assert!(!event.properties.contains_key("callsign"));
+        assert!(!event.properties.contains_key("squawk"));
+    }
+
+    #[test]
+    fn test_adsb_connector_id() {
+        let config = ConnectorConfig {
+            connector_id: "adsb-test-id".to_string(),
+            connector_type: "adsb".to_string(),
+            url: None,
+            entity_type: "aircraft".to_string(),
+            enabled: true,
+            trust_score: 0.9,
+            properties: HashMap::new(),
+        };
+        let connector = AdsbConnector::new(config);
+        assert_eq!(connector.connector_id(), "adsb-test-id");
+    }
+
+    #[tokio::test]
+    async fn test_adsb_health_check_not_running() {
+        let config = ConnectorConfig {
+            connector_id: "adsb-health".to_string(),
+            connector_type: "adsb".to_string(),
+            url: None,
+            entity_type: "aircraft".to_string(),
+            enabled: true,
+            trust_score: 0.9,
+            properties: HashMap::new(),
+        };
+        let connector = AdsbConnector::new(config);
+        assert!(connector.health_check().await.is_err());
+    }
 }

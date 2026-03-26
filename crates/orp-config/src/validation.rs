@@ -320,4 +320,182 @@ mod tests {
         let errs = validate_config(&config).unwrap_err();
         assert!(errs.iter().any(|e| e.contains("telemetry_endpoint")));
     }
+
+    #[test]
+    fn test_invalid_signing_algorithm() {
+        let mut config = Config::default();
+        config.security.signing.algorithm = "RSA".to_string();
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("signing.algorithm")));
+    }
+
+    #[test]
+    fn test_duckdb_zero_memory() {
+        let mut config = Config::default();
+        config.storage.duckdb.memory_limit_gb = 0;
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("memory_limit_gb")));
+    }
+
+    #[test]
+    fn test_duckdb_zero_connections() {
+        let mut config = Config::default();
+        config.storage.duckdb.max_connections = 0;
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("max_connections")));
+    }
+
+    #[test]
+    fn test_empty_duckdb_path() {
+        let mut config = Config::default();
+        config.storage.duckdb.path = "".to_string();
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("duckdb.path")));
+    }
+
+    #[test]
+    fn test_kuzu_zero_sync_interval() {
+        let mut config = Config::default();
+        config.storage.kuzu.sync_interval_seconds = 0;
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("sync_interval_seconds")));
+    }
+
+    #[test]
+    fn test_rocksdb_zero_cache() {
+        let mut config = Config::default();
+        config.storage.rocksdb.cache_size_mb = 0;
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("cache_size_mb")));
+    }
+
+    #[test]
+    fn test_zero_rate_limit() {
+        let mut config = Config::default();
+        config.api.rate_limit_per_minute = 0;
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("rate_limit_per_minute")));
+    }
+
+    #[test]
+    fn test_invalid_logging_format() {
+        let mut config = Config::default();
+        config.logging.format = "xml".to_string();
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("logging.format")));
+    }
+
+    #[test]
+    fn test_invalid_resolution_phase() {
+        let mut config = Config::default();
+        config.entity_resolution.phase = "quantum".to_string();
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("entity_resolution.phase")));
+    }
+
+    #[test]
+    fn test_probabilistic_requires_model_path() {
+        let mut config = Config::default();
+        config.entity_resolution.probabilistic.enabled = true;
+        config.entity_resolution.probabilistic.model_path = None;
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("model_path")));
+    }
+
+    #[test]
+    fn test_invalid_confidence_threshold() {
+        let mut config = Config::default();
+        config.entity_resolution.probabilistic.confidence_threshold = 1.5;
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("confidence_threshold")));
+    }
+
+    #[test]
+    fn test_connector_empty_type() {
+        let config = Config {
+            connectors: vec![crate::schema::ConnectorDef {
+                name: "test".to_string(),
+                connector_type: "".to_string(),
+                enabled: true,
+                url: None,
+                entity_type: "ship".to_string(),
+                trust_score: 0.9,
+                schedule: None,
+                headers: Default::default(),
+                retry_policy: None,
+                mapping: Default::default(),
+            }],
+            ..Config::default()
+        };
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("type must not be empty")));
+    }
+
+    #[test]
+    fn test_connector_empty_entity_type() {
+        let config = Config {
+            connectors: vec![crate::schema::ConnectorDef {
+                name: "test".to_string(),
+                connector_type: "ais".to_string(),
+                enabled: true,
+                url: None,
+                entity_type: "".to_string(),
+                trust_score: 0.9,
+                schedule: None,
+                headers: Default::default(),
+                retry_policy: None,
+                mapping: Default::default(),
+            }],
+            ..Config::default()
+        };
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("entity_type must not be empty")));
+    }
+
+    #[test]
+    fn test_zero_workers() {
+        let mut config = Config::default();
+        config.server.workers = 0;
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("workers")));
+    }
+
+    #[test]
+    fn test_zero_delete_batch_size() {
+        let mut config = Config::default();
+        config.retention.delete_batch_size = 0;
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("delete_batch_size")));
+    }
+
+    #[test]
+    fn test_oidc_missing_client_id() {
+        let mut config = Config::default();
+        config.security.oidc.enabled = true;
+        config.security.oidc.provider_url = Some("https://auth.example.com".to_string());
+        config.security.oidc.client_id = None;
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("client_id")));
+    }
+
+    #[test]
+    fn test_negative_trust_score() {
+        let config = Config {
+            connectors: vec![crate::schema::ConnectorDef {
+                name: "bad".to_string(),
+                connector_type: "http".to_string(),
+                enabled: true,
+                url: None,
+                entity_type: "ship".to_string(),
+                trust_score: -0.1,
+                schedule: None,
+                headers: Default::default(),
+                retry_policy: None,
+                mapping: Default::default(),
+            }],
+            ..Config::default()
+        };
+        let errs = validate_config(&config).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("trust_score")));
+    }
 }

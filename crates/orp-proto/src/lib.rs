@@ -962,4 +962,225 @@ mod tests {
         assert!(entity.is_active);
         assert_eq!(entity.confidence, 1.0_f64);
     }
+
+    // ── 16. Event type string ────────────────────────────────────────────────
+    #[test]
+    fn test_event_type_str_position() {
+        let event = make_position_event();
+        assert_eq!(event.event_type_str(), "position_update");
+    }
+
+    #[test]
+    fn test_event_type_str_property_change() {
+        let event = OrpEvent::new(
+            "e1".to_string(),
+            "ship".to_string(),
+            EventPayload::PropertyChange {
+                key: "speed".to_string(),
+                old_value: None,
+                new_value: json!(10),
+                is_derived: false,
+            },
+            "src".to_string(),
+            0.9,
+        );
+        assert_eq!(event.event_type_str(), "property_change");
+    }
+
+    #[test]
+    fn test_event_type_str_state_transition() {
+        let event = OrpEvent::new(
+            "e1".to_string(),
+            "ship".to_string(),
+            EventPayload::StateTransition {
+                from_state: "a".to_string(),
+                to_state: "b".to_string(),
+                reason: None,
+            },
+            "src".to_string(),
+            0.9,
+        );
+        assert_eq!(event.event_type_str(), "state_transition");
+    }
+
+    #[test]
+    fn test_event_type_str_custom() {
+        let event = OrpEvent::new(
+            "e1".to_string(),
+            "sensor".to_string(),
+            EventPayload::Custom { data: json!(null) },
+            "src".to_string(),
+            0.5,
+        );
+        assert_eq!(event.event_type_str(), "custom");
+    }
+
+    // ── 17. With methods builder pattern ─────────────────────────────────────
+    #[test]
+    fn test_with_geo_builder() {
+        let event = make_position_event()
+            .with_geo(GeoPoint { lat: 1.0, lon: 2.0, alt: Some(3.0) });
+        assert!(event.geo.is_some());
+        let geo = event.geo.unwrap();
+        assert!((geo.lat - 1.0).abs() < 0.01);
+        assert_eq!(geo.alt, Some(3.0));
+    }
+
+    #[test]
+    fn test_with_severity_builder() {
+        let event = make_position_event().with_severity(EventSeverity::Warning);
+        assert_eq!(event.severity, Some(EventSeverity::Warning));
+    }
+
+    // ── 18. JSON pretty ──────────────────────────────────────────────────────
+    #[test]
+    fn test_to_json_pretty() {
+        let event = make_position_event();
+        let pretty = event.to_json_pretty().unwrap();
+        assert!(pretty.contains('\n'));
+        assert!(pretty.contains("entity_id"));
+    }
+
+    // ── 19. Protobuf roundtrip (PropertyChange) ──────────────────────────────
+    #[test]
+    fn test_protobuf_roundtrip_property_change() {
+        let event = OrpEvent::new(
+            "e1".to_string(),
+            "ship".to_string(),
+            EventPayload::PropertyChange {
+                key: "speed".to_string(),
+                old_value: Some(json!(10)),
+                new_value: json!(20),
+                is_derived: true,
+            },
+            "src".to_string(),
+            0.9,
+        );
+        let bytes = event.to_protobuf().unwrap();
+        let back = OrpEvent::from_protobuf(&bytes).unwrap();
+        if let EventPayload::PropertyChange { key, is_derived, .. } = &back.payload {
+            assert_eq!(key, "speed");
+            assert!(is_derived);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    // ── 20. Protobuf roundtrip (StateTransition) ─────────────────────────────
+    #[test]
+    fn test_protobuf_roundtrip_state_transition() {
+        let event = OrpEvent::new(
+            "e1".to_string(),
+            "ship".to_string(),
+            EventPayload::StateTransition {
+                from_state: "underway".to_string(),
+                to_state: "moored".to_string(),
+                reason: Some("arrived".to_string()),
+            },
+            "src".to_string(),
+            0.9,
+        );
+        let bytes = event.to_protobuf().unwrap();
+        let back = OrpEvent::from_protobuf(&bytes).unwrap();
+        if let EventPayload::StateTransition { from_state, to_state, .. } = &back.payload {
+            assert_eq!(from_state, "underway");
+            assert_eq!(to_state, "moored");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    // ── 21. Protobuf roundtrip (RelationshipChange) ──────────────────────────
+    #[test]
+    fn test_protobuf_roundtrip_relationship() {
+        let mut props = HashMap::new();
+        props.insert("eta".to_string(), json!("2026-04-01T12:00:00Z"));
+        let event = OrpEvent::new(
+            "e1".to_string(),
+            "ship".to_string(),
+            EventPayload::RelationshipChange {
+                relationship_type: "heading_to".to_string(),
+                target_entity_id: "port-1".to_string(),
+                action: RelationshipAction::Updated,
+                properties: props,
+            },
+            "src".to_string(),
+            0.9,
+        );
+        let bytes = event.to_protobuf().unwrap();
+        let back = OrpEvent::from_protobuf(&bytes).unwrap();
+        if let EventPayload::RelationshipChange { action, .. } = &back.payload {
+            assert_eq!(*action, RelationshipAction::Updated);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    // ── 22. Protobuf roundtrip (Custom) ──────────────────────────────────────
+    #[test]
+    fn test_protobuf_roundtrip_custom() {
+        let event = OrpEvent::new(
+            "s1".to_string(),
+            "sensor".to_string(),
+            EventPayload::Custom { data: json!({"temp": 22.5}) },
+            "mqtt".to_string(),
+            0.7,
+        );
+        let bytes = event.to_protobuf().unwrap();
+        let back = OrpEvent::from_protobuf(&bytes).unwrap();
+        if let EventPayload::Custom { data } = &back.payload {
+            assert_eq!(data["temp"], json!(22.5));
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    // ── 23. Entity with properties ───────────────────────────────────────────
+    #[test]
+    fn test_entity_with_properties() {
+        let mut props = HashMap::new();
+        props.insert("speed".to_string(), json!(15.0));
+        props.insert("mmsi".to_string(), json!("123456789"));
+        let entity = Entity {
+            entity_id: "test-entity".to_string(),
+            entity_type: "ship".to_string(),
+            properties: props,
+            ..Entity::default()
+        };
+        assert_eq!(entity.properties.len(), 2);
+        assert_eq!(entity.properties["speed"], json!(15.0));
+    }
+
+    // ── 24. Relationship struct ──────────────────────────────────────────────
+    #[test]
+    fn test_relationship_struct() {
+        let rel = Relationship {
+            relationship_id: "r1".to_string(),
+            source_entity_id: "ship-1".to_string(),
+            target_entity_id: "port-1".to_string(),
+            relationship_type: "docked_at".to_string(),
+            properties: HashMap::new(),
+            confidence: 0.95,
+            is_active: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert_eq!(rel.relationship_type, "docked_at");
+        assert!(rel.is_active);
+    }
+
+    // ── 25. DataSource struct ────────────────────────────────────────────────
+    #[test]
+    fn test_datasource_struct() {
+        let ds = DataSource {
+            source_id: "ais-1".to_string(),
+            source_name: "AIS Feed".to_string(),
+            source_type: "ais".to_string(),
+            trust_score: 0.95,
+            events_ingested: 1000,
+            enabled: true,
+        };
+        assert!(ds.enabled);
+        assert_eq!(ds.events_ingested, 1000);
+    }
 }

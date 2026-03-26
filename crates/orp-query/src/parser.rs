@@ -453,4 +453,222 @@ mod tests {
         let result = parse_orpql(query);
         assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
     }
+
+    #[test]
+    fn test_within_query() {
+        let query = "MATCH (s:Ship) WHERE WITHIN(s, min_lat=48.0, min_lon=-5.0, max_lat=55.0, max_lon=10.0) RETURN s.id";
+        let result = parse_orpql(query);
+        assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
+        let q = result.unwrap();
+        let cond = &q.where_clause.unwrap().conditions[0];
+        match cond {
+            Condition::Within { min_lat, min_lon, max_lat, max_lon, .. } => {
+                assert!((*min_lat - 48.0).abs() < 0.01);
+                assert!((*min_lon - -5.0).abs() < 0.01);
+                assert!((*max_lat - 55.0).abs() < 0.01);
+                assert!((*max_lon - 10.0).abs() < 0.01);
+            }
+            _ => panic!("Expected Within condition"),
+        }
+    }
+
+    #[test]
+    fn test_and_conditions() {
+        let query = r#"MATCH (s:Ship) WHERE s.speed > 10 AND s.speed < 30 RETURN s.id"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
+        let q = result.unwrap();
+        assert_eq!(q.where_clause.unwrap().conditions.len(), 2);
+    }
+
+    #[test]
+    fn test_order_by_asc() {
+        let query = r#"MATCH (s:Ship) RETURN s.id ORDER BY s.speed ASC"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
+        let q = result.unwrap();
+        assert!(q.order_by.as_ref().unwrap().ascending);
+    }
+
+    #[test]
+    fn test_order_by_desc() {
+        let query = r#"MATCH (s:Ship) RETURN s.id ORDER BY s.speed DESC"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
+        let q = result.unwrap();
+        assert!(!q.order_by.as_ref().unwrap().ascending);
+    }
+
+    #[test]
+    fn test_comparison_operators() {
+        for (op, expected) in &[
+            ("=", ComparisonOp::Eq),
+            ("!=", ComparisonOp::Neq),
+            (">", ComparisonOp::Gt),
+            ("<", ComparisonOp::Lt),
+            (">=", ComparisonOp::Gte),
+            ("<=", ComparisonOp::Lte),
+        ] {
+            let query = format!(r#"MATCH (s:Ship) WHERE s.speed {} 10 RETURN s.id"#, op);
+            let result = parse_orpql(&query);
+            assert!(result.is_ok(), "Failed to parse '{}': {:?}", op, result.err());
+            let q = result.unwrap();
+            let cond = &q.where_clause.unwrap().conditions[0];
+            if let Condition::Comparison { op: parsed_op, .. } = cond {
+                assert!(
+                    std::mem::discriminant(parsed_op) == std::mem::discriminant(expected),
+                    "Operator mismatch for '{}': {:?} vs {:?}", op, parsed_op, expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_string_literal_comparison() {
+        let query = r#"MATCH (s:Ship) WHERE s.ship_type = "tanker" RETURN s.id"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok());
+        let q = result.unwrap();
+        if let Condition::Comparison { right, .. } = &q.where_clause.unwrap().conditions[0] {
+            match right {
+                Literal::String(s) => assert_eq!(s, "tanker"),
+                _ => panic!("Expected string literal"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_boolean_literal() {
+        let query = r#"MATCH (s:Ship) WHERE s.is_active = true RETURN s.id"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok());
+        let q = result.unwrap();
+        if let Condition::Comparison { right, .. } = &q.where_clause.unwrap().conditions[0] {
+            match right {
+                Literal::Boolean(b) => assert!(*b),
+                _ => panic!("Expected boolean literal"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_sum_function() {
+        let query = r#"MATCH (s:Ship) RETURN SUM(s.speed) as total_speed"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok());
+        let q = result.unwrap();
+        if let ReturnExpr::Function { name, alias, .. } = &q.return_clause.expressions[0] {
+            assert_eq!(name, "SUM");
+            assert_eq!(alias.as_deref(), Some("total_speed"));
+        }
+    }
+
+    #[test]
+    fn test_avg_function() {
+        let query = r#"MATCH (s:Ship) RETURN AVG(s.speed) as avg_speed"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_min_max_functions() {
+        for func in &["MIN", "MAX"] {
+            let query = format!("MATCH (s:Ship) RETURN {}(s.speed)", func);
+            let result = parse_orpql(&query);
+            assert!(result.is_ok(), "Failed to parse {}: {:?}", func, result.err());
+        }
+    }
+
+    #[test]
+    fn test_distance_function() {
+        let query = r#"MATCH (s:Ship) RETURN DISTANCE(s.position) as dist"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_multiple_return_expressions() {
+        let query = r#"MATCH (s:Ship) RETURN s.id, s.name, s.speed, s.heading"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok());
+        let q = result.unwrap();
+        assert_eq!(q.return_clause.expressions.len(), 4);
+    }
+
+    #[test]
+    fn test_return_with_alias() {
+        let query = r#"MATCH (s:Ship) RETURN s.name as ship_name"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok());
+        let q = result.unwrap();
+        if let ReturnExpr::Property { alias, .. } = &q.return_clause.expressions[0] {
+            assert_eq!(alias.as_deref(), Some("ship_name"));
+        }
+    }
+
+    #[test]
+    fn test_entity_pattern_no_type() {
+        let query = r#"MATCH (s) RETURN s"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok());
+        let q = result.unwrap();
+        assert!(q.match_clause.patterns[0].entity.entity_type.is_none());
+    }
+
+    #[test]
+    fn test_property_filter_in_match() {
+        let query = r#"MATCH (s:Ship {mmsi: "123456789"}) RETURN s.id"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok());
+        let q = result.unwrap();
+        assert!(!q.match_clause.patterns[0].entity.properties.is_empty());
+    }
+
+    #[test]
+    fn test_case_insensitive_keywords() {
+        let query = r#"match (s:Ship) where s.speed > 10 return s.id order by s.speed limit 5"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok(), "Failed to parse case-insensitive: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_invalid_query_returns_error() {
+        let result = parse_orpql("THIS IS NOT VALID");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_empty_query_returns_error() {
+        let result = parse_orpql("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_near_with_decimal_values() {
+        let query = "MATCH (s:Ship) WHERE NEAR(s, lat=51.922500, lon=4.270600, radius_km=0.5) RETURN s.id";
+        let result = parse_orpql(query);
+        assert!(result.is_ok());
+        let q = result.unwrap();
+        if let Condition::Near { radius_km, .. } = &q.where_clause.unwrap().conditions[0] {
+            assert!((*radius_km - 0.5).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn test_limit_zero() {
+        let query = r#"MATCH (s:Ship) RETURN s.id LIMIT 0"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok());
+        let q = result.unwrap();
+        assert_eq!(q.limit, Some(0));
+    }
+
+    #[test]
+    fn test_large_limit() {
+        let query = r#"MATCH (s:Ship) RETURN s.id LIMIT 999999"#;
+        let result = parse_orpql(query);
+        assert!(result.is_ok());
+        let q = result.unwrap();
+        assert_eq!(q.limit, Some(999999));
+    }
 }

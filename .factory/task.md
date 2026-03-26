@@ -1,22 +1,31 @@
-# ORP — Final Integration + LoginPage
+# ORP — 500+ Tests + World-Class CLI
 
-Teams wrote ~10K new lines. Make it all compile and work.
+## 1. TEST EXPANSION (target 500+)
+Add tests to EVERY crate:
+- orp-core handlers: axum::test integration tests for EVERY endpoint (200/401/403/404/409/422/429), pagination, sorting. 50+ tests.
+- orp-core websocket: subscribe, unsubscribe, auth, broadcast, heartbeat. 15+ tests.
+- orp-query: every ORP-QL feature — AND, OR, NEAR, WITHIN, DISTANCE, aggregations, graph, errors. 30+ tests.
+- orp-connector: each adapter edge cases — malformed input, retry, reconnect. 25+ tests.
+- orp-storage/graph_engine: path queries, neighbors, sync, cypher. 15+ tests.
+- orp-entity: matching, merge, canonical IDs. 10+ tests.
+- orp-config: YAML parsing, env var substitution, validation errors. 10+ tests.
+Target: `cargo test` shows 400+ Rust tests.
 
-## 1. Fix Compilation
-Run `cargo check`, fix all errors. New files: graph_engine.rs, updated processor.rs, updated duckdb_engine.rs. Resolve import/type conflicts.
+## 2. WORLD-CLASS CLI (clap v4 derive)
+Rewrite `cli/args.rs` + `commands.rs`:
+- `orp start` (--port --config --template --dev)
+- `orp query "ORP-QL"` — output as table/json/csv
+- `orp query --file queries.oql`
+- `orp status` — health, entities, connectors, uptime
+- `orp connectors list/add/remove`
+- `orp entities search --near 51.9,4.2 --radius 50`
+- `orp entities get <id>`
+- `orp events --entity <id> --since 1h`
+- `orp monitors list/add/remove`
+- `orp config validate <file>`
+- `orp version` — version + build info
+- `orp completions <shell>` — bash/zsh/fish
+Colored table output (add `tabled` + `colored` deps). --json/--csv modes. Respect NO_COLOR.
 
-## 2. Create LoginPage
-Write `frontend/src/components/LoginPage.tsx`: email+password form, "Login with SSO" button, store JWT in localStorage, error handling. Wire into App.tsx: show LoginPage if no token, main app if authenticated. Add logout to header.
-
-## 3. Install Frontend Test Deps
-Run `cd frontend && npm install` to pick up new vitest deps in package.json.
-
-## 4. Verify
-- `cargo test` — all must pass
-- `cargo clippy` — zero warnings
-- `cd frontend && npm run build` — must succeed
-- Commit everything, push to origin
-
-## Rules
-- Fix don't rewrite. Only touch what's broken.
-- Commit message: "feat: final A+ integration — graph engine, tests, OpenAPI, WCAG, auth"
+## RULES
+- cargo test 400+. cargo clippy zero. Commit+push.

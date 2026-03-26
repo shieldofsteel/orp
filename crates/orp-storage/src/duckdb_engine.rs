@@ -2093,4 +2093,133 @@ mod tests {
         assert_eq!(fetched[0].data["speed"], serde_json::json!(42.5));
         assert_eq!(fetched[0].data["nested"]["a"], serde_json::json!(1));
     }
+
+    #[tokio::test]
+    async fn test_26_count_entities() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        for i in 0..5 {
+            s.insert_entity(&make_entity(&format!("cnt-{}", i), "ship")).await.unwrap();
+        }
+        let count = s.count_entities().await.unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn test_27_entity_upsert_on_conflict() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        let mut e = make_entity("upsert-1", "ship");
+        e.name = Some("Original".to_string());
+        s.insert_entity(&e).await.unwrap();
+
+        e.name = Some("Updated".to_string());
+        s.insert_entity(&e).await.unwrap();
+
+        let fetched = s.get_entity("upsert-1").await.unwrap().unwrap();
+        assert_eq!(fetched.name, Some("Updated".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_28_update_entity_property() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("prop-1", "ship")).await.unwrap();
+        s.update_entity_property("prop-1", "speed", serde_json::json!(25.5)).await.unwrap();
+
+        let entity = s.get_entity("prop-1").await.unwrap().unwrap();
+        assert!(entity.properties.contains_key("speed"));
+    }
+
+    #[tokio::test]
+    async fn test_29_search_by_name() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        let mut e = make_entity("search-1", "ship");
+        e.name = Some("Ever Given".to_string());
+        s.insert_entity(&e).await.unwrap();
+
+        let results = s.search_entities("Ever", Some("ship"), 10).await.unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_30_search_empty_query_returns_all() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        for i in 0..3 {
+            s.insert_entity(&make_entity(&format!("all-{}", i), "ship")).await.unwrap();
+        }
+        let results = s.search_entities("", None, 100).await.unwrap();
+        assert!(results.len() >= 3);
+    }
+
+    #[tokio::test]
+    async fn test_31_get_entities_in_radius_no_results() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        let e = make_entity_with_geo("far", "ship", 10.0, 10.0);
+        s.insert_entity(&e).await.unwrap();
+
+        let near = s.get_entities_in_radius(51.0, 4.0, 5.0, None).await.unwrap();
+        assert!(near.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_32_register_and_delete_data_source() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        let ds = orp_proto::DataSource {
+            source_id: "ds-del".to_string(),
+            source_name: "To Delete".to_string(),
+            source_type: "ais".to_string(),
+            trust_score: 0.9,
+            events_ingested: 0,
+            enabled: true,
+        };
+        s.register_data_source(&ds).await.unwrap();
+        assert!(s.get_data_source("ds-del").await.unwrap().is_some());
+
+        let deleted = s.delete_data_source("ds-del").await.unwrap();
+        assert!(deleted);
+        assert!(s.get_data_source("ds-del").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_33_delete_nonexistent_data_source() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        let deleted = s.delete_data_source("nonexistent").await.unwrap();
+        assert!(!deleted);
+    }
+
+    #[tokio::test]
+    async fn test_34_events_global_with_filters() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("glob-e1", "ship")).await.unwrap();
+        let ev = make_event("glob-ev1", "glob-e1");
+        s.insert_event(&ev).await.unwrap();
+
+        let events = s.get_events_global(Some("glob-e1"), None, None, None, None, 10, 0).await.unwrap();
+        assert!(!events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_35_count_events_global() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("cnt-ev", "ship")).await.unwrap();
+        for i in 0..3 {
+            let mut ev = make_event(&format!("cnt-ev-{}", i), "cnt-ev");
+            ev.event_type = "position_update".to_string();
+            s.insert_event(&ev).await.unwrap();
+        }
+        let count = s.count_events_global(Some("cnt-ev"), None, None, None, None).await.unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_36_entity_delete_soft_removes() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("soft-del", "ship")).await.unwrap();
+        s.delete_entity("soft-del").await.unwrap();
+        // After soft delete, entity still exists but is_active = false
+        // get_entity returns it regardless of is_active
+        let _entity = s.get_entity("soft-del").await.unwrap();
+        // The entity may or may not be returned depending on impl
+        // but get_entities_by_type should not return it
+        let active = s.get_entities_by_type("ship", 100, 0).await.unwrap();
+        assert!(active.iter().all(|e| e.entity_id != "soft-del"));
+    }
 }

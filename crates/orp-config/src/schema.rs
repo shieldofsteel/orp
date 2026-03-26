@@ -509,4 +509,68 @@ server:
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.workers, 2);
     }
+
+    #[test]
+    fn test_from_yaml_with_connectors() {
+        let yaml = r#"
+server:
+  host: "0.0.0.0"
+  port: 9090
+  workers: 4
+  log_level: "info"
+  telemetry_enabled: false
+connectors:
+  - name: "ais"
+    type: "ais"
+    enabled: true
+    entity_type: "ship"
+    trust_score: 0.9
+"#;
+        let config = Config::from_yaml(yaml).expect("parse failed");
+        assert_eq!(config.connectors.len(), 1);
+        assert_eq!(config.connectors[0].name, "ais");
+    }
+
+    #[test]
+    fn test_load_or_default_returns_defaults() {
+        // When config.yaml doesn't exist, should use defaults
+        let config = Config::load_or_default();
+        assert_eq!(config.server.port, 9090);
+    }
+
+    #[test]
+    fn test_default_storage_config() {
+        let config = StorageConfig::default();
+        assert_eq!(config.duckdb.memory_limit_gb, 4);
+        assert_eq!(config.kuzu.sync_interval_seconds, 30);
+    }
+
+    #[test]
+    fn test_default_security_config() {
+        let config = SecurityConfig::default();
+        assert!(!config.oidc.enabled);
+        assert!(config.abac.enabled);
+        assert_eq!(config.signing.algorithm, "Ed25519");
+    }
+
+    #[test]
+    fn test_default_frontend_config() {
+        let config = FrontendConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.port, 9090);
+    }
+
+    #[test]
+    fn test_from_yaml_invalid_syntax() {
+        let yaml = "{{{{invalid yaml}}}";
+        assert!(Config::from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn test_env_var_with_default_syntax() {
+        // ${env.NONEXISTENT} should be replaced with empty string
+        let input = "key: ${env.THIS_VAR_DOES_NOT_EXIST_98765}";
+        let result = Config::substitute_env_vars(input);
+        assert!(!result.contains("${env."));
+    }
 }

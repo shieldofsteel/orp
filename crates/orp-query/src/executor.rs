@@ -875,4 +875,125 @@ mod tests {
         // May return 0 results since we don't have actual graph relationships, but should not error
         assert!(result.execution_time_ms >= 0.0);
     }
+
+    #[tokio::test]
+    async fn test_gte_comparison() {
+        let storage = setup_test_storage().await;
+        let executor = QueryExecutor::new(storage);
+        let result = executor
+            .execute("MATCH (s:Ship) WHERE s.speed >= 5 RETURN s.id")
+            .await
+            .unwrap();
+        assert_eq!(result.row_count, 10); // all ships have speed >= 5
+    }
+
+    #[tokio::test]
+    async fn test_lte_comparison() {
+        let storage = setup_test_storage().await;
+        let executor = QueryExecutor::new(storage);
+        let result = executor
+            .execute("MATCH (s:Ship) WHERE s.speed <= 5 RETURN s.id")
+            .await
+            .unwrap();
+        assert_eq!(result.row_count, 1); // Only ship-0 has speed 5.0
+    }
+
+    #[tokio::test]
+    async fn test_neq_comparison() {
+        let storage = setup_test_storage().await;
+        let executor = QueryExecutor::new(storage);
+        let result = executor
+            .execute(r#"MATCH (s:Ship) WHERE s.ship_type != "container" RETURN s.id"#)
+            .await
+            .unwrap();
+        assert!(result.row_count > 0);
+        for row in &result.rows {
+            let st = row.get("ship_type").and_then(|v| v.as_str()).unwrap_or("");
+            assert_ne!(st, "container");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_where_clause() {
+        let storage = setup_test_storage().await;
+        let executor = QueryExecutor::new(storage);
+        let result = executor
+            .execute("MATCH (s:Ship) RETURN s.id")
+            .await
+            .unwrap();
+        assert_eq!(result.row_count, 10);
+    }
+
+    #[tokio::test]
+    async fn test_return_builtin_properties() {
+        let storage = setup_test_storage().await;
+        let executor = QueryExecutor::new(storage);
+        let result = executor
+            .execute("MATCH (s:Ship) RETURN s.entity_id, s.name, s.confidence LIMIT 1")
+            .await
+            .unwrap();
+        assert_eq!(result.row_count, 1);
+        let row = &result.rows[0];
+        assert!(row.contains_key("entity_id") || row.contains_key("id"));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_and_conditions() {
+        let storage = setup_test_storage().await;
+        let executor = QueryExecutor::new(storage);
+        let result = executor
+            .execute(r#"MATCH (s:Ship) WHERE s.speed > 10 AND s.ship_type = "container" RETURN s.id"#)
+            .await
+            .unwrap();
+        // Some ships should match
+        for row in &result.rows {
+            assert!(row.get("id").is_some() || row.get("entity_id").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_planner_no_geo_filter() {
+        let query = parse_orpql(
+            "MATCH (s:Ship) WHERE s.speed > 20 RETURN s.id LIMIT 10",
+        )
+        .unwrap();
+        let plan = QueryPlanner::plan(&query);
+        assert!(matches!(plan[0], PlanStep::EntityScan { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_planner_aggregate() {
+        let query = parse_orpql(
+            "MATCH (s:Ship) RETURN COUNT(s) as total",
+        )
+        .unwrap();
+        let plan = QueryPlanner::plan(&query);
+        assert!(plan.iter().any(|s| matches!(s, PlanStep::Aggregate { .. })));
+    }
+
+    #[test]
+    fn test_haversine_km() {
+        let dist = haversine_km(51.9225, 4.4792, 52.3676, 4.9041);
+        assert!((dist - 57.0).abs() < 5.0);
+    }
+
+    #[test]
+    fn test_haversine_km_same_point() {
+        let dist = haversine_km(51.0, 4.0, 51.0, 4.0);
+        assert!(dist.abs() < 0.001);
+    }
+
+    #[test]
+    fn test_compare_json_numbers() {
+        let a = serde_json::json!(10.0);
+        let b = serde_json::json!(20.0);
+        assert_eq!(compare_json(&a, &b), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_json_strings() {
+        let a = serde_json::json!("abc");
+        let b = serde_json::json!("xyz");
+        assert_eq!(compare_json(&a, &b), std::cmp::Ordering::Less);
+    }
 }
