@@ -1,0 +1,148 @@
+version: "3.9"
+
+# ── ORP — Operational Relay Protocol ─────────────────────────────────────────
+# Full deployment stack with standard, edge, and federation examples.
+#
+# Usage:
+#   Single node:      docker compose up orp
+#   Edge node:        docker compose up orp-edge
+#   Federation demo:  docker compose --profile federation up
+
+networks:
+  orp-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  orp-data:
+  orp-edge-data:
+  orp-fed-alpha-data:
+  orp-fed-beta-data:
+
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+
+  # ── Primary ORP node ───────────────────────────────────────────────────────
+  orp:
+    image: ghcr.io/shieldofsteel/orp:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orp
+    restart: unless-stopped
+    ports:
+      - "${ORP_PORT:-9090}:9090"
+    environment:
+      ORP_LOG: "${ORP_LOG:-info}"
+      ORP_DATA_DIR: /var/lib/orp
+      ORP_CONFIG: /etc/orp/config.toml
+      ORP_LISTEN: "0.0.0.0:9090"
+      ORP_NODE_ID: "${ORP_NODE_ID:-orp-primary}"
+      ORP_SECRET_KEY: "${ORP_SECRET_KEY:-change-me-in-production}"
+      # Federation peers (comma-separated)
+      ORP_PEERS: "${ORP_PEERS:-}"
+    volumes:
+      - orp-data:/var/lib/orp
+      - ./config:/etc/orp:ro
+    networks:
+      orp-net:
+        ipv4_address: 172.20.0.10
+    healthcheck:
+      test: ["CMD", "orp", "status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Edge node (headless, low-resource) ────────────────────────────────────
+  # Designed for deployment on Raspberry Pi, embedded systems, edge servers.
+  # Runs with --headless flag: no web UI, minimal memory footprint.
+  orp-edge:
+    image: ghcr.io/shieldofsteel/orp:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orp-edge
+    restart: unless-stopped
+    profiles:
+      - edge
+    ports:
+      - "${ORP_EDGE_PORT:-9091}:9090"
+    environment:
+      ORP_LOG: "${ORP_LOG:-warn}"
+      ORP_DATA_DIR: /var/lib/orp
+      ORP_CONFIG: /etc/orp/config.toml
+      ORP_LISTEN: "0.0.0.0:9090"
+      ORP_NODE_ID: "${ORP_EDGE_NODE_ID:-orp-edge-01}"
+      ORP_SECRET_KEY: "${ORP_SECRET_KEY:-change-me-in-production}"
+      # Connect back to primary node
+      ORP_PEERS: "orp:9090"
+    command: ["orp", "start", "--headless"]
+    volumes:
+      - orp-edge-data:/var/lib/orp
+    networks:
+      orp-net:
+        ipv4_address: 172.20.0.20
+    depends_on:
+      orp:
+        condition: service_healthy
+
+  # ── Federation: Alpha node ─────────────────────────────────────────────────
+  # Two independent ORP deployments peered together.
+  # Demonstrates cross-organization / cross-datacenter federation.
+  orp-fed-alpha:
+    image: ghcr.io/shieldofsteel/orp:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orp-fed-alpha
+    restart: unless-stopped
+    profiles:
+      - federation
+    ports:
+      - "9092:9090"
+    environment:
+      ORP_LOG: info
+      ORP_DATA_DIR: /var/lib/orp
+      ORP_NODE_ID: fed-alpha
+      ORP_SECRET_KEY: "${ORP_FED_SECRET:-fed-shared-secret-change-me}"
+      # Peer with beta
+      ORP_PEERS: "orp-fed-beta:9090"
+      ORP_FEDERATION_ENABLED: "true"
+      ORP_FEDERATION_ROLE: primary
+    volumes:
+      - orp-fed-alpha-data:/var/lib/orp
+    networks:
+      orp-net:
+        ipv4_address: 172.20.0.30
+
+  # ── Federation: Beta node ──────────────────────────────────────────────────
+  orp-fed-beta:
+    image: ghcr.io/shieldofsteel/orp:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orp-fed-beta
+    restart: unless-stopped
+    profiles:
+      - federation
+    ports:
+      - "9093:9090"
+    environment:
+      ORP_LOG: info
+      ORP_DATA_DIR: /var/lib/orp
+      ORP_NODE_ID: fed-beta
+      ORP_SECRET_KEY: "${ORP_FED_SECRET:-fed-shared-secret-change-me}"
+      # Peer with alpha
+      ORP_PEERS: "orp-fed-alpha:9090"
+      ORP_FEDERATION_ENABLED: "true"
+      ORP_FEDERATION_ROLE: secondary
+    volumes:
+      - orp-fed-beta-data:/var/lib/orp
+    networks:
+      orp-net:
+        ipv4_address: 172.20.0.31
+    depends_on:
+      - orp-fed-alpha

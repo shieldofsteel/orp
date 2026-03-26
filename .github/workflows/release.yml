@@ -1,0 +1,291 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: write      # create GitHub Release
+  packages: write      # push Docker image to GHCR
+  id-token: write      # OIDC for attestation (future)
+
+jobs:
+  # ── Cross-compile all targets ──────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — native
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: orp-linux-x86_64
+            cross: false
+
+          # Linux aarch64 — cross-compile via cross-rs
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: orp-linux-aarch64
+            cross: true
+
+          # macOS x86_64 — native on GitHub runner
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: orp-macos-x86_64
+            cross: false
+
+          # macOS aarch64 (Apple Silicon) — cross from macOS runner
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: orp-macos-aarch64
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-${{ matrix.target }}-
+
+      # ── Install protoc ─────────────────────────────────────────────────────
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      # ── cross-rs for Linux aarch64 ─────────────────────────────────────────
+      - name: Install cross (aarch64 Linux only)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      # ── Build ──────────────────────────────────────────────────────────────
+      - name: Build release binary (native)
+        if: "!matrix.cross"
+        run: cargo build --release --target ${{ matrix.target }} -p orp-core
+
+      - name: Build release binary (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }} -p orp-core
+
+      # ── Strip Linux binaries ───────────────────────────────────────────────
+      - name: Strip binary (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: strip target/${{ matrix.target }}/release/orp
+
+      - name: Strip binary (Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get install -y --no-install-recommends binutils-aarch64-linux-gnu
+          aarch64-linux-gnu-strip target/${{ matrix.target }}/release/orp
+
+      # ── Package ────────────────────────────────────────────────────────────
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist/${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/orp dist/${{ matrix.artifact }}/
+          [ -f LICENSE ]    && cp LICENSE    dist/${{ matrix.artifact }}/
+          [ -f README.md ]  && cp README.md  dist/${{ matrix.artifact }}/
+          [ -f CHANGELOG.md ] && cp CHANGELOG.md dist/${{ matrix.artifact }}/
+          tar czf ${{ matrix.artifact }}.tar.gz -C dist ${{ matrix.artifact }}
+          echo "TARBALL=${{ matrix.artifact }}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          retention-days: 1
+
+  # ── Build frontend ─────────────────────────────────────────────────────────
+  build-frontend:
+    name: Build frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            frontend/package-lock.json
+            ui/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          if [ -f frontend/package.json ]; then
+            cd frontend && npm ci
+          elif [ -f ui/package.json ]; then
+            cd ui && npm ci
+          else
+            echo "No frontend directory found, skipping"
+            exit 0
+          fi
+
+      - name: Build frontend
+        run: |
+          if [ -f frontend/package.json ]; then
+            cd frontend && npm run build
+            tar czf frontend-dist.tar.gz dist/
+          elif [ -f ui/package.json ]; then
+            cd ui && npm run build
+            tar czf frontend-dist.tar.gz dist/
+          else
+            echo "No frontend to build"
+            exit 0
+          fi
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: frontend-dist
+          path: frontend-dist.tar.gz
+          retention-days: 1
+
+  # ── Build + push Docker image ───────────────────────────────────────────────
+  docker:
+    name: Docker build & push
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (multi-arch builds)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Create GitHub Release ──────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, build-frontend, docker]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Download all binary artifacts
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      # Generate checksums
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -name "*.tar.gz" -exec cp {} . \;
+          sha256sum *.tar.gz > checksums.sha256
+          echo "=== Checksums ==="
+          cat checksums.sha256
+
+      # Extract version from tag
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      # Extract release notes from CHANGELOG if present
+      - name: Extract release notes
+        id: notes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          if [ -f CHANGELOG.md ]; then
+            # Extract section for this version
+            awk "/^## \[?${VERSION#v}/,/^## /" CHANGELOG.md | head -n -1 > release_notes.md
+            if [ ! -s release_notes.md ]; then
+              echo "Release $VERSION" > release_notes.md
+            fi
+          else
+            printf "## ORP %s\n\nSee [CHANGELOG](https://github.com/%s/blob/main/CHANGELOG.md) for details.\n" \
+              "$VERSION" "${{ github.repository }}" > release_notes.md
+          fi
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "ORP ${{ steps.version.outputs.version }}"
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            artifacts/*.tar.gz
+            artifacts/checksums.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Post-release: update install script's latest pointer (optional)
+      - name: Summary
+        run: |
+          echo "## Release ${{ steps.version.outputs.version }} published 🎉" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Artifacts" >> "$GITHUB_STEP_SUMMARY"
+          echo "| File | SHA256 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r line; do
+            hash="${line%% *}"
+            file="${line##* }"
+            echo "| \`$file\` | \`${hash:0:16}...\` |" >> "$GITHUB_STEP_SUMMARY"
+          done < artifacts/checksums.sha256
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Docker" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`bash" >> "$GITHUB_STEP_SUMMARY"
+          echo "docker pull ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"

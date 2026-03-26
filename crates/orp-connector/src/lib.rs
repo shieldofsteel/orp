@@ -9,5 +9,6 @@ pub use adapters::generic_api::GenericApiConnector;
 pub use adapters::http_poller::HttpPollerConnector;
 pub use adapters::mqtt::MqttConnector;
 pub use adapters::syslog::SyslogConnector;
+pub use adapters::nmea::NmeaConnector;
 pub use adapters::websocket_client::WebSocketClientConnector;
 pub use traits::{Connector, ConnectorConfig, ConnectorError, ConnectorStats, SourceEvent};
