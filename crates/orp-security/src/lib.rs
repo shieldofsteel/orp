@@ -45,6 +45,7 @@ pub mod api_keys;
 pub mod jwt;
 pub mod middleware;
 pub mod oidc;
+pub mod rbac;
 
 // ─── Convenience re-exports ───────────────────────────────────────────────────
 
@@ -63,3 +64,8 @@ pub use jwt::{Claims, JwtAlgorithm, JwtConfig, JwtError, JwtService};
 pub use middleware::{AuthContext, AuthError, AuthMethod, AuthState};
 
 pub use oidc::{OidcClient, OidcConfig, OidcError, SecurityError, TokenResponse};
+
+pub use rbac::{
+    check_role_permission, check_role_permission_str, register_rbac_policies,
+    Action as RbacAction, Role, RolePermissions,
+};

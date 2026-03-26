@@ -31,6 +31,7 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
 duckdb = { version = "1.2", features = ["bundled"] }
 thiserror = { workspace = true }
 orp-testbed = { path = "../orp-testbed" }
@@ -38,5 +39,8 @@ tabled = "0.17"
 colored = "3"
 clap_complete = "4"
 csv = "1.3"
+sha2 = { workspace = true }
+rand = { workspace = true }
+hex = "0.4"
 
 

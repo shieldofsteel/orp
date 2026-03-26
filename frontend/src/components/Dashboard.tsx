@@ -207,7 +207,7 @@ function ConnectorStatusBar({ connectors }: { connectors: Connector[] }) {
             <div key={c.id} className="flex items-center gap-2">
               <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${statusColor}`} />
               <span className="text-[10px] text-gray-400 flex-1 truncate">{c.name}</span>
-              <span className="text-[9px] text-gray-600">{c.stats.events_per_sec.toFixed(1)} e/s</span>
+              <span className="text-[9px] text-gray-600">{(c.stats?.events_per_sec ?? 0).toFixed(1)} e/s</span>
             </div>
           );
         })}

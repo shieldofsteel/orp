@@ -3,6 +3,7 @@ pub mod dedup;
 pub mod dlq;
 pub mod monitor;
 pub mod processor;
+pub mod sanctions;
 pub mod threat;
 
 pub use analytics::{
@@ -20,6 +21,10 @@ pub use monitor::{
 pub use processor::{
     DefaultStreamProcessor, ProcessorError, ProcessorResult, ProcessorStats, StreamContext,
     StreamProcessor,
+};
+pub use sanctions::{
+    SanctionsDatabase, SanctionsMatch, SanctionsQuery, SanctionsResult, SanctionsRiskLevel,
+    SdnEntry, fuzzy_score, levenshtein,
 };
 pub use threat::{
     CriticalInfrastructure, InfrastructureType, RiskFactors, RiskWeights, SanctionsList,
