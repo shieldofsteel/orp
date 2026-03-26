@@ -157,9 +157,18 @@ async fn rate_limit_middleware(
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Exempt ingest endpoints from rate limiting (they need high throughput)
+    // Exempt high-throughput and static paths from rate limiting
     let path = request.uri().path();
-    if path.starts_with("/api/v1/ingest") {
+    if path.starts_with("/api/v1/ingest") 
+        || path.starts_with("/assets/")
+        || path.starts_with("/api/v1/health")
+        || path == "/"
+        || path.ends_with(".js")
+        || path.ends_with(".css")
+        || path.ends_with(".html")
+        || path.ends_with(".svg")
+        || path.ends_with(".png")
+    {
         return next.run(request).await;
     }
 
