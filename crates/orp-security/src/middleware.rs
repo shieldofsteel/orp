@@ -50,8 +50,8 @@ impl AuthContext {
         self.scopes.iter().any(|s| s == scope)
     }
 
-    /// Build an anonymous (unauthenticated) context — used in permissive/dev mode.
-    /// Anonymous context has ZERO permissions for security.
+    /// Build an anonymous (unauthenticated) context — used when no credentials are
+    /// provided in production mode. Has ZERO permissions for security.
     pub fn anonymous() -> Self {
         Self {
             subject: "anonymous".to_string(),
@@ -60,6 +60,30 @@ impl AuthContext {
             name: Some("Anonymous".to_string()),
             org_id: None,
             scopes: vec![],
+            auth_method: AuthMethod::DevMode,
+        }
+    }
+
+    /// Build an anonymous context with full admin permissions — used in dev/permissive mode
+    /// so that unauthenticated requests have unrestricted access for local development.
+    pub fn anonymous_dev() -> Self {
+        Self {
+            subject: "anonymous".to_string(),
+            permissions: vec!["admin".to_string()],
+            email: None,
+            name: Some("Anonymous (dev)".to_string()),
+            org_id: None,
+            scopes: vec![
+                "entities:read".to_string(),
+                "entities:write".to_string(),
+                "events:read".to_string(),
+                "events:write".to_string(),
+                "graph:read".to_string(),
+                "graph:write".to_string(),
+                "monitors:read".to_string(),
+                "monitors:write".to_string(),
+                "admin".to_string(),
+            ],
             auth_method: AuthMethod::DevMode,
         }
     }
@@ -234,7 +258,7 @@ async fn extract_auth(
         if let Some(ctx) = parts.extensions.get::<AuthContext>() {
             return Ok(ctx.clone());
         }
-        return Ok(AuthContext::anonymous());
+        return Ok(AuthContext::anonymous_dev());
     }
 
     Err(AuthError {
@@ -247,7 +271,7 @@ async fn extract_auth(
 async fn validate_jwt(token: &str, state: &AuthState) -> Result<AuthContext, AuthError> {
     let svc = match &state.jwt_service {
         Some(s) => s.clone(),
-        None if state.permissive_mode => return Ok(AuthContext::anonymous()),
+        None if state.permissive_mode => return Ok(AuthContext::anonymous_dev()),
         None => {
             return Err(AuthError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -275,7 +299,7 @@ async fn validate_jwt(token: &str, state: &AuthState) -> Result<AuthContext, Aut
 async fn validate_api_key(key: &str, state: &AuthState) -> Result<AuthContext, AuthError> {
     let svc = match &state.api_key_service {
         Some(s) => s.clone(),
-        None if state.permissive_mode => return Ok(AuthContext::anonymous()),
+        None if state.permissive_mode => return Ok(AuthContext::anonymous_dev()),
         None => {
             return Err(AuthError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -323,6 +347,17 @@ mod tests {
         assert!(!ctx.has_permission("admin"));
         assert!(ctx.permissions.is_empty());
         assert!(ctx.scopes.is_empty());
+        assert_eq!(ctx.auth_method, AuthMethod::DevMode);
+    }
+
+    #[test]
+    fn test_anonymous_dev_context_has_admin_permissions() {
+        let ctx = AuthContext::anonymous_dev();
+        assert!(ctx.has_permission("entities:read"));
+        assert!(ctx.has_permission("entities:write"));
+        assert!(ctx.has_permission("admin"));
+        assert!(!ctx.permissions.is_empty());
+        assert!(!ctx.scopes.is_empty());
         assert_eq!(ctx.auth_method, AuthMethod::DevMode);
     }
 

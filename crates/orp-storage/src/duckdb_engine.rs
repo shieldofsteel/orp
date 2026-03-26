@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS idx_geom_coords ON entity_geometry(latitude, longitud
 -- ─── EVENTS ────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS events (
     event_id             VARCHAR PRIMARY KEY,
-    entity_id            VARCHAR NOT NULL REFERENCES entities(entity_id),
+    entity_id            VARCHAR NOT NULL,
     event_type           VARCHAR NOT NULL,
     event_timestamp      TIMESTAMP NOT NULL,
     ingestion_timestamp  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
