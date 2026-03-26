@@ -10,6 +10,7 @@ pub use adapters::database::DatabaseConnector;
 pub use adapters::generic_api::GenericApiConnector;
 pub use adapters::http_poller::HttpPollerConnector;
 pub use adapters::mqtt::MqttConnector;
+pub use adapters::opcua::OpcuaConnector;
 pub use adapters::stix::StixConnector;
 pub use adapters::syslog::SyslogConnector;
 pub use adapters::nmea::NmeaConnector;
