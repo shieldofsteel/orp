@@ -1,7 +1,8 @@
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { useAppStore } from './store/useAppStore';
 import { useEntities } from './hooks/useEntities';
+import { useEntityTypes } from './hooks/useEntityTypes';
 import { useWebSocket } from './hooks/useWebSocket';
 import { MapView } from './components/MapView';
 import { EntityInspector } from './components/EntityInspector';
@@ -29,10 +30,12 @@ function Header({
   onLogout,
   activeTab,
   onTabChange,
+  entitySummary,
 }: {
   onLogout: () => void;
   activeTab: AppTab;
   onTabChange: (tab: AppTab) => void;
+  entitySummary: Array<{ label: string; count: number; colorHex: string }>;
 }) {
   const wsConnected = useAppStore((s) => s.wsConnected);
   const sidebarOpen = useAppStore((s) => s.sidebarOpen);
@@ -85,6 +88,22 @@ function Header({
           </h1>
         </div>
       </div>
+
+      <div className="h-5 w-px bg-gray-800 mx-1" aria-hidden="true" />
+
+      {/* Dynamic entity type counts */}
+      {entitySummary.length > 0 && (
+        <div className="hidden md:flex items-center gap-2 text-[10px] font-mono">
+          {entitySummary.map(({ label, count, colorHex }, i) => (
+            <React.Fragment key={label}>
+              {i > 0 && <span className="text-gray-700">·</span>}
+              <span style={{ color: colorHex }}>
+                {count} <span className="text-gray-500">{label.toLowerCase()}{count !== 1 ? 's' : ''}</span>
+              </span>
+            </React.Fragment>
+          ))}
+        </div>
+      )}
 
       <div className="h-5 w-px bg-gray-800 mx-1" aria-hidden="true" />
 
@@ -252,21 +271,36 @@ function Header({
 function AppContent({ onLogout }: { onLogout: () => void }) {
   const [activeTab, setActiveTab] = useState<AppTab>('map');
   const setEntities = useAppStore((s) => s.setEntities);
+  const entities    = useAppStore((s) => s.entities);
   const inspectorOpen = useAppStore((s) => s.inspectorOpen);
   const setInspectorOpen = useAppStore((s) => s.setInspectorOpen);
   const selectEntity = useAppStore((s) => s.selectEntity);
 
-  const { data: shipData } = useEntities({ type: 'Ship', limit: 500 });
-  const { data: portData } = useEntities({ type: 'Port', limit: 200 });
+  // Load all entities without type filter — fully dynamic
+  const { data: allData } = useEntities({ limit: 1000 });
 
-  useWebSocket('Ship');
+  useWebSocket('');
 
   useEffect(() => {
-    const ships = shipData?.data ?? [];
-    const ports = portData?.data ?? [];
-    const all = [...ships, ...ports];
+    const all = allData?.data ?? [];
     if (all.length > 0) setEntities(all);
-  }, [shipData, portData, setEntities]);
+  }, [allData, setEntities]);
+
+  // Dynamic registry from live entity store
+  const registry = useEntityTypes(entities);
+
+  // Build header entity summary: [{label, count, colorHex}]
+  const entitySummary = useMemo(() => {
+    const summary: Array<{ label: string; count: number; colorHex: string }> = [];
+    for (const [type, config] of registry) {
+      let count = 0;
+      for (const e of entities.values()) {
+        if (e.type?.toLowerCase() === type) count++;
+      }
+      if (count > 0) summary.push({ label: config.label, count, colorHex: config.colorHex });
+    }
+    return summary;
+  }, [registry, entities]);
 
   // Global keyboard handler: Escape closes inspector
   const handleGlobalKeyDown = useCallback(
@@ -294,7 +328,7 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
         Skip to main content
       </a>
 
-      <Header onLogout={onLogout} activeTab={activeTab} onTabChange={setActiveTab} />
+      <Header onLogout={onLogout} activeTab={activeTab} onTabChange={setActiveTab} entitySummary={entitySummary} />
 
       <div className="flex flex-1 overflow-hidden">
         {/* Sidebar navigation */}

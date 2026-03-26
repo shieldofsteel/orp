@@ -1,4 +1,6 @@
+use crate::server::federation::{self, PeerRegistry};
 use crate::server::handlers;
+use crate::server::ingest;
 use crate::server::layers;
 use crate::server::websocket;
 use anyhow::Result;
@@ -37,6 +39,8 @@ pub struct AppState {
     pub started_at: std::time::Instant,
     /// Layer registry for intelligence overlays (optional — None if DB unavailable).
     pub layer_registry: Option<Arc<layers::LayerRegistry>>,
+    /// Federation peer registry (optional — None if federation is disabled).
+    pub federation_registry: Option<Arc<PeerRegistry>>,
 }
 
 /// Per-IP rate limiter state — token bucket with 100 req/sec.
@@ -188,7 +192,13 @@ pub struct ServerConfig {
     pub audit_signer: Option<Arc<EventSigner>>,
     /// Optional layer registry for intelligence overlays.
     pub layer_registry: Option<Arc<layers::LayerRegistry>>,
+    /// Optional federation peer registry. Pass `Some(PeerRegistry::new())` to enable federation.
+    pub federation_registry: Option<Arc<PeerRegistry>>,
     pub port: u16,
+    /// Headless mode: serve API + WebSocket only, skip static frontend files.
+    /// Enables deployment on servers, Raspberry Pi, embedded, and CI environments
+    /// where the web UI build artefacts are absent or unwanted.
+    pub headless: bool,
 }
 
 pub async fn start_server(config: ServerConfig) -> Result<()> {
@@ -210,7 +220,13 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         broadcast_tx,
         started_at: std::time::Instant::now(),
         layer_registry: config.layer_registry,
+        federation_registry: config.federation_registry.clone(),
     });
+
+    // Spawn federation background sync if registry provided
+    if config.federation_registry.is_some() {
+        federation::spawn_federation_sync(state.clone());
+    }
 
     let cors = build_cors_layer();
     let rate_limiter = RateLimiter::new(100, 100); // 100 tokens, refill 100/sec
@@ -220,7 +236,8 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         layers::layers_router(Arc::clone(registry))
     });
 
-    let mut app = Router::new()
+    // Core API routes (always present regardless of headless mode)
+    let api_routes = Router::new()
         // Health (no auth required)
         .route("/api/v1/health", get(handlers::health_check))
         // Metrics (auth required — handler extracts AuthContext)
@@ -281,24 +298,52 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         .route("/api/v1/api-keys", post(handlers::create_api_key))
         .route("/api/v1/api-keys", get(handlers::list_api_keys))
         .route("/api/v1/api-keys/{id}", delete(handlers::delete_api_key))
+        // Universal ingest — any system can POST JSON, ORP handles the rest
+        .route("/api/v1/ingest", post(ingest::ingest_single))
+        .route("/api/v1/ingest/batch", post(ingest::ingest_batch))
+        // Federation peers
+        .route("/api/v1/peers", get(federation::list_peers))
+        .route("/api/v1/peers", post(federation::register_peer))
+        .route("/api/v1/peers/{id}", delete(federation::remove_peer))
+        .route("/api/v1/peers/{id}/sync", post(federation::sync_peer))
         // WebSocket
-        .route("/ws/updates", get(websocket::ws_handler))
-        // Frontend — serve built Vite assets from frontend/dist/
-        .fallback_service(
-            ServeDir::new("frontend/dist")
-                .not_found_service(ServeFile::new("frontend/dist/index.html")),
-        )
-        .layer(axum::middleware::from_fn_with_state(
-            rate_limiter,
-            rate_limit_middleware,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            inject_auth_state,
-        ))
-        .layer(cors)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .route("/ws/updates", get(websocket::ws_handler));
+
+    // In headless mode we skip static file serving entirely — no frontend/dist
+    // required, making ORP deployable on Raspberry Pi, servers, and embedded.
+    let mut app: Router = if config.headless {
+        tracing::info!("Headless mode: static frontend disabled");
+        api_routes
+            .layer(axum::middleware::from_fn_with_state(
+                rate_limiter,
+                rate_limit_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                inject_auth_state,
+            ))
+            .layer(cors)
+            .layer(TraceLayer::new_for_http())
+            .with_state(state)
+    } else {
+        api_routes
+            // Frontend — serve built Vite assets from frontend/dist/
+            .fallback_service(
+                ServeDir::new("frontend/dist")
+                    .not_found_service(ServeFile::new("frontend/dist/index.html")),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                rate_limiter,
+                rate_limit_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                inject_auth_state,
+            ))
+            .layer(cors)
+            .layer(TraceLayer::new_for_http())
+            .with_state(state)
+    };
 
     // Nest the layers sub-router if registry is available
     if let Some(subrouter) = layers_subrouter {

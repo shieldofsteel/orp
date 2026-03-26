@@ -1,6 +1,7 @@
 /**
- * MapView — Military-grade Common Operating Picture (COP)
- * World-class Leaflet implementation with full situational awareness features.
+ * MapView — Dynamic Common Operating Picture (COP)
+ * All entity type rendering driven by EntityTypeRegistry.
+ * Zero hardcoded type names — add any entity type, it renders automatically.
  */
 
 import React, {
@@ -24,15 +25,12 @@ import {
   useMapEvents,
   ScaleControl,
 } from 'react-leaflet';
-import type { LeafletMouseEvent } from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { useAppStore } from '../store/useAppStore';
-import type { Entity } from '../types';
-import {
-  MapControls,
-  type TileLayerType,
-  type LayerVisibility,
-} from './MapControls';
+import type { Entity, EntityTypeConfig } from '../types';
+import { useEntityTypes, getEntityTypeConfig, groupEntitiesByType } from '../hooks/useEntityTypes';
+import { MapControls, type TileLayerType, type LayerVisibility } from './MapControls';
+import { MapLegend } from './MapLegend';
 
 // ── Tile layer configs ────────────────────────────────────────────────────────
 
@@ -41,9 +39,7 @@ interface TileConfig {
   attribution: string;
   subdomains?: string;
   opacity: number;
-  className?: string;
   maxZoom?: number;
-  // Whether to apply a dark CSS filter for military aesthetic
   darkFilter: boolean;
 }
 
@@ -59,7 +55,6 @@ const TILE_CONFIGS: Record<TileLayerType, TileConfig> = {
   satellite: {
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     attribution: '© Esri, Maxar, Earthstar Geographics',
-    subdomains: '',
     opacity: 1,
     darkFilter: false,
     maxZoom: 19,
@@ -75,40 +70,11 @@ const TILE_CONFIGS: Record<TileLayerType, TileConfig> = {
   topo: {
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',
     attribution: '© Esri, HERE, Garmin, OpenStreetMap',
-    subdomains: '',
     opacity: 1,
     darkFilter: true,
     maxZoom: 19,
   },
 };
-
-// ── Color helpers ─────────────────────────────────────────────────────────────
-
-function shipColor(speed: unknown, selected: boolean): string {
-  if (selected) return '#ff3232';
-  const s = typeof speed === 'number' && isFinite(speed) ? speed : 0;
-  if (s > 20) return '#ff7800';
-  if (s >= 10) return '#1e8cff';
-  return '#3cc85a';
-}
-
-function weatherFill(severity: string): string {
-  switch (severity?.toLowerCase()) {
-    case 'extreme': return 'rgba(220,20,20,0.30)';
-    case 'high':    return 'rgba(255,90,0,0.25)';
-    case 'moderate':return 'rgba(255,200,0,0.20)';
-    default:        return 'rgba(100,160,255,0.14)';
-  }
-}
-
-function weatherStroke(severity: string): string {
-  switch (severity?.toLowerCase()) {
-    case 'extreme': return '#ff1e1e';
-    case 'high':    return '#ff7800';
-    case 'moderate':return '#ffdc1e';
-    default:        return '#78b4ff';
-  }
-}
 
 // ── Geometry helpers ──────────────────────────────────────────────────────────
 
@@ -141,7 +107,7 @@ function hasValidGeometry(e: Entity): boolean {
   return false;
 }
 
-function getWeatherLatLngs(d: Entity): [number, number][] {
+function getPolygonLatLngs(d: Entity): [number, number][] {
   if (d.geometry?.type === 'Polygon' && Array.isArray(d.geometry.coordinates)) {
     const ring = (d.geometry.coordinates as number[][][])[0];
     if (Array.isArray(ring)) return ring.map(([lon, lat]) => [lat, lon] as [number, number]);
@@ -163,28 +129,62 @@ function getWeatherLatLngs(d: Entity): [number, number][] {
   return [];
 }
 
-// ── Course vector projection ──────────────────────────────────────────────────
+// ── Dynamic color helpers ─────────────────────────────────────────────────────
 
 /**
- * Project position forward 30 minutes at given speed (knots) and course (degrees).
- * Returns [lat, lon] of projected point.
+ * For entity types with a speed field, return a color based on speed magnitude.
+ * Falls back to the entity type's base color for types without speed.
  */
+function speedColor(
+  entity: Entity,
+  config: EntityTypeConfig,
+  selected: boolean,
+): string {
+  if (selected) return '#ff3232';
+  if (!config.speedField) return config.colorHex;
+  const speed = entity.properties?.[config.speedField];
+  const s = typeof speed === 'number' && isFinite(speed) ? speed : 0;
+  if (s > 20) return '#ff7800';
+  if (s >= 10) return '#1e8cff';
+  return '#3cc85a';
+}
+
+/** Color for polygon area entities (weather zones, regions) */
+function areaFill(entity: Entity, config: EntityTypeConfig): string {
+  const [r, g, b] = config.color;
+  const severity = (entity.properties?.severity as string)?.toLowerCase() ?? '';
+  if (severity === 'extreme') return 'rgba(220,20,20,0.30)';
+  if (severity === 'high')    return 'rgba(255,90,0,0.25)';
+  if (severity === 'moderate') return 'rgba(255,200,0,0.20)';
+  return `rgba(${r},${g},${b},0.16)`;
+}
+
+function areaStroke(entity: Entity, config: EntityTypeConfig): string {
+  const severity = (entity.properties?.severity as string)?.toLowerCase() ?? '';
+  if (severity === 'extreme') return '#ff1e1e';
+  if (severity === 'high')    return '#ff7800';
+  if (severity === 'moderate') return '#ffdc1e';
+  return config.colorHex;
+}
+
+// ── Vector projection ─────────────────────────────────────────────────────────
+
 function projectPosition(
   lat: number,
   lon: number,
   courseDegs: number,
   speedKnots: number,
 ): [number, number] {
-  const distNm = speedKnots * 0.5; // 30 min
+  const distNm = speedKnots * 0.5; // 30 min projection
   const courseRad = (courseDegs * Math.PI) / 180;
   const dLat = (distNm * Math.cos(courseRad)) / 60;
   const dLon = (distNm * Math.sin(courseRad)) / (60 * Math.cos((lat * Math.PI) / 180));
   return [lat + dLat, lon + dLon];
 }
 
-// ── Ship DivIcon factory ──────────────────────────────────────────────────────
+// ── DivIcon factories ─────────────────────────────────────────────────────────
 
-function createShipIcon(
+function createArrowIcon(
   course: number,
   color: string,
   selected: boolean,
@@ -194,19 +194,10 @@ function createShipIcon(
   const strokeW = selected ? 2 : 1;
   const glow = selected ? `filter: drop-shadow(0 0 4px ${color});` : '';
   return L.divIcon({
-    html: `<svg
-      width="${size}" height="${size}"
-      viewBox="0 0 20 24"
-      xmlns="http://www.w3.org/2000/svg"
-      style="transform: rotate(${course}deg); transform-origin: 50% 50%; ${glow}"
-    >
-      <polygon
-        points="10,1 18,23 10,17 2,23"
-        fill="${color}"
-        stroke="${stroke}"
-        stroke-width="${strokeW}"
-        stroke-linejoin="round"
-      />
+    html: `<svg width="${size}" height="${size}" viewBox="0 0 20 24" xmlns="http://www.w3.org/2000/svg"
+      style="transform: rotate(${course}deg); transform-origin: 50% 50%; ${glow}">
+      <polygon points="10,1 18,23 10,17 2,23" fill="${color}" stroke="${stroke}"
+        stroke-width="${strokeW}" stroke-linejoin="round"/>
     </svg>`,
     className: '',
     iconSize: [size, size],
@@ -214,31 +205,71 @@ function createShipIcon(
   });
 }
 
-// ── Measurement point icon ────────────────────────────────────────────────────
+function createPlaneIcon(heading: number, color: string, selected: boolean): L.DivIcon {
+  const size = selected ? 22 : 16;
+  const glow = selected ? `filter: drop-shadow(0 0 4px ${color});` : '';
+  return L.divIcon({
+    html: `<svg width="${size}" height="${size}" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"
+      style="transform: rotate(${heading}deg); transform-origin: 50% 50%; ${glow}">
+      <path d="M12 2L8 10H2l3 3-2 7 9-5 9 5-2-7 3-3h-6z" fill="${color}" stroke="rgba(0,0,0,0.5)" stroke-width="0.8"/>
+    </svg>`,
+    className: '',
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+}
+
+function createDiamondIcon(color: string, selected: boolean): L.DivIcon {
+  const size = selected ? 18 : 12;
+  const glow = selected ? `filter: drop-shadow(0 0 4px ${color});` : '';
+  return L.divIcon({
+    html: `<svg width="${size}" height="${size}" viewBox="0 0 12 12" xmlns="http://www.w3.org/2000/svg" style="${glow}">
+      <polygon points="6,0 12,6 6,12 0,6" fill="${color}" stroke="rgba(0,0,0,0.5)" stroke-width="0.8"/>
+    </svg>`,
+    className: '',
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+}
+
+function createSquareIcon(color: string, selected: boolean): L.DivIcon {
+  const size = selected ? 16 : 10;
+  const glow = selected ? `filter: drop-shadow(0 0 4px ${color});` : '';
+  return L.divIcon({
+    html: `<svg width="${size}" height="${size}" viewBox="0 0 12 12" xmlns="http://www.w3.org/2000/svg" style="${glow}">
+      <rect x="0.5" y="0.5" width="11" height="11" fill="${color}" stroke="rgba(255,255,255,0.3)" stroke-width="0.8"/>
+    </svg>`,
+    className: '',
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+}
+
+function createEmojiIcon(emoji: string, selected: boolean): L.DivIcon {
+  const sz = selected ? '16px' : '12px';
+  const glow = selected ? 'text-shadow: 0 0 6px rgba(255,255,255,0.7);' : '';
+  return L.divIcon({
+    html: `<div style="font-size:${sz};line-height:1;${glow}">${emoji}</div>`,
+    className: '',
+    iconSize: [20, 20],
+    iconAnchor: [10, 10],
+  });
+}
 
 function createMeasureIcon(label: string): L.DivIcon {
   return L.divIcon({
-    html: `<div style="
-      width:10px;height:10px;
-      background:#facc15;
-      border:2px solid #fff;
-      border-radius:50%;
-      position:relative;
-    "><span style="
-      position:absolute;left:12px;top:-2px;
-      color:#facc15;font-size:9px;
-      font-family:monospace;white-space:nowrap;
-      text-shadow:0 1px 3px rgba(0,0,0,0.9);
-    ">${label}</span></div>`,
+    html: `<div style="width:10px;height:10px;background:#facc15;border:2px solid #fff;border-radius:50%;position:relative;">
+      <span style="position:absolute;left:12px;top:-2px;color:#facc15;font-size:9px;font-family:monospace;white-space:nowrap;text-shadow:0 1px 3px rgba(0,0,0,0.9);">${label}</span>
+    </div>`,
     className: '',
     iconSize: [10, 10],
     iconAnchor: [5, 5],
   });
 }
 
-// ── Tooltip content ───────────────────────────────────────────────────────────
+// ── Tooltip content (dynamic) ─────────────────────────────────────────────────
 
-function tooltipHTML(entity: Entity): string {
+function tooltipHTML(entity: Entity, config: EntityTypeConfig): string {
   const name = entity.name ?? entity.id;
   const type = entity.type ?? 'Unknown';
   const props = entity.properties ?? {};
@@ -248,45 +279,49 @@ function tooltipHTML(entity: Entity): string {
 
   const rows: string[] = [];
 
-  if (entity.type?.toLowerCase() === 'ship') {
-    const speed = typeof props.speed === 'number' ? `${props.speed.toFixed(1)} kn` : '—';
-    const course = typeof props.course === 'number' ? `${Math.round(props.course)}°` : '—';
-    rows.push(`Speed: ${speed}`, `Course: ${course}`);
-  } else if (entity.type?.toLowerCase() === 'port') {
-    const teu = typeof props.total_teu === 'number' ? props.total_teu.toLocaleString() : '—';
-    const cong = typeof props.congestion === 'number' ? `${(props.congestion * 100).toFixed(0)}%` : '—';
-    rows.push(`TEU: ${teu}`, `Congestion: ${cong}`);
-  } else if (entity.type?.toLowerCase() === 'weathersystem') {
-    rows.push(`Severity: ${(props.severity as string) ?? '—'}`);
+  if (config.speedField && props[config.speedField] != null) {
+    const v = typeof props[config.speedField] === 'number'
+      ? (props[config.speedField] as number).toFixed(1)
+      : String(props[config.speedField]);
+    rows.push(`Speed: ${v}`);
+  }
+  if (config.headingField && props[config.headingField] != null) {
+    rows.push(`Heading: ${Math.round(props[config.headingField] as number)}°`);
+  }
+  if (config.altitudeField && props[config.altitudeField] != null) {
+    rows.push(`Alt: ${(props[config.altitudeField] as number).toFixed(0)} m`);
+  }
+  // Generic interesting props (max 3 more)
+  const skip = new Set([config.speedField, config.headingField, config.altitudeField].filter(Boolean));
+  let extra = 0;
+  for (const [k, v] of Object.entries(props)) {
+    if (skip.has(k) || extra >= 3) break;
+    if (v != null && typeof v !== 'object') {
+      rows.push(`${k}: ${v}`);
+      extra++;
+    }
   }
   rows.push(`Confidence: ${conf}`);
 
   return `
-    <div style="
-      font-family: 'JetBrains Mono','Fira Code',monospace;
-      font-size: 10px;
-      line-height: 1.4;
-      min-width: 130px;
-    ">
+    <div style="font-family:'JetBrains Mono','Fira Code',monospace;font-size:10px;line-height:1.4;min-width:130px;">
       <div style="font-weight:700;color:#e5e7eb;margin-bottom:3px;font-size:11px">${name}</div>
-      <div style="color:#6b7280;margin-bottom:4px;font-size:9px;text-transform:uppercase;letter-spacing:.08em">${type}</div>
+      <div style="color:${config.colorHex};margin-bottom:4px;font-size:9px;text-transform:uppercase;letter-spacing:.08em">${type}</div>
       ${rows.map(r => `<div style="color:#9ca3af">${r}</div>`).join('')}
     </div>
   `;
 }
 
-// ── Grid layer component ──────────────────────────────────────────────────────
+// ── Grid overlay ──────────────────────────────────────────────────────────────
 
 function LatLonGrid() {
   const map = useMap();
-  const [lines, setLines] = useState<Array<{ positions: [number, number][]; label: string; isLat: boolean }>>([]);
+  const [lines, setLines] = useState<Array<{ positions: [number, number][]; isLat: boolean }>>([]);
 
   useEffect(() => {
     const update = () => {
       const bounds = map.getBounds();
       const zoom = map.getZoom();
-
-      // Adaptive step based on zoom
       let step = 10;
       if (zoom >= 8)  step = 1;
       if (zoom >= 10) step = 0.5;
@@ -294,31 +329,18 @@ function LatLonGrid() {
       if (zoom >= 14) step = 0.1;
 
       const newLines: typeof lines = [];
-
-      // Lat lines
       const minLat = Math.floor(bounds.getSouth() / step) * step;
       const maxLat = Math.ceil(bounds.getNorth() / step) * step;
       for (let lat = minLat; lat <= maxLat; lat = Math.round((lat + step) * 1e6) / 1e6) {
-        newLines.push({
-          positions: [[lat, bounds.getWest()], [lat, bounds.getEast()]],
-          label: `${Math.abs(lat).toFixed(step < 1 ? 2 : 0)}°${lat >= 0 ? 'N' : 'S'}`,
-          isLat: true,
-        });
+        newLines.push({ positions: [[lat, bounds.getWest()], [lat, bounds.getEast()]], isLat: true });
       }
-
-      // Lon lines
       const minLon = Math.floor(bounds.getWest() / step) * step;
       const maxLon = Math.ceil(bounds.getEast() / step) * step;
       for (let lon = minLon; lon <= maxLon; lon = Math.round((lon + step) * 1e6) / 1e6) {
-        newLines.push({
-          positions: [[bounds.getSouth(), lon], [bounds.getNorth(), lon]],
-          label: `${Math.abs(lon).toFixed(step < 1 ? 2 : 0)}°${lon >= 0 ? 'E' : 'W'}`,
-          isLat: false,
-        });
+        newLines.push({ positions: [[bounds.getSouth(), lon], [bounds.getNorth(), lon]], isLat: false });
       }
       setLines(newLines);
     };
-
     update();
     map.on('moveend zoomend', update);
     return () => { map.off('moveend zoomend', update); };
@@ -327,23 +349,16 @@ function LatLonGrid() {
   return (
     <>
       {lines.map((line, i) => (
-        <Polyline
-          key={i}
-          positions={line.positions}
-          pathOptions={{ color: '#334155', weight: 0.5, opacity: 0.5, dashArray: '2 4' }}
-        />
+        <Polyline key={i} positions={line.positions}
+          pathOptions={{ color: '#334155', weight: 0.5, opacity: 0.5, dashArray: '2 4' }} />
       ))}
     </>
   );
 }
 
-// ── Coordinate tracker (inside MapContainer context) ──────────────────────────
+// ── Coord tracker ─────────────────────────────────────────────────────────────
 
-function CoordTracker({
-  onCoords,
-}: {
-  onCoords: (coords: [number, number] | null) => void;
-}) {
+function CoordTracker({ onCoords }: { onCoords: (c: [number, number] | null) => void }) {
   useMapEvents({
     mousemove(e) { onCoords([e.latlng.lat, e.latlng.lng]); },
     mouseout()   { onCoords(null); },
@@ -351,136 +366,85 @@ function CoordTracker({
   return null;
 }
 
-// ── Lasso/box selection handler ───────────────────────────────────────────────
+// ── Lasso handler ─────────────────────────────────────────────────────────────
 
-interface LassoHandlerProps {
-  active: boolean;
-  onSelect: (bounds: L.LatLngBounds) => void;
-}
-
-function LassoHandler({ active, onSelect }: LassoHandlerProps) {
+function LassoHandler({ active, onSelect }: { active: boolean; onSelect: (b: L.LatLngBounds) => void }) {
   const map = useMap();
   const startRef = useRef<L.LatLng | null>(null);
   const draggingRef = useRef(false);
-  const [selectionBounds, setSelectionBounds] = useState<L.LatLngBounds | null>(null);
+  const [bounds, setBounds] = useState<L.LatLngBounds | null>(null);
 
   useEffect(() => {
-    if (!active) {
-      setSelectionBounds(null);
-      return;
-    }
-
-    const onMouseDown = (e: L.LeafletMouseEvent) => {
+    if (!active) { setBounds(null); return; }
+    const onDown = (e: L.LeafletMouseEvent) => {
       if (!e.originalEvent.shiftKey) return;
       e.originalEvent.preventDefault();
       map.dragging.disable();
       startRef.current = e.latlng;
       draggingRef.current = true;
     };
-
-    const onMouseMove = (e: L.LeafletMouseEvent) => {
+    const onMove = (e: L.LeafletMouseEvent) => {
       if (!draggingRef.current || !startRef.current) return;
-      setSelectionBounds(L.latLngBounds(startRef.current, e.latlng));
+      setBounds(L.latLngBounds(startRef.current, e.latlng));
     };
-
-    const onMouseUp = (e: L.LeafletMouseEvent) => {
+    const onUp = (e: L.LeafletMouseEvent) => {
       if (!draggingRef.current || !startRef.current) return;
       draggingRef.current = false;
       map.dragging.enable();
-      const bounds = L.latLngBounds(startRef.current, e.latlng);
-      onSelect(bounds);
-      setSelectionBounds(null);
+      onSelect(L.latLngBounds(startRef.current, e.latlng));
+      setBounds(null);
       startRef.current = null;
     };
-
-    map.on('mousedown', onMouseDown as L.LeafletEventHandlerFn);
-    map.on('mousemove', onMouseMove as L.LeafletEventHandlerFn);
-    map.on('mouseup', onMouseUp as L.LeafletEventHandlerFn);
-
+    map.on('mousedown', onDown as L.LeafletEventHandlerFn);
+    map.on('mousemove', onMove as L.LeafletEventHandlerFn);
+    map.on('mouseup', onUp as L.LeafletEventHandlerFn);
     return () => {
-      map.off('mousedown', onMouseDown as L.LeafletEventHandlerFn);
-      map.off('mousemove', onMouseMove as L.LeafletEventHandlerFn);
-      map.off('mouseup', onMouseUp as L.LeafletEventHandlerFn);
+      map.off('mousedown', onDown as L.LeafletEventHandlerFn);
+      map.off('mousemove', onMove as L.LeafletEventHandlerFn);
+      map.off('mouseup', onUp as L.LeafletEventHandlerFn);
       map.dragging.enable();
-      setSelectionBounds(null);
     };
   }, [active, map, onSelect]);
 
-  if (!selectionBounds) return null;
+  if (!bounds) return null;
   return (
-    <Rectangle
-      bounds={selectionBounds}
-      pathOptions={{
-        color: '#00e5ff',
-        weight: 1.5,
-        fillColor: '#00e5ff',
-        fillOpacity: 0.05,
-        dashArray: '4 3',
-      }}
-    />
+    <Rectangle bounds={bounds}
+      pathOptions={{ color: '#00e5ff', weight: 1.5, fillColor: '#00e5ff', fillOpacity: 0.05, dashArray: '4 3' }} />
   );
 }
 
-// ── Measurement tool handler ──────────────────────────────────────────────────
+// ── Measurement tool ──────────────────────────────────────────────────────────
 
 function MeasurementHandler({ active }: { active: boolean }) {
   const [points, setPoints] = useState<L.LatLng[]>([]);
-
   useMapEvents({
     click(e) {
       if (!active) return;
       e.originalEvent.stopPropagation();
-      setPoints((prev) => {
-        if (prev.length >= 2) return [e.latlng];
-        return [...prev, e.latlng];
-      });
+      setPoints((prev) => prev.length >= 2 ? [e.latlng] : [...prev, e.latlng]);
     },
   });
-
-  useEffect(() => {
-    if (!active) setPoints([]);
-  }, [active]);
+  useEffect(() => { if (!active) setPoints([]); }, [active]);
 
   if (!active || points.length === 0) return null;
-
   const distM = points.length === 2 ? points[0].distanceTo(points[1]) : null;
-  const distKm = distM !== null ? (distM / 1000).toFixed(2) : null;
-  const distNm = distM !== null ? (distM / 1852).toFixed(2) : null;
-
-  const midLabel = distKm !== null ? `${distKm} km / ${distNm} nm` : 'Click 2nd point';
+  const label = distM !== null
+    ? `${(distM / 1000).toFixed(2)} km / ${(distM / 1852).toFixed(2)} nm`
+    : 'Click 2nd point';
 
   return (
     <>
-      {points.map((pt, i) => (
-        <Marker
-          key={i}
-          position={pt}
-          icon={createMeasureIcon(i === 0 ? 'A' : 'B')}
-        />
-      ))}
+      {points.map((pt, i) => <Marker key={i} position={pt} icon={createMeasureIcon(i === 0 ? 'A' : 'B')} />)}
       {points.length === 2 && (
         <>
-          <Polyline
-            positions={[points[0], points[1]]}
-            pathOptions={{ color: '#facc15', weight: 2, dashArray: '6 4' }}
-          />
-          {/* Mid-point label */}
+          <Polyline positions={[points[0], points[1]]}
+            pathOptions={{ color: '#facc15', weight: 2, dashArray: '6 4' }} />
           <Marker
-            position={[
-              (points[0].lat + points[1].lat) / 2,
-              (points[0].lng + points[1].lng) / 2,
-            ]}
+            position={[(points[0].lat + points[1].lat) / 2, (points[0].lng + points[1].lng) / 2]}
             icon={L.divIcon({
-              html: `<div style="
-                background:rgba(0,0,0,0.85);
-                border:1px solid #facc15;
-                color:#facc15;
-                font-family:monospace;
-                font-size:10px;
-                padding:2px 6px;
-                white-space:nowrap;
-                transform:translateX(-50%);
-              ">${midLabel}</div>`,
+              html: `<div style="background:rgba(0,0,0,0.85);border:1px solid #facc15;color:#facc15;
+                font-family:monospace;font-size:10px;padding:2px 6px;white-space:nowrap;
+                transform:translateX(-50%);">${label}</div>`,
               className: '',
               iconAnchor: [0, 0],
             })}
@@ -505,70 +469,276 @@ function MapController({
   zoomToPos: [number, number] | null;
 }) {
   const map = useMap();
-
-  useEffect(() => {
-    mapRef.current = map;
-  }, [map, mapRef]);
-
+  useEffect(() => { mapRef.current = map; }, [map, mapRef]);
   useEffect(() => {
     if (zoomToFitTrigger === 0) return;
-    const points: L.LatLng[] = [];
-    for (const e of allEntities) {
-      const pos = getLatLng(e);
-      if (pos) points.push(L.latLng(pos[0], pos[1]));
-    }
+    const points = allEntities.flatMap(e => { const p = getLatLng(e); return p ? [L.latLng(p[0], p[1])] : []; });
     if (points.length === 0) return;
-    const bounds = L.latLngBounds(points);
-    map.fitBounds(bounds, { padding: [40, 40], maxZoom: 12 });
+    map.fitBounds(L.latLngBounds(points), { padding: [40, 40], maxZoom: 12 });
   }, [zoomToFitTrigger, map, allEntities]);
-
   useEffect(() => {
     if (!zoomToPos) return;
     map.setView(zoomToPos, Math.max(map.getZoom(), 13), { animate: true });
   }, [zoomToPos, map]);
-
   return null;
 }
 
-// ── CSS injection for tile layer dark filter ──────────────────────────────────
+// ── Track renderer (fading polyline) ─────────────────────────────────────────
 
-const DARK_FILTER_STYLE = `
-  .leaflet-tile-pane.cop-dark-filter img {
-    filter: brightness(0.5) saturate(0.4) hue-rotate(190deg);
-  }
-`;
+function useRenderTrack() {
+  return useCallback((entity: Entity, config: EntityTypeConfig, isSelected: boolean) => {
+    const history = entity.history ?? [];
+    const positions = history
+      .slice(-50)
+      .filter(h => {
+        const c = h.geometry?.coordinates;
+        return Array.isArray(c) && c.length >= 2 &&
+          typeof c[0] === 'number' && typeof c[1] === 'number' &&
+          isFinite(c[0]) && isFinite(c[1]);
+      })
+      .map(h => {
+        const [lon, lat] = h.geometry!.coordinates as number[];
+        return [lat, lon] as [number, number];
+      });
 
-function InjectStyle() {
-  useEffect(() => {
-    const el = document.createElement('style');
-    el.textContent = DARK_FILTER_STYLE;
-    document.head.appendChild(el);
-    return () => el.remove();
+    if (positions.length < 2) return null;
+    const segCount = 5;
+    const segSize = Math.ceil(positions.length / segCount);
+    const segments = [];
+    for (let i = 0; i < segCount; i++) {
+      const pts = positions.slice(i * segSize, Math.min((i + 1) * segSize + 1, positions.length));
+      if (pts.length < 2) continue;
+      segments.push({
+        pts,
+        opacity: isSelected ? 0.15 + i * 0.17 : 0.05 + i * 0.06,
+      });
+    }
+    const trackColor = isSelected ? '#ffc832' : config.colorHex + '88';
+    return segments.map((seg, si) => (
+      <Polyline
+        key={`track-${entity.id}-${si}`}
+        positions={seg.pts}
+        pathOptions={{
+          color: trackColor,
+          weight: isSelected ? 2 : 1,
+          opacity: seg.opacity,
+        }}
+      />
+    ));
   }, []);
-  return null;
 }
+
+// ── Entity marker renderer ────────────────────────────────────────────────────
+
+interface EntityMarkersProps {
+  entities: Entity[];
+  config: EntityTypeConfig;
+  layerOn: boolean;
+  tracksOn: boolean;
+  vectorsOn: boolean;
+  selectedEntityId: string | null;
+  selectedEntities: Set<string>;
+  onEntityClick: (id: string) => (e: L.LeafletEvent) => void;
+  onEntityDblClick: (pos: [number, number]) => (e: L.LeafletEvent) => void;
+  renderTrack: (entity: Entity, config: EntityTypeConfig, isSelected: boolean) => React.ReactNode;
+}
+
+const EntityMarkers: React.FC<EntityMarkersProps> = ({
+  entities,
+  config,
+  layerOn,
+  tracksOn,
+  vectorsOn,
+  selectedEntityId,
+  selectedEntities,
+  onEntityClick,
+  onEntityDblClick,
+  renderTrack,
+}) => {
+  if (!layerOn) return null;
+
+  return (
+    <>
+      {/* Area entities (polygons) */}
+      {config.isArea && entities.map((entity) => {
+        const positions = getPolygonLatLngs(entity);
+        if (positions.length === 0) return null;
+        const isSelected = entity.id === selectedEntityId;
+        return (
+          <Polygon
+            key={entity.id}
+            positions={positions}
+            pathOptions={{
+              fillColor: areaFill(entity, config),
+              fillOpacity: 1,
+              color: isSelected ? '#ffffff' : areaStroke(entity, config),
+              weight: isSelected ? 2.5 : 1.5,
+            }}
+            eventHandlers={{ click: onEntityClick(entity.id) }}
+          >
+            <Tooltip direction="top" sticky className="cop-tooltip" opacity={1}>
+              <div dangerouslySetInnerHTML={{ __html: tooltipHTML(entity, config) }} />
+            </Tooltip>
+          </Polygon>
+        );
+      })}
+
+      {/* Point entities */}
+      {!config.isArea && entities.map((entity) => {
+        const pos = getLatLng(entity);
+        if (!pos) return null;
+        const isSelected = entity.id === selectedEntityId;
+        const isMulti = selectedEntities.has(entity.id);
+        const color = speedColor(entity, config, isSelected);
+
+        // Track
+        const track = (tracksOn && config.showTrack) ? renderTrack(entity, config, isSelected) : null;
+
+        // Vector
+        const vecEl = (() => {
+          if (!vectorsOn || !config.showVector || !config.headingField || !config.speedField) return null;
+          const speed = entity.properties?.[config.speedField];
+          const heading = entity.properties?.[config.headingField];
+          if (typeof speed !== 'number' || typeof heading !== 'number' || speed < 0.5) return null;
+          const projected = projectPosition(pos[0], pos[1], heading, speed);
+          return (
+            <Polyline
+              key={`vec-${entity.id}`}
+              positions={[pos, projected]}
+              pathOptions={{
+                color: isSelected ? '#ffffff' : color,
+                weight: isSelected ? 2 : 1,
+                opacity: isSelected ? 0.9 : 0.55,
+                dashArray: '6 3',
+              }}
+            />
+          );
+        })();
+
+        // Choose marker type
+        const marker = (() => {
+          const tooltip = (
+            <Tooltip direction="top" sticky offset={[0, -8]} opacity={1} className="cop-tooltip">
+              <div dangerouslySetInnerHTML={{ __html: tooltipHTML(entity, config) }} />
+            </Tooltip>
+          );
+
+          if (config.markerStyle === 'circle') {
+            const sizeProp = entity.properties?.total_teu ?? entity.properties?.capacity ?? 0;
+            const radius = isSelected
+              ? 14
+              : Math.max(6, Math.min(14, 4 + Math.log10((sizeProp as number) + 1) * 2));
+            return (
+              <CircleMarker
+                key={entity.id}
+                center={pos}
+                radius={radius}
+                pathOptions={{
+                  fillColor: color,
+                  fillOpacity: isSelected ? 0.95 : 0.75,
+                  color: isSelected || isMulti ? '#ffffff' : 'rgba(255,255,255,0.35)',
+                  weight: isSelected ? 2.5 : isMulti ? 2 : 1,
+                }}
+                eventHandlers={{
+                  click: onEntityClick(entity.id),
+                  dblclick: onEntityDblClick(pos),
+                }}
+              >
+                {tooltip}
+              </CircleMarker>
+            );
+          }
+
+          if (config.markerStyle === 'dot') {
+            return (
+              <CircleMarker
+                key={entity.id}
+                center={pos}
+                radius={isSelected ? 8 : 5}
+                pathOptions={{
+                  fillColor: color,
+                  fillOpacity: 0.85,
+                  color: isSelected ? '#ffffff' : 'rgba(0,0,0,0.4)',
+                  weight: isSelected ? 2 : 1,
+                }}
+                eventHandlers={{ click: onEntityClick(entity.id) }}
+              >
+                {tooltip}
+              </CircleMarker>
+            );
+          }
+
+          // Arrow / plane / diamond / square / emoji — use DivIcon Marker
+          const heading = config.headingField
+            ? (typeof entity.properties?.[config.headingField] === 'number'
+                ? entity.properties[config.headingField] as number
+                : 0)
+            : 0;
+
+          let icon: L.DivIcon;
+          if (config.iconIsEmoji && config.icon) {
+            icon = createEmojiIcon(config.icon, isSelected);
+          } else if (config.markerStyle === 'plane') {
+            icon = createPlaneIcon(heading, color, isSelected);
+          } else if (config.markerStyle === 'diamond') {
+            icon = createDiamondIcon(color, isSelected);
+          } else if (config.markerStyle === 'square') {
+            icon = createSquareIcon(color, isSelected);
+          } else {
+            icon = createArrowIcon(heading, color, isSelected);
+          }
+
+          return (
+            <Marker
+              key={entity.id}
+              position={pos}
+              icon={icon}
+              zIndexOffset={isSelected ? 1000 : isMulti ? 500 : 0}
+              eventHandlers={{
+                click: onEntityClick(entity.id),
+                dblclick: (e: L.LeafletEvent) => {
+                  (e as L.LeafletMouseEvent).originalEvent?.stopPropagation();
+                  onEntityDblClick(pos)(e);
+                },
+              }}
+            >
+              {tooltip}
+            </Marker>
+          );
+        })();
+
+        return (
+          <React.Fragment key={entity.id}>
+            {track}
+            {vecEl}
+            {marker}
+          </React.Fragment>
+        );
+      })}
+    </>
+  );
+};
 
 // ── Main Component ────────────────────────────────────────────────────────────
 
+const DARK_FILTER_STYLE = `
+  .cop-dark-filter .leaflet-tile {
+    filter: brightness(0.5) saturate(0.4) hue-rotate(190deg) !important;
+  }
+`;
+
 export const MapView: React.FC = () => {
-  // ── Store ──
   const entities         = useAppStore((s) => s.entities);
   const selectedEntityId = useAppStore((s) => s.selectedEntityId);
   const selectedEntities = useAppStore((s) => s.selectedEntities);
-  const showWeatherLayer = useAppStore((s) => s.showWeatherLayer);
-  const showShipTracksLayer = useAppStore((s) => s.showShipTracksLayer);
   const selectEntity     = useAppStore((s) => s.selectEntity);
   const toggleEntitySelection = useAppStore((s) => s.toggleEntitySelection);
 
-  // ── Local state ──
   const [activeTile, setActiveTile] = useState<TileLayerType>('osm');
   const [layers, setLayers] = useState<LayerVisibility>({
-    ships:   true,
-    ports:   true,
-    weather: true,
-    tracks:  true,
+    tracks: true,
     vectors: true,
-    grid:    false,
+    grid: false,
   });
   const [measureActive, setMeasureActive] = useState(false);
   const [lassoActive, setLassoActive]     = useState(false);
@@ -577,25 +747,34 @@ export const MapView: React.FC = () => {
   const [zoomToPos, setZoomToPos]         = useState<[number, number] | null>(null);
   const mapRef = useRef<L.Map | null>(null);
 
-  // ── Derived data ──
   const allEntities = useMemo(() => Array.from(entities.values()), [entities]);
 
-  const ships = useMemo(
-    () => allEntities.filter((e) => e.type?.toLowerCase() === 'ship' && hasValidGeometry(e)),
-    [allEntities],
-  );
-  const ports = useMemo(
-    () => allEntities.filter((e) => e.type?.toLowerCase() === 'port' && hasValidGeometry(e)),
-    [allEntities],
-  );
-  const weatherSystems = useMemo(
-    () => allEntities.filter((e) => e.type?.toLowerCase() === 'weathersystem' && hasValidGeometry(e)),
-    [allEntities],
+  // ── Dynamic entity type registry ──
+  const registry = useEntityTypes(entities);
+  const entityTypesList = useMemo(() => Array.from(registry.values()), [registry]);
+
+  // ── Group entities by type ──
+  const grouped = useMemo(() => groupEntitiesByType(entities, registry), [entities, registry]);
+
+  // ── Entity counts per type ──
+  const entityCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const [type, list] of grouped) {
+      counts[type] = list.filter(hasValidGeometry).length;
+    }
+    return counts;
+  }, [grouped]);
+
+  // ── Entity types visible on map (have geometry) ──
+  const visibleTypes = useMemo(
+    () => entityTypesList.filter((cfg) => (entityCounts[cfg.type] ?? 0) > 0),
+    [entityTypesList, entityCounts],
   );
 
-  // ── Handlers ──
-  const handleToggleLayer = useCallback((layer: keyof LayerVisibility) => {
-    setLayers((prev) => ({ ...prev, [layer]: !prev[layer] }));
+  const renderTrack = useRenderTrack();
+
+  const handleToggleLayer = useCallback((layer: string) => {
+    setLayers((prev) => ({ ...prev, [layer]: !(prev[layer] !== false) }));
   }, []);
 
   const handleEntityClick = useCallback(
@@ -607,21 +786,16 @@ export const MapView: React.FC = () => {
   );
 
   const handleEntityDblClick = useCallback(
-    (pos: [number, number]) => (e: L.LeafletEvent) => {
-      (e as L.LeafletMouseEvent).originalEvent?.stopPropagation();
-      setZoomToPos(pos);
-    },
+    (pos: [number, number]) => (_e: L.LeafletEvent) => { setZoomToPos(pos); },
     [],
   );
 
   const handleLassoSelect = useCallback(
     (bounds: L.LatLngBounds) => {
-      const inBounds = allEntities.filter((e) => {
+      allEntities.forEach((e) => {
         const pos = getLatLng(e);
-        if (!pos) return false;
-        return bounds.contains(L.latLng(pos[0], pos[1]));
+        if (pos && bounds.contains(L.latLng(pos[0], pos[1]))) toggleEntitySelection(e.id);
       });
-      inBounds.forEach((e) => toggleEntitySelection(e.id));
     },
     [allEntities, toggleEntitySelection],
   );
@@ -629,329 +803,10 @@ export const MapView: React.FC = () => {
   const tileConfig = TILE_CONFIGS[activeTile];
   const tileLayerClass = tileConfig.darkFilter ? 'cop-dark-filter' : '';
 
-  // Sync local layer state with store for weather/tracks
-  useEffect(() => {
-    // Keep store in sync when toggled via MapControls
-    // (store has its own toggles; for simplicity we use local state as source of truth for these)
-  }, []);
-
-  // ── Track segments with fading opacity ──
-  const renderTrack = useCallback((ship: Entity, isSelected: boolean) => {
-    const history = ship.history ?? [];
-    const trackPositions = history
-      .slice(-50)
-      .filter((h) => {
-        const c = h.geometry?.coordinates;
-        return (
-          Array.isArray(c) &&
-          c.length >= 2 &&
-          typeof c[0] === 'number' &&
-          typeof c[1] === 'number' &&
-          isFinite(c[0]) &&
-          isFinite(c[1])
-        );
-      })
-      .map((h) => {
-        const [lon, lat] = h.geometry!.coordinates as number[];
-        return [lat, lon] as [number, number];
-      });
-
-    if (trackPositions.length < 2) return null;
-
-    // Split into 5 segments for fading effect
-    const segCount = 5;
-    const segSize = Math.ceil(trackPositions.length / segCount);
-    const segments: Array<{ positions: [number, number][]; opacity: number }> = [];
-
-    for (let i = 0; i < segCount; i++) {
-      const start = i * segSize;
-      const end = Math.min(start + segSize + 1, trackPositions.length);
-      const pts = trackPositions.slice(start, end);
-      if (pts.length < 2) continue;
-      segments.push({
-        positions: pts,
-        opacity: isSelected ? 0.15 + i * 0.17 : 0.05 + i * 0.06,
-      });
-    }
-
-    return segments.map((seg, segIdx) => (
-      <Polyline
-        key={`track-${ship.id}-seg${segIdx}`}
-        positions={seg.positions}
-        pathOptions={{
-          color: isSelected ? '#ffc832' : '#64a0dc',
-          weight: isSelected ? 2 : 1,
-          opacity: seg.opacity,
-        }}
-      />
-    ));
-  }, []);
-
   return (
-    <div
-      className="relative flex-1 overflow-hidden"
-      role="application"
-      aria-label="Military Common Operating Picture map"
-    >
-      {/* Inject dark filter CSS once */}
-      <style>{DARK_FILTER_STYLE}</style>
-
-      <MapContainer
-        center={[51.92, 4.27]}
-        zoom={10}
-        className="h-full w-full"
-        style={{ background: '#060b14' }}
-        zoomControl={false}
-        attributionControl={false}
-      >
-        {/* Tile layer — keyed to force remount on change */}
-        <TileLayer
-          key={activeTile}
-          url={tileConfig.url}
-          attribution={tileConfig.attribution}
-          subdomains={tileConfig.subdomains as string | undefined}
-          opacity={tileConfig.opacity}
-          maxZoom={tileConfig.maxZoom}
-          className={tileLayerClass}
-        />
-
-        {/* Scale control */}
-        <ScaleControl position="bottomleft" imperial metric />
-
-        {/* Internal utility components */}
-        <CoordTracker onCoords={setMouseCoords} />
-        <MapController
-          zoomToFitTrigger={zoomToFitTrigger}
-          allEntities={allEntities}
-          mapRef={mapRef}
-          zoomToPos={zoomToPos}
-        />
-
-        {/* Grid */}
-        {layers.grid && <LatLonGrid />}
-
-        {/* Measurement tool */}
-        <MeasurementHandler active={measureActive} />
-
-        {/* Lasso/box selection */}
-        <LassoHandler active={lassoActive} onSelect={handleLassoSelect} />
-
-        {/* ── Weather layer ────────────────────────────────────────────── */}
-        {layers.weather &&
-          weatherSystems.map((w) => {
-            const positions = getWeatherLatLngs(w);
-            if (positions.length === 0) return null;
-            const severity = (w.properties?.severity as string) ?? '';
-            const isSelected = w.id === selectedEntityId;
-            return (
-              <Polygon
-                key={w.id}
-                positions={positions}
-                pathOptions={{
-                  fillColor: weatherFill(severity),
-                  fillOpacity: 1,
-                  color: isSelected ? '#ffffff' : weatherStroke(severity),
-                  weight: isSelected ? 2.5 : 1.5,
-                }}
-                eventHandlers={{
-                  click: handleEntityClick(w.id),
-                }}
-              >
-                <Tooltip
-                  direction="top"
-                  sticky
-                  className="cop-tooltip"
-                  opacity={1}
-                >
-                  <div dangerouslySetInnerHTML={{ __html: tooltipHTML(w) }} />
-                </Tooltip>
-              </Polygon>
-            );
-          })}
-
-        {/* ── Ship tracks ──────────────────────────────────────────────── */}
-        {layers.tracks &&
-          ships.map((ship) => {
-            const isSelected = ship.id === selectedEntityId;
-            return renderTrack(ship, isSelected);
-          })}
-
-        {/* ── Course/speed vectors ─────────────────────────────────────── */}
-        {layers.vectors &&
-          ships.map((ship) => {
-            const pos = getLatLng(ship);
-            if (!pos) return null;
-            const speed  = typeof ship.properties?.speed  === 'number' ? ship.properties.speed  : 0;
-            const course = typeof ship.properties?.course === 'number' ? ship.properties.course : 0;
-            if (speed < 0.5) return null; // don't draw vectors for stationary ships
-
-            const projected = projectPosition(pos[0], pos[1], course, speed);
-            const isSelected = ship.id === selectedEntityId;
-            return (
-              <Polyline
-                key={`vec-${ship.id}`}
-                positions={[pos, projected]}
-                pathOptions={{
-                  color: isSelected ? '#ffffff' : shipColor(speed, false),
-                  weight: isSelected ? 2 : 1,
-                  opacity: isSelected ? 0.9 : 0.55,
-                  dashArray: '6 3',
-                }}
-              />
-            );
-          })}
-
-        {/* ── Port markers ─────────────────────────────────────────────── */}
-        {layers.ports &&
-          ports.map((port) => {
-            const pos = getLatLng(port);
-            if (!pos) return null;
-            const isSelected = port.id === selectedEntityId;
-            const isInMultiSelect = selectedEntities.has(port.id);
-            // Size based on TEU
-            const teu = typeof port.properties?.total_teu === 'number' ? port.properties.total_teu : 0;
-            const radius = isSelected
-              ? 14
-              : Math.max(6, Math.min(14, 4 + Math.log10(teu + 1) * 2));
-            return (
-              <CircleMarker
-                key={port.id}
-                center={pos}
-                radius={radius}
-                pathOptions={{
-                  fillColor: '#f97316',
-                  fillOpacity: isSelected ? 0.95 : 0.75,
-                  color: isSelected || isInMultiSelect ? '#ffffff' : 'rgba(255,255,255,0.35)',
-                  weight: isSelected ? 2.5 : isInMultiSelect ? 2 : 1,
-                }}
-                eventHandlers={{
-                  click: handleEntityClick(port.id),
-                  dblclick: (e) => handleEntityDblClick(pos)(e),
-                }}
-              >
-                <Tooltip
-                  direction="top"
-                  sticky
-                  opacity={1}
-                  className="cop-tooltip"
-                >
-                  <div dangerouslySetInnerHTML={{ __html: tooltipHTML(port) }} />
-                </Tooltip>
-              </CircleMarker>
-            );
-          })}
-
-        {/* ── Ship markers (directional arrows) ───────────────────────── */}
-        {layers.ships &&
-          ships.map((ship) => {
-            const pos = getLatLng(ship);
-            if (!pos) return null;
-            const isSelected = ship.id === selectedEntityId;
-            const isInMultiSelect = selectedEntities.has(ship.id);
-            const speed  = ship.properties?.speed;
-            const course = typeof ship.properties?.course === 'number' ? ship.properties.course : 0;
-            const color  = shipColor(speed, isSelected);
-
-            return (
-              <Marker
-                key={ship.id}
-                position={pos}
-                icon={createShipIcon(course, color, isSelected)}
-                zIndexOffset={isSelected ? 1000 : isInMultiSelect ? 500 : 0}
-                eventHandlers={{
-                  click: handleEntityClick(ship.id),
-                  dblclick: (e) => {
-                    (e as L.LeafletMouseEvent).originalEvent?.stopPropagation();
-                    setZoomToPos(pos);
-                  },
-                }}
-              >
-                <Tooltip
-                  direction="top"
-                  sticky
-                  offset={[0, -8]}
-                  opacity={1}
-                  className="cop-tooltip"
-                >
-                  <div dangerouslySetInnerHTML={{ __html: tooltipHTML(ship) }} />
-                </Tooltip>
-              </Marker>
-            );
-          })}
-      </MapContainer>
-
-      {/* ── MapControls overlay ────────────────────────────────────────── */}
-      <MapControls
-        activeTile={activeTile}
-        onTileChange={setActiveTile}
-        layers={layers}
-        onToggleLayer={handleToggleLayer}
-        measureActive={measureActive}
-        lassoActive={lassoActive}
-        onToggleMeasure={() => { setMeasureActive((v) => !v); if (lassoActive) setLassoActive(false); }}
-        onToggleLasso={() => { setLassoActive((v) => !v); if (measureActive) setMeasureActive(false); }}
-        onZoomToFit={() => setZoomToFitTrigger((n) => n + 1)}
-        mouseCoords={mouseCoords}
-        entityCount={{ ships: ships.length, ports: ports.length, weather: weatherSystems.length }}
-      />
-
-      {/* ── Bottom-left legend ──────────────────────────────────────────── */}
-      <div
-        className="absolute bottom-8 left-2 z-[1000] bg-gray-950/90 border border-gray-700/70 p-2 text-[9px]"
-        style={{
-          fontFamily: "'JetBrains Mono','Fira Code',monospace",
-          backdropFilter: 'blur(8px)',
-        }}
-        aria-label="Map legend"
-      >
-        <div className="text-gray-500 font-bold tracking-widest uppercase text-[8px] mb-1.5">
-          Ships
-        </div>
-        <div className="space-y-0.5">
-          {[
-            { color: '#3cc85a', label: '< 10 kn' },
-            { color: '#1e8cff', label: '10–20 kn' },
-            { color: '#ff7800', label: '> 20 kn' },
-            { color: '#ff3232', label: 'Selected' },
-          ].map(({ color, label }) => (
-            <div key={label} className="flex items-center gap-1.5">
-              <svg width="10" height="12" viewBox="0 0 10 14" style={{ color }} fill="currentColor">
-                <polygon points="5,0 9,14 5,10 1,14" />
-              </svg>
-              <span className="text-gray-500">{label}</span>
-            </div>
-          ))}
-        </div>
-        <div className="border-t border-gray-800 my-1.5" />
-        <div className="text-gray-500 font-bold tracking-widest uppercase text-[8px] mb-1.5">
-          Ports
-        </div>
-        <div className="space-y-0.5">
-          {[
-            { label: 'Size = TEU volume' },
-            { label: 'Orange fill' },
-          ].map(({ label }) => (
-            <div key={label} className="flex items-center gap-1.5 text-gray-600">
-              <span className="w-2.5 h-2.5 border border-orange-500/60" style={{ background: '#f9731620' }} />
-              <span>{label}</span>
-            </div>
-          ))}
-        </div>
-        {(measureActive || lassoActive) && (
-          <>
-            <div className="border-t border-gray-800 my-1.5" />
-            {measureActive && (
-              <div className="text-yellow-500/80 text-[8px]">● Click two points to measure</div>
-            )}
-            {lassoActive && (
-              <div className="text-cyan-500/80 text-[8px]">● Shift+drag to select area</div>
-            )}
-          </>
-        )}
-      </div>
-
-      {/* ── Tooltip styles ──────────────────────────────────────────────── */}
+    <div className="relative flex-1 overflow-hidden" role="application" aria-label="Common Operating Picture map">
       <style>{`
+        ${DARK_FILTER_STYLE}
         .cop-tooltip {
           background: rgba(5, 8, 16, 0.96) !important;
           border: 1px solid rgba(75, 85, 99, 0.8) !important;
@@ -959,16 +814,8 @@ export const MapView: React.FC = () => {
           padding: 6px 8px !important;
           box-shadow: 0 4px 16px rgba(0,0,0,0.6) !important;
         }
-        .cop-tooltip::before {
-          display: none !important;
-        }
-        .leaflet-tooltip-top.cop-tooltip::before {
-          display: none !important;
-        }
-        .cop-dark-filter .leaflet-tile {
-          filter: brightness(0.5) saturate(0.4) hue-rotate(190deg) !important;
-        }
-        /* Custom zoom control styling */
+        .cop-tooltip::before { display: none !important; }
+        .leaflet-tooltip-top.cop-tooltip::before { display: none !important; }
         .leaflet-control-zoom a {
           background: rgba(5, 8, 16, 0.92) !important;
           border-color: rgba(55, 65, 81, 0.8) !important;
@@ -989,6 +836,78 @@ export const MapView: React.FC = () => {
           padding: 1px 4px !important;
         }
       `}</style>
+
+      <MapContainer
+        center={[51.92, 4.27]}
+        zoom={10}
+        className="h-full w-full"
+        style={{ background: '#060b14' }}
+        zoomControl={false}
+        attributionControl={false}
+      >
+        <TileLayer
+          key={activeTile}
+          url={tileConfig.url}
+          attribution={tileConfig.attribution}
+          subdomains={tileConfig.subdomains}
+          opacity={tileConfig.opacity}
+          maxZoom={tileConfig.maxZoom}
+          className={tileLayerClass}
+        />
+
+        <ScaleControl position="bottomleft" imperial metric />
+        <CoordTracker onCoords={setMouseCoords} />
+        <MapController
+          zoomToFitTrigger={zoomToFitTrigger}
+          allEntities={allEntities}
+          mapRef={mapRef}
+          zoomToPos={zoomToPos}
+        />
+
+        {layers.grid && <LatLonGrid />}
+        <MeasurementHandler active={measureActive} />
+        <LassoHandler active={lassoActive} onSelect={handleLassoSelect} />
+
+        {/* ── Dynamic entity layers — one pass per type ─────────────────── */}
+        {visibleTypes.map((config) => (
+          <EntityMarkers
+            key={config.type}
+            entities={(grouped.get(config.type) ?? []).filter(hasValidGeometry)}
+            config={config}
+            layerOn={layers[config.type] !== false}
+            tracksOn={layers['tracks'] !== false}
+            vectorsOn={layers['vectors'] !== false}
+            selectedEntityId={selectedEntityId}
+            selectedEntities={selectedEntities}
+            onEntityClick={handleEntityClick}
+            onEntityDblClick={handleEntityDblClick}
+            renderTrack={renderTrack}
+          />
+        ))}
+      </MapContainer>
+
+      {/* ── Controls overlay ──────────────────────────────────────────────── */}
+      <MapControls
+        activeTile={activeTile}
+        onTileChange={setActiveTile}
+        entityTypes={visibleTypes}
+        entityCounts={entityCounts}
+        layers={layers}
+        onToggleLayer={handleToggleLayer}
+        measureActive={measureActive}
+        lassoActive={lassoActive}
+        onToggleMeasure={() => { setMeasureActive((v) => !v); if (lassoActive) setLassoActive(false); }}
+        onToggleLasso={() => { setLassoActive((v) => !v); if (measureActive) setMeasureActive(false); }}
+        onZoomToFit={() => setZoomToFitTrigger((n) => n + 1)}
+        mouseCoords={mouseCoords}
+      />
+
+      {/* ── Dynamic legend ────────────────────────────────────────────────── */}
+      <MapLegend
+        entityTypes={visibleTypes}
+        measureActive={measureActive}
+        lassoActive={lassoActive}
+      />
     </div>
   );
 };

@@ -1839,6 +1839,9 @@ pub async fn delete_api_key(
 
 // Frontend is now served via ServeDir in http.rs (frontend/dist/)
 
+// Ingest handlers have moved to server::ingest
+// Federation handlers have moved to server::federation
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1891,6 +1894,7 @@ mod tests {
             broadcast_tx,
             started_at: std::time::Instant::now(),
             layer_registry: None,
+            federation_registry: None,
         })
     }
 

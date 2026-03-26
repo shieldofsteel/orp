@@ -21,7 +21,7 @@ use tabled::builder::Builder;
 use tabled::settings::{object::Rows, Color, Style};
 use tokio::sync::mpsc;
 
-use super::args::{ConnectorType, OutputFormat, Severity};
+use super::args::{ConnectorType, ExportFormat, OutputFormat, Severity};
 use crate::server;
 use orp_stream::RocksDbDedupWindow;
 
@@ -258,8 +258,12 @@ pub async fn run_start(
     template: Option<String>,
     port_override: Option<u16>,
     dev: bool,
+    headless: bool,
+    no_auth: bool,
 ) -> Result<()> {
-    if dev {
+    // --no-auth implies --dev and sets ORP_DEV_MODE
+    let dev = dev || no_auth;
+    if dev || no_auth {
         std::env::set_var("ORP_DEV_MODE", "true");
     }
 
@@ -541,6 +545,10 @@ pub async fn run_start(
         Arc::new(registry)
     };
 
+    if headless {
+        tracing::info!("🔧 Headless mode: serving API + WebSocket only (no web frontend)");
+    }
+
     server::http::start_server(server::http::ServerConfig {
         storage,
         query_executor,
@@ -551,7 +559,9 @@ pub async fn run_start(
         api_key_service,
         audit_signer: None,
         layer_registry: Some(layer_registry),
+        federation_registry: Some(server::federation::PeerRegistry::new()),
         port,
+        headless,
     })
     .await?;
 
@@ -1285,4 +1295,443 @@ pub fn run_completions(shell: clap_complete::Shell) {
         "orp",
         &mut std::io::stdout(),
     );
+}
+
+// ── New universal-platform commands ──────────────────────────────────────────
+
+/// Connect a data source via URL (ais://, adsb://, mqtt://, http://, ws://, syslog://)
+///
+/// Parses the URL scheme to infer connector type, then POSTs to /api/v1/connectors.
+pub async fn run_connect(
+    host: &str,
+    url: &str,
+    name: Option<&str>,
+    entity_type: Option<&str>,
+    trust_score: f64,
+) -> Result<()> {
+    // Parse scheme from url
+    let scheme = url
+        .split("://")
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Invalid URL '{}': expected <protocol>://<host>[/path]", url))?;
+
+    let connector_type = ConnectorType::from_scheme(scheme)
+        .ok_or_else(|| anyhow::anyhow!(
+            "Unknown protocol '{}'. Supported: ais, adsb, mqtt, http, https, ws, wss, syslog",
+            scheme
+        ))?;
+
+    // Strip our custom schemes to a transport URL the connector understands
+    let transport_url = match scheme {
+        "ais" => url.replacen("ais://", "tcp://", 1),
+        "adsb" => url.replacen("adsb://", "tcp://", 1),
+        "syslog" => url.replacen("syslog://", "udp://", 1),
+        _ => url.to_string(),
+    };
+
+    let connector_name = name.unwrap_or(url);
+    let etype = entity_type.unwrap_or_else(|| connector_type.default_entity_type());
+
+    print_header(&format!("Connecting: {}", url));
+    println!("  Protocol:    {}", connector_type.as_str());
+    println!("  Entity type: {}", etype);
+    println!("  Trust score: {:.2}", trust_score);
+    println!();
+
+    let client = reqwest::Client::new();
+    let api_url = format!("{}/api/v1/connectors", base_url(host));
+    let response = client
+        .post(&api_url)
+        .json(&serde_json::json!({
+            "name": connector_name,
+            "connector_type": connector_type.as_str(),
+            "entity_type": etype,
+            "trust_score": trust_score,
+            "url": transport_url,
+        }))
+        .send()
+        .await;
+
+    match response {
+        Ok(resp) if resp.status().is_success() => {
+            print_success(&format!(
+                "Connected '{}' as {} connector (entity_type: {})",
+                connector_name,
+                connector_type.as_str(),
+                etype
+            ));
+            println!("  → Data will appear at: orp entities search --entity-type {}", etype);
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await?;
+            print_error(&format!("Failed to connect (HTTP {}): {}", status, body));
+            std::process::exit(1);
+        }
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            eprintln!("  → Is ORP running? Start with: orp start");
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+/// Bulk ingest entities from a JSON or CSV file
+///
+/// Reads the file, sends records to POST /api/v1/ingest/batch.
+pub async fn run_ingest(
+    host: &str,
+    file: &str,
+    dry_run: bool,
+    entity_type: Option<&str>,
+    trust_score: f64,
+) -> Result<()> {
+    let content = std::fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("Cannot read file '{}': {}", file, e))?;
+
+    let records: Vec<serde_json::Value> = if file.ends_with(".csv") {
+        let mut rdr = csv::Reader::from_reader(content.as_bytes());
+        let headers: Vec<String> = rdr
+            .headers()
+            .map_err(|e| anyhow::anyhow!("CSV header error: {}", e))?
+            .iter()
+            .map(String::from)
+            .collect();
+
+        rdr.records()
+            .filter_map(|r| r.ok())
+            .map(|record| {
+                let mut obj = serde_json::Map::new();
+                for (i, field) in record.iter().enumerate() {
+                    if let Some(key) = headers.get(i) {
+                        // Try to parse numbers; fall back to string
+                        let val: serde_json::Value = field
+                            .parse::<f64>()
+                            .map(serde_json::Value::from)
+                            .unwrap_or_else(|_| serde_json::Value::String(field.to_string()));
+                        obj.insert(key.clone(), val);
+                    }
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect()
+    } else {
+        // JSON: accept either an array or a single object
+        let v: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("JSON parse error in '{}': {}", file, e))?;
+        match v {
+            serde_json::Value::Array(arr) => arr,
+            obj @ serde_json::Value::Object(_) => vec![obj],
+            _ => anyhow::bail!("Expected a JSON array or object in '{}'", file),
+        }
+    };
+
+    if records.is_empty() {
+        println!("  No records found in '{}'.", file);
+        return Ok(());
+    }
+
+    print_header(&format!("Ingesting {} records from '{}'", records.len(), file));
+
+    if let Some(etype) = entity_type {
+        println!("  Entity type override: {}", etype);
+    }
+    println!("  Trust score: {:.2}", trust_score);
+
+    if dry_run {
+        println!();
+        println!("  DRY RUN — no data written. First 3 records:");
+        for rec in records.iter().take(3) {
+            println!("  {}", serde_json::to_string_pretty(rec)?);
+        }
+        println!("  → {} records would be ingested.", records.len());
+        return Ok(());
+    }
+
+    println!();
+
+    // Attach entity_type and trust_score to each record if override given
+    let payload: Vec<serde_json::Value> = if let Some(etype) = entity_type {
+        records
+            .into_iter()
+            .map(|mut r| {
+                if let Some(obj) = r.as_object_mut() {
+                    obj.insert("_entity_type".to_string(), serde_json::json!(etype));
+                    obj.insert("_trust_score".to_string(), serde_json::json!(trust_score));
+                }
+                r
+            })
+            .collect()
+    } else {
+        records
+            .into_iter()
+            .map(|mut r| {
+                if let Some(obj) = r.as_object_mut() {
+                    obj.insert("_trust_score".to_string(), serde_json::json!(trust_score));
+                }
+                r
+            })
+            .collect()
+    };
+
+    let total = payload.len();
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/ingest/batch", base_url(host));
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({ "records": payload }))
+        .send()
+        .await;
+
+    match response {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await?;
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let ingested = parsed.get("ingested").and_then(|v| v.as_u64()).unwrap_or(total as u64);
+            let failed = parsed.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+            print_success(&format!("{} records ingested ({} failed)", ingested, failed));
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await?;
+            print_error(&format!("Ingest failed (HTTP {}): {}", status, body));
+            std::process::exit(1);
+        }
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+/// Register a peer ORP instance for federation
+pub async fn run_peer_add(host: &str, address: &str, name: Option<&str>, trust_score: f64) -> Result<()> {
+    let peer_name = name.unwrap_or(address);
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/peers", base_url(host));
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "address": address,
+            "name": peer_name,
+            "trust_score": trust_score,
+        }))
+        .send()
+        .await;
+
+    match response {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await?;
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let peer_id = parsed.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            print_success(&format!("Peer '{}' registered (id: {})", peer_name, peer_id));
+            println!("  → View peers with: orp peer list");
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await?;
+            print_error(&format!("Failed to add peer (HTTP {}): {}", status, body));
+            std::process::exit(1);
+        }
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+/// List all registered peer ORP instances
+pub async fn run_peer_list(host: &str, format: OutputFormat) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/peers", base_url(host));
+    let response = client.get(&url).send().await;
+
+    match response {
+        Ok(resp) => {
+            let body = resp.text().await?;
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let data = parsed
+                .get("data")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            match format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&parsed)?),
+                OutputFormat::Csv => {
+                    let rows: Vec<HashMap<String, serde_json::Value>> = data
+                        .iter()
+                        .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                        .collect();
+                    print!("{}", format_csv(&rows, &["id", "name", "address", "status", "trust_score", "last_seen"]));
+                }
+                OutputFormat::Table => {
+                    if data.is_empty() {
+                        println!("  No peers registered.");
+                        println!("  → Add one with: orp peer add <host:port>");
+                    } else {
+                        let rows: Vec<HashMap<String, serde_json::Value>> = data
+                            .iter()
+                            .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                            .collect();
+                        println!("{}", render_table(&rows, &["id", "name", "address", "status", "trust_score", "last_seen"]));
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+/// Remove a peer ORP instance
+pub async fn run_peer_remove(host: &str, id: &str, yes: bool) -> Result<()> {
+    if !confirm(&format!("Disconnect and remove peer '{}'?", id), yes) {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/peers/{}", base_url(host), id);
+    let response = client.delete(&url).send().await;
+
+    match response {
+        Ok(resp) if resp.status().is_success() => {
+            print_success(&format!("Peer '{}' removed.", id));
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await?;
+            print_error(&format!("Failed to remove peer (HTTP {}): {}", status, body));
+            std::process::exit(1);
+        }
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+/// Export all entities in the requested format
+pub async fn run_export(
+    host: &str,
+    format: ExportFormat,
+    output_file: Option<&str>,
+    entity_type: Option<&str>,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let mut params = vec!["limit=10000".to_string()];
+    if let Some(etype) = entity_type {
+        params.push(format!("type={}", etype));
+    }
+
+    // Fetch all entities
+    let url = format!(
+        "{}/api/v1/entities/search?{}",
+        base_url(host),
+        params.join("&")
+    );
+    let response = client.get(&url).send().await
+        .map_err(|e| anyhow::anyhow!("Cannot reach ORP server at {}: {}", host, e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await?;
+        print_error(&format!("Export failed (HTTP {}): {}", status, body));
+        std::process::exit(1);
+    }
+
+    let body = response.text().await?;
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("Invalid response from server: {}", e))?;
+
+    let entities = parsed
+        .get("data")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let output = match format {
+        ExportFormat::Json => {
+            serde_json::to_string_pretty(&entities)?
+        }
+        ExportFormat::Geojson => {
+            // Build GeoJSON FeatureCollection
+            let features: Vec<serde_json::Value> = entities
+                .iter()
+                .map(|entity| {
+                    let lat = entity.get("latitude")
+                        .or_else(|| entity.get("lat"))
+                        .and_then(|v| v.as_f64());
+                    let lon = entity.get("longitude")
+                        .or_else(|| entity.get("lon"))
+                        .or_else(|| entity.get("lng"))
+                        .and_then(|v| v.as_f64());
+
+                    let geometry = match (lat, lon) {
+                        (Some(lat), Some(lon)) => serde_json::json!({
+                            "type": "Point",
+                            "coordinates": [lon, lat]
+                        }),
+                        _ => serde_json::Value::Null,
+                    };
+
+                    serde_json::json!({
+                        "type": "Feature",
+                        "geometry": geometry,
+                        "properties": entity,
+                    })
+                })
+                .collect();
+
+            serde_json::to_string_pretty(&serde_json::json!({
+                "type": "FeatureCollection",
+                "features": features,
+            }))?
+        }
+        ExportFormat::Csv => {
+            let rows: Vec<HashMap<String, serde_json::Value>> = entities
+                .iter()
+                .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                .collect();
+            // Collect all unique column names from all rows (stable order: id first)
+            let mut columns: Vec<String> = vec!["id".into(), "type".into(), "name".into()];
+            for row in &rows {
+                for key in row.keys() {
+                    if !columns.contains(key) {
+                        columns.push(key.clone());
+                    }
+                }
+            }
+            let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+            format_csv(&rows, &col_refs)
+        }
+    };
+
+    match output_file {
+        Some(path) => {
+            std::fs::write(path, &output)
+                .map_err(|e| anyhow::anyhow!("Cannot write to '{}': {}", path, e))?;
+            print_success(&format!(
+                "Exported {} entities to '{}' (format: {})",
+                entities.len(),
+                path,
+                format.as_str()
+            ));
+        }
+        None => {
+            print!("{}", output);
+        }
+    }
+
+    Ok(())
 }

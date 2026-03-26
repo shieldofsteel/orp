@@ -39,6 +39,8 @@ pub enum Commands {
     ///   orp start
     ///   orp start --template maritime
     ///   orp start --port 8080 --dev
+    ///   orp start --headless              # API-only mode for servers/Pi/embedded
+    ///   orp start --no-auth               # Dev shortcut (permissive auth + dev mode)
     Start {
         /// Override the server port
         #[arg(short, long)]
@@ -55,6 +57,98 @@ pub enum Commands {
         /// Enable dev mode (permissive auth, verbose logging, auto-reloads)
         #[arg(long)]
         dev: bool,
+
+        /// Headless mode: serve API + WebSocket only, no web frontend.
+        /// Ideal for Raspberry Pi, servers, embedded, and CI environments.
+        #[arg(long)]
+        headless: bool,
+
+        /// Dev shortcut: enables --dev AND sets ORP_DEV_MODE=true.
+        /// Equivalent to --dev with ORP_DEV_MODE=true in the environment.
+        #[arg(long)]
+        no_auth: bool,
+    },
+
+    /// Connect a data source in one command
+    ///
+    /// Protocols: ais://, adsb://, mqtt://, http://, ws://, syslog://
+    ///
+    /// Examples:
+    ///   orp connect ais://0.0.0.0:10110
+    ///   orp connect adsb://192.168.1.100:30005
+    ///   orp connect mqtt://broker.local:1883/sensors/+
+    ///   orp connect http://api.example.com/feed
+    ///   orp connect ws://stream.example.com/updates
+    ///   orp connect syslog://0.0.0.0:514
+    Connect {
+        /// Connection URL in the form <protocol>://<host:port>[/path]
+        url: String,
+
+        /// Human-readable name for this connector (defaults to the URL)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Entity type this feed produces (auto-detected from protocol if omitted)
+        #[arg(long)]
+        entity_type: Option<String>,
+
+        /// Trust score for data from this connector (0.0–1.0)
+        #[arg(long, default_value_t = 0.8, value_parser = parse_trust_score)]
+        trust_score: f64,
+    },
+
+    /// Bulk ingest entities from a JSON or CSV file
+    ///
+    /// Examples:
+    ///   orp ingest vessels.json
+    ///   orp ingest aircraft.csv
+    ///   orp ingest --dry-run contacts.json
+    Ingest {
+        /// Path to the JSON (array of objects) or CSV file to ingest
+        file: String,
+
+        /// Preview what would be ingested without writing to the database
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Override entity type for all records (auto-detected if omitted)
+        #[arg(long)]
+        entity_type: Option<String>,
+
+        /// Trust score for ingested records (0.0–1.0)
+        #[arg(long, default_value_t = 0.9, value_parser = parse_trust_score)]
+        trust_score: f64,
+    },
+
+    /// Manage federated ORP peers
+    ///
+    /// Examples:
+    ///   orp peer add 192.168.1.50:9090
+    ///   orp peer list
+    ///   orp peer remove peer-abc123
+    Peer {
+        #[command(subcommand)]
+        action: PeerAction,
+    },
+
+    /// Export all entities to a file or stdout
+    ///
+    /// Examples:
+    ///   orp export --format geojson > entities.geojson
+    ///   orp export --format csv --output-file dump.csv
+    ///   orp export --format json --entity-type ship
+    Export {
+        /// Export format
+        #[arg(long, value_enum, default_value_t = ExportFormat::Json)]
+        format: ExportFormat,
+
+        /// Write output to a file instead of stdout
+        #[arg(long, value_name = "PATH")]
+        output_file: Option<String>,
+
+        /// Filter by entity type (ship, aircraft, vehicle, …)
+        #[arg(long)]
+        entity_type: Option<String>,
     },
 
     /// Execute an ORP-QL query against a running instance
@@ -309,6 +403,67 @@ pub enum OutputFormat {
     Csv,
 }
 
+#[derive(Subcommand)]
+pub enum PeerAction {
+    /// Register a peer ORP instance for federation
+    ///
+    /// Example: orp peer add 192.168.1.50:9090
+    Add {
+        /// Peer host and port in the form host:port
+        #[arg(value_name = "HOST:PORT")]
+        address: String,
+
+        /// Human-readable name for this peer (defaults to address)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Trust score for data received from this peer (0.0–1.0)
+        #[arg(long, default_value_t = 0.7, value_parser = parse_trust_score)]
+        trust_score: f64,
+    },
+
+    /// List all registered peers and their connection status
+    ///
+    /// Example: orp peer list --output json
+    List {
+        /// Output format [default: table]
+        #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Disconnect and remove a peer by ID
+    ///
+    /// Example: orp peer remove peer-abc123
+    Remove {
+        /// Peer ID to remove
+        id: String,
+
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ExportFormat {
+    /// GeoJSON FeatureCollection — for maps and GIS tools
+    Geojson,
+    /// JSON array of entity objects
+    Json,
+    /// CSV — spreadsheet-compatible
+    Csv,
+}
+
+impl ExportFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Geojson => "geojson",
+            Self::Json => "json",
+            Self::Csv => "csv",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ConnectorType {
     /// Automatic Identification System (maritime vessels)
@@ -319,6 +474,10 @@ pub enum ConnectorType {
     Http,
     /// MQTT message broker
     Mqtt,
+    /// WebSocket stream
+    Ws,
+    /// Syslog UDP/TCP receiver
+    Syslog,
 }
 
 impl ConnectorType {
@@ -328,6 +487,30 @@ impl ConnectorType {
             Self::Adsb => "adsb",
             Self::Http => "http",
             Self::Mqtt => "mqtt",
+            Self::Ws => "ws",
+            Self::Syslog => "syslog",
+        }
+    }
+
+    /// Infer the connector type from a URL scheme.
+    pub fn from_scheme(scheme: &str) -> Option<Self> {
+        match scheme {
+            "ais" => Some(Self::Ais),
+            "adsb" => Some(Self::Adsb),
+            "mqtt" => Some(Self::Mqtt),
+            "http" | "https" => Some(Self::Http),
+            "ws" | "wss" => Some(Self::Ws),
+            "syslog" => Some(Self::Syslog),
+            _ => None,
+        }
+    }
+
+    /// Guess the entity type produced by this connector when not explicitly set.
+    pub fn default_entity_type(&self) -> &'static str {
+        match self {
+            Self::Ais => "ship",
+            Self::Adsb => "aircraft",
+            Self::Mqtt | Self::Http | Self::Ws | Self::Syslog => "generic",
         }
     }
 }

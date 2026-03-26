@@ -26,8 +26,10 @@ async fn main() -> Result<()> {
             template,
             port,
             dev,
+            headless,
+            no_auth,
         } => {
-            cli::commands::run_start(config, template, port, dev).await?;
+            cli::commands::run_start(config, template, port, dev, headless, no_auth).await?;
         }
 
         cli::args::Commands::Query {
@@ -157,6 +159,48 @@ async fn main() -> Result<()> {
                 cli::commands::run_config_validate(&file)?;
             }
         },
+
+        cli::args::Commands::Connect {
+            url,
+            name,
+            entity_type,
+            trust_score,
+        } => {
+            cli::commands::run_connect(host, &url, name.as_deref(), entity_type.as_deref(), trust_score)
+                .await?;
+        }
+
+        cli::args::Commands::Ingest {
+            file,
+            dry_run,
+            entity_type,
+            trust_score,
+        } => {
+            cli::commands::run_ingest(host, &file, dry_run, entity_type.as_deref(), trust_score)
+                .await?;
+        }
+
+        cli::args::Commands::Peer { action } => match action {
+            cli::args::PeerAction::Add { address, name, trust_score } => {
+                cli::commands::run_peer_add(host, &address, name.as_deref(), trust_score).await?;
+            }
+            cli::args::PeerAction::List { output } => {
+                let fmt = args.output.unwrap_or(output);
+                cli::commands::run_peer_list(host, fmt).await?;
+            }
+            cli::args::PeerAction::Remove { id, yes } => {
+                cli::commands::run_peer_remove(host, &id, yes).await?;
+            }
+        },
+
+        cli::args::Commands::Export {
+            format,
+            output_file,
+            entity_type,
+        } => {
+            cli::commands::run_export(host, format, output_file.as_deref(), entity_type.as_deref())
+                .await?;
+        }
 
         cli::args::Commands::Version => {
             cli::commands::run_version();

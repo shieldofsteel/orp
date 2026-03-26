@@ -1,5 +1,43 @@
 // ORP Frontend Type Definitions — Production
 
+// ── Entity Type Registry ──────────────────────────────────────────────────────
+
+/**
+ * Configuration for a single entity type discovered in the data.
+ * Drives map rendering, legend, layer toggles — zero hardcoding.
+ */
+export interface EntityTypeConfig {
+  /** Canonical type string (lowercase, matches entity.type.toLowerCase()) */
+  type: string;
+  /** Display label e.g. "Ship", "Aircraft" */
+  label: string;
+  /** SVG path string OR single emoji for the icon */
+  icon: string;
+  /** Whether icon is emoji (true) or SVG path (false) */
+  iconIsEmoji: boolean;
+  /** RGB color triple [r, g, b] — used for markers and legend */
+  color: [number, number, number];
+  /** CSS hex string derived from color */
+  colorHex: string;
+  /** Property key that holds speed (knots / km-h / m-s) if applicable */
+  speedField?: string;
+  /** Property key that holds heading/course in degrees if applicable */
+  headingField?: string;
+  /** Property key that holds altitude in meters if applicable */
+  altitudeField?: string;
+  /** Map marker style */
+  markerStyle: 'arrow' | 'plane' | 'circle' | 'dot' | 'diamond' | 'square' | 'cross';
+  /** Whether to draw course/speed vector lines */
+  showVector: boolean;
+  /** Whether to draw historical track polyline */
+  showTrack: boolean;
+  /** Whether to render as polygon (area entity like weather zones) */
+  isArea: boolean;
+}
+
+/** Auto-discovered registry: type string → config */
+export type EntityTypeRegistry = Map<string, EntityTypeConfig>;
+
 export interface GeoJSON {
   type: 'Point' | 'LineString' | 'Polygon';
   coordinates: number[] | number[][] | number[][][];
