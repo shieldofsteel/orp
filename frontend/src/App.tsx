@@ -393,17 +393,29 @@ export default function App() {
   const [token, setToken] = useState<string | null>(() =>
     localStorage.getItem('orp_token')
   );
+  const [devMode, setDevMode] = useState(false);
+
+  // Auto-detect dev mode: if /api/v1/health responds without auth, skip login
+  useEffect(() => {
+    if (!token) {
+      fetch('/api/v1/health')
+        .then(r => { if (r.ok) { setDevMode(true); } })
+        .catch(() => {});
+    }
+  }, [token]);
 
   const handleLogin = useCallback((jwt: string) => {
     setToken(jwt);
+    localStorage.setItem('orp_token', jwt);
   }, []);
 
   const handleLogout = useCallback(() => {
     localStorage.removeItem('orp_token');
     setToken(null);
+    setDevMode(false);
   }, []);
 
-  if (!token) {
+  if (!token && !devMode) {
     return <LoginPage onLogin={handleLogin} />;
   }
 
