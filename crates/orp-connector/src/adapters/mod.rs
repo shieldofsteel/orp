@@ -1,6 +1,7 @@
 pub mod adsb;
 pub mod ais;
 pub mod asterix;
+pub mod cap;
 pub mod nmea;
 pub mod cot;
 pub mod csv_watcher;
