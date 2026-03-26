@@ -9,8 +9,11 @@ pub fn get_maritime_template() -> Config {
             port: 9090,
             workers: 4,
             log_level: "info".to_string(),
+            telemetry_enabled: false,
+            telemetry_endpoint: None,
         },
         storage: StorageConfig::default(),
+        retention: RetentionPolicy::default(),
         security: SecurityConfig::default(),
         connectors: vec![
             ConnectorDef {
@@ -21,6 +24,9 @@ pub fn get_maritime_template() -> Config {
                 entity_type: "ship".to_string(),
                 trust_score: 0.95,
                 schedule: None,
+                headers: Default::default(),
+                retry_policy: None,
+                mapping: Default::default(),
             },
             ConnectorDef {
                 name: "adsb_demo".to_string(),
@@ -30,23 +36,31 @@ pub fn get_maritime_template() -> Config {
                 entity_type: "aircraft".to_string(),
                 trust_score: 0.90,
                 schedule: None,
+                headers: Default::default(),
+                retry_policy: None,
+                mapping: Default::default(),
             },
         ],
+        entity_resolution: EntityResolutionConfig::default(),
         monitors: vec![MonitorRule {
             rule_id: "speed_alert".to_string(),
             name: "High speed alert".to_string(),
             entity_type: "ship".to_string(),
             condition: "speed > 25".to_string(),
             action: "alert".to_string(),
+            action_target: None,
             enabled: true,
         }],
         api: ApiConfig::default(),
         frontend: FrontendConfig {
             enabled: true,
             port: 9090,
+            assets_path: "./frontend/dist".to_string(),
             default_map_center: [51.92, 4.27], // Rotterdam
+            default_zoom: 8,
         },
         logging: LoggingConfig::default(),
+        templates: vec![],
     }
 }
 

@@ -1,4 +1,4 @@
-// ORP Frontend Type Definitions
+// ORP Frontend Type Definitions — Production
 
 export interface GeoJSON {
   type: 'Point' | 'LineString' | 'Polygon';
@@ -28,6 +28,7 @@ export interface Entity {
     changed_properties: Record<string, unknown>;
     source: string;
     geometry?: {
+      type?: string;
       coordinates: number[];
     };
   }>;
@@ -59,6 +60,36 @@ export interface EntityUpdate {
     type: string;
     coordinates: number[];
   };
+}
+
+export interface EntityCreated {
+  entity_id: string;
+  entity_type: string;
+  entity_name?: string;
+  properties?: Record<string, unknown>;
+  geometry?: {
+    type: string;
+    coordinates: number[];
+  };
+  source: string;
+}
+
+export interface EntityDeleted {
+  entity_id: string;
+  entity_type: string;
+  entity_name?: string;
+  reason?: string;
+}
+
+export interface RelationshipChanged {
+  relationship_id: string;
+  source_id: string;
+  source_type: string;
+  target_id: string;
+  target_type: string;
+  relationship_type: string;
+  event: 'created' | 'deleted' | 'updated';
+  properties?: Record<string, unknown>;
 }
 
 export interface Subscription {
@@ -118,18 +149,34 @@ export interface SearchParams {
   limit?: number;
 }
 
+export interface ConnectorStats {
+  events_per_sec: number;
+  last_event_at: string;
+  error_count: number;
+  total_ingested: number;
+}
+
 export interface Connector {
   id: string;
   name: string;
   type: string;
   enabled: boolean;
   status: 'healthy' | 'degraded' | 'error';
-  stats: {
-    total_ingested: number;
-    last_event_at: string;
-    error_count: number;
-    events_per_sec: number;
-  };
+  stats: ConnectorStats;
+}
+
+export interface Monitor {
+  id: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  severity: 'info' | 'warning' | 'critical';
+  condition: string;
+  entity_type?: string;
+  created_at: string;
+  updated_at: string;
+  last_triggered?: string;
+  trigger_count: number;
 }
 
 export interface HealthResponse {
@@ -145,16 +192,48 @@ export interface HealthResponse {
   };
 }
 
-export interface WebSocketMessage {
-  type: string;
-  id?: string;
-  timestamp: string;
-  data?: Record<string, unknown>;
-  error?: {
-    code: string;
-    message: string;
-  };
-}
+// WebSocket message union type
+export type WebSocketMessage =
+  | {
+      type: 'entity_update';
+      timestamp: string;
+      data: EntityUpdate;
+    }
+  | {
+      type: 'entity_created';
+      timestamp: string;
+      data: EntityCreated;
+    }
+  | {
+      type: 'entity_deleted';
+      timestamp: string;
+      data: EntityDeleted;
+    }
+  | {
+      type: 'relationship_changed';
+      timestamp: string;
+      data: RelationshipChanged;
+    }
+  | {
+      type: 'alert_triggered';
+      timestamp: string;
+      data: AlertEvent & { timestamp: string };
+    }
+  | {
+      type: 'heartbeat';
+      timestamp: string;
+    }
+  | {
+      type: 'subscription_created';
+      timestamp: string;
+      id: string;
+      data: { subscription_id: string; entity_type?: string; active_entities?: number };
+    }
+  | {
+      type: 'error';
+      timestamp: string;
+      error: { code: string; message: string };
+    };
 
 export interface RelationshipsResponse {
   entity_id: string;
@@ -177,4 +256,55 @@ export interface RelationshipsResponse {
     confidence?: number;
   }>;
   total: number;
+}
+
+// ABAC / Auth types
+export interface JWTPayload {
+  sub: string;
+  email: string;
+  name: string;
+  iat: number;
+  exp: number;
+  iss: string;
+  aud: string;
+  scope: string;
+  org_id: string;
+  permissions: string[];
+}
+
+export interface AuthState {
+  token: string | null;
+  user: JWTPayload | null;
+  authenticated: boolean;
+}
+
+export interface ABACPolicy {
+  resource: string;
+  required_permissions: string[];
+  sensitivity: 'public' | 'internal' | 'secret';
+}
+
+// Timeline types
+export interface TimelineState {
+  playing: boolean;
+  currentTime: Date;
+  speed: number; // 1x, 2x, 5x, 10x
+  minTime: Date;
+  maxTime: Date;
+}
+
+// Query types
+export type QueryMode = 'structured' | 'natural';
+
+export interface QueryHistoryEntry {
+  id: string;
+  query: string;
+  mode: QueryMode;
+  timestamp: Date;
+  resultCount: number;
+}
+
+export interface SidebarSection {
+  id: 'datasources' | 'query' | 'alerts';
+  collapsed: boolean;
 }

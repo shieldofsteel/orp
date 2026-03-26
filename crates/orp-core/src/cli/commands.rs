@@ -8,13 +8,15 @@ use orp_query::QueryExecutor;
 use orp_storage::DuckDbStorage;
 use orp_storage::traits::Storage;
 use orp_stream::{
-    MonitorCondition, MonitorEngine, MonitorRule, StreamProcessor, ThresholdOp,
+    DefaultStreamProcessor, MonitorCondition, MonitorEngine, MonitorRule, StreamProcessor,
+    ThresholdOp,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::server;
+use orp_stream::RocksDbDedupWindow;
 
 /// Start the ORP server
 pub async fn run_start(
@@ -71,7 +73,14 @@ pub async fn run_start(
     tracing::info!("Loaded {} ports", ports.len());
 
     // Initialize stream processor
-    let processor = Arc::new(StreamProcessor::new(storage.clone(), 50, 5));
+    let dedup_path = std::env::temp_dir().join("orp-dedup");
+    std::fs::create_dir_all(&dedup_path).ok();
+    let dedup = Arc::new(
+        RocksDbDedupWindow::open(&dedup_path, 3600)
+            .map_err(|e| anyhow::anyhow!("Dedup init failed: {}", e))?,
+    );
+    let processor: Arc<dyn StreamProcessor> =
+        Arc::new(DefaultStreamProcessor::new(storage.clone(), dedup, None, 50));
 
     // Initialize query executor
     let query_executor = Arc::new(QueryExecutor::new(storage.clone()));
@@ -153,32 +162,34 @@ pub async fn run_start(
             let event = OrpEvent::new(
                 source_event.entity_id.clone(),
                 source_event.entity_type.clone(),
-                "position_update".to_string(),
                 EventPayload::PositionUpdate {
                     latitude: source_event.latitude.unwrap_or(0.0),
                     longitude: source_event.longitude.unwrap_or(0.0),
                     altitude: None,
+                    accuracy_meters: None,
                     speed_knots: source_event
                         .properties
                         .get("speed")
-                        .and_then(|v| v.as_f64())
-                        .map(|v| v as f32),
+                        .and_then(|v| v.as_f64()),
                     heading_degrees: source_event
                         .properties
                         .get("heading")
-                        .and_then(|v| v.as_f64())
-                        .map(|v| v as f32),
+                        .and_then(|v| v.as_f64()),
                     course_degrees: source_event
                         .properties
                         .get("course")
-                        .and_then(|v| v.as_f64())
-                        .map(|v| v as f32),
+                        .and_then(|v| v.as_f64()),
                 },
                 source_event.connector_id.clone(),
                 0.95,
             );
 
-            if let Err(e) = processor_bg.process_event(event).await {
+            let ctx = orp_stream::StreamContext {
+                event,
+                dedup_window_seconds: 3600,
+                batch_size: 50,
+            };
+            if let Err(e) = processor_bg.process_event(ctx).await {
                 tracing::warn!("Failed to process event: {}", e);
             }
 

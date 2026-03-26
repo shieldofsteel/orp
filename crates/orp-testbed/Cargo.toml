@@ -17,6 +17,8 @@ tokio = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
 orp-query = { path = "../orp-query" }
 orp-stream = { path = "../orp-stream" }
+tempfile = "3"
+uuid = { workspace = true }
 
 [[bench]]
 name = "query_latency"

@@ -1,25 +1,28 @@
-# ORP — Complete ALL Phases to Production
+# ORP — Integration Build
 
-Read `REQUIREMENTS.md` for the full checklist of what's built and what's missing. Read `specs/` for the complete technical specifications (Powerful.md, BUILD_CORE_ENGINE.md, BUILD_API_FRONTEND.md, BUILD_TEAMS_SPRINTS.md).
+6 parallel teams wrote ~16,000 lines of new code. Your job: make it all compile, pass tests, and work together.
 
-## Mission
-The foundation (12 crates, 4,570 lines) is done. Now finish EVERYTHING to production quality. Every feature from every phase in the specs — even months 5-10 features — must be built now.
+## Priority 1: Fix Compilation
+Run `cargo check` and fix ALL errors. Teams wrote files independently — expect import mismatches, type conflicts, missing re-exports. Fix them.
 
-## Priority Order
-1. Kuzu graph engine + DuckDB→Kuzu sync (30s loop)
-2. All 6 connectors (ADS-B, HTTP, MQTT, CSV, WebSocket + improve AIS)
-3. Full ORP-QL parser + query planner + hybrid executor
-4. Complete REST API (all endpoints from OpenAPI spec)
-5. WebSocket protocol (subscriptions, broadcasts, heartbeat)
-6. Proper React frontend (Vite + Deck.gl + Zustand + TanStack Query)
-7. Entity resolution (structural + canonical IDs)
-8. Security hardening (OIDC flow, ABAC enforcement, signing)
-9. Monitor/alerting system (rules engine, anomaly detection)
-10. 100+ tests, benchmarks, clippy clean
-11. CLI commands, config system, documentation
+## Priority 2: API & WebSocket Gaps (team that failed)
+These files need rewriting — current versions are stale:
+- `crates/orp-core/src/server/handlers.rs` — add missing endpoints: GET /events (global), PUT /connectors/{id}, DELETE /connectors/{id}, PUT /monitors/{id}. Fix pagination to include `links` object. Fix error responses to include `details` field.
+- `crates/orp-core/src/server/websocket.rs` — rewrite for full protocol: multiple subscriptions per client, all message types (entity_created, entity_deleted, relationship_changed, alert_triggered), 30s heartbeat, geo region subscriptions.
+- `crates/orp-core/src/server/http.rs` — wire auth middleware from orp-security, serve frontend/dist/ via ServeDir, add CORS config.
+
+## Priority 3: Wire Everything Together
+- `crates/orp-core/src/main.rs` + `cli/commands.rs` — use new error.rs, retry.rs. Wire auth, storage, stream with new traits.
+- Ensure orp-proto OrpEvent is used consistently across all crates
+- Ensure Cargo.toml deps are correct (rocksdb in orp-stream, jsonwebtoken in orp-security, etc.)
+
+## Priority 4: Tests + Commit
+- `cargo test` — all must pass
+- `cargo clippy` — zero warnings
+- Add LICENSE file (Apache 2.0)
+- Git commit everything, push to origin
 
 ## Rules
-- Use superpowers: verification-before-completion, executing-plans
-- Spawn sub-agents for parallel work — one builds, one audits
-- `cargo test` + `cargo clippy` after each milestone
-- Conventional commits. Work non-stop until fully complete.
+- Use superpowers: verification-before-completion
+- Do NOT rewrite files that are already good — only fix what's broken
+- Run cargo check frequently to catch errors early

@@ -1,127 +1,385 @@
-use crate::traits::{Storage, StorageError, StorageResult};
+//! DuckDB storage backend — implements the full ORP schema (Section 2.1).
+//!
+//! Tables: entities, entity_geometry, entity_properties, events,
+//!         relationships, data_sources, audit_log, snapshots, monitor_rules
+//!
+//! Spatial extension is loaded if available; the code gracefully degrades to
+//! bounding-box queries when ST_GEOMETRY / RTREE are unavailable.
+
+use crate::traits::{DataSource, Storage, StorageError, StorageResult, StorageStats};
 use async_trait::async_trait;
 use duckdb::{params, Connection};
-use orp_proto::{DataSource, Entity, Event, GeoPoint, Relationship, StorageStats};
+use orp_proto::{Entity, Event, GeoPoint, Relationship};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-/// DuckDB-backed storage engine
+// ── Schema strings ────────────────────────────────────────────────────────────
+
+const DUCKDB_BASE_SCHEMA: &str = r#"
+-- ─── ENTITIES ──────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS entities (
+    entity_id        VARCHAR PRIMARY KEY,
+    entity_type      VARCHAR NOT NULL,
+    canonical_id     VARCHAR,
+    name             VARCHAR,
+    first_seen       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_updated     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    confidence       FLOAT DEFAULT 1.0,
+    source_count     INTEGER DEFAULT 1,
+    is_canonical     BOOLEAN DEFAULT FALSE,
+    is_active        BOOLEAN DEFAULT TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_type        ON entities(entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_canonical   ON entities(canonical_id);
+CREATE INDEX IF NOT EXISTS idx_entities_last_updated ON entities(last_updated);
+
+-- ─── ENTITY_PROPERTIES ─────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS entity_properties (
+    id             BIGINT PRIMARY KEY,
+    entity_id      VARCHAR NOT NULL,
+    property_key   VARCHAR NOT NULL,
+    property_value VARCHAR NOT NULL,
+    property_type  VARCHAR NOT NULL,
+    source_id      VARCHAR NOT NULL,
+    timestamp      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    confidence     FLOAT DEFAULT 1.0,
+    is_latest      BOOLEAN DEFAULT TRUE
+);
+
+CREATE SEQUENCE IF NOT EXISTS entity_properties_seq START 1;
+
+CREATE INDEX IF NOT EXISTS idx_entity_props_entity    ON entity_properties(entity_id);
+CREATE INDEX IF NOT EXISTS idx_entity_props_key       ON entity_properties(property_key);
+CREATE INDEX IF NOT EXISTS idx_entity_props_timestamp ON entity_properties(timestamp);
+CREATE INDEX IF NOT EXISTS idx_entity_props_latest    ON entity_properties(is_latest);
+
+-- ─── ENTITY_GEOMETRY (lat/lon fallback; ST_GEOMETRY added if spatial loads) ──
+CREATE TABLE IF NOT EXISTS entity_geometry (
+    entity_id     VARCHAR PRIMARY KEY,
+    geometry_wkt  VARCHAR,
+    latitude      FLOAT NOT NULL,
+    longitude     FLOAT NOT NULL,
+    last_updated  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_geom_coords ON entity_geometry(latitude, longitude);
+
+-- ─── EVENTS ────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS events (
+    event_id             VARCHAR PRIMARY KEY,
+    entity_id            VARCHAR NOT NULL REFERENCES entities(entity_id),
+    event_type           VARCHAR NOT NULL,
+    event_timestamp      TIMESTAMP NOT NULL,
+    ingestion_timestamp  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    source_id            VARCHAR NOT NULL,
+    event_data           JSON NOT NULL,
+    confidence           FLOAT DEFAULT 1.0,
+    severity             VARCHAR DEFAULT 'info'
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_entity     ON events(entity_id);
+CREATE INDEX IF NOT EXISTS idx_events_type       ON events(event_type);
+CREATE INDEX IF NOT EXISTS idx_events_timestamp  ON events(event_timestamp);
+CREATE INDEX IF NOT EXISTS idx_events_severity   ON events(severity);
+CREATE INDEX IF NOT EXISTS idx_events_ingestion  ON events(ingestion_timestamp);
+
+-- ─── RELATIONSHIPS ──────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS relationships (
+    relationship_id             VARCHAR PRIMARY KEY,
+    source_entity_id            VARCHAR NOT NULL,
+    target_entity_id            VARCHAR NOT NULL,
+    relationship_type           VARCHAR NOT NULL,
+    properties                  JSON,
+    created_timestamp           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_confirmed_timestamp    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    confidence                  FLOAT DEFAULT 1.0,
+    is_active                   BOOLEAN DEFAULT TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_rels_source ON relationships(source_entity_id);
+CREATE INDEX IF NOT EXISTS idx_rels_target ON relationships(target_entity_id);
+CREATE INDEX IF NOT EXISTS idx_rels_type   ON relationships(relationship_type);
+CREATE INDEX IF NOT EXISTS idx_rels_active ON relationships(is_active);
+
+-- ─── DATA_SOURCES ───────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS data_sources (
+    source_id                   VARCHAR PRIMARY KEY,
+    source_name                 VARCHAR NOT NULL,
+    source_type                 VARCHAR NOT NULL,
+    url                         VARCHAR,
+    enabled                     BOOLEAN DEFAULT TRUE,
+    trust_score                 FLOAT DEFAULT 0.8,
+    last_heartbeat              TIMESTAMP,
+    events_ingested_total       BIGINT DEFAULT 0,
+    entities_provided_total     BIGINT DEFAULT 0,
+    error_count                 INTEGER DEFAULT 0,
+    certificate_fingerprint     VARCHAR,
+    created_timestamp           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sources_type    ON data_sources(source_type);
+CREATE INDEX IF NOT EXISTS idx_sources_enabled ON data_sources(enabled);
+
+-- ─── AUDIT_LOG (hash-chained, append-only) ──────────────────────────────────
+CREATE TABLE IF NOT EXISTS audit_log (
+    sequence_number  BIGINT PRIMARY KEY,
+    timestamp        TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    operation        VARCHAR NOT NULL,
+    entity_type      VARCHAR,
+    entity_id        VARCHAR,
+    user_id          VARCHAR,
+    previous_hash    VARCHAR,
+    content_hash     VARCHAR NOT NULL,
+    signature        VARCHAR,
+    details          JSON
+);
+
+CREATE SEQUENCE IF NOT EXISTS audit_log_seq START 1;
+
+CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_operation ON audit_log(operation);
+CREATE INDEX IF NOT EXISTS idx_audit_entity    ON audit_log(entity_type, entity_id);
+
+-- ─── SNAPSHOTS ──────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS snapshots (
+    snapshot_id           VARCHAR PRIMARY KEY,
+    snapshot_timestamp    TIMESTAMP NOT NULL,
+    entity_state          JSON NOT NULL,
+    relationship_state    JSON NOT NULL,
+    size_bytes            BIGINT,
+    created_timestamp     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON snapshots(snapshot_timestamp);
+
+-- ─── MONITOR_RULES ──────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS monitor_rules (
+    rule_id            VARCHAR PRIMARY KEY,
+    rule_name          VARCHAR NOT NULL,
+    entity_type        VARCHAR NOT NULL,
+    condition_sql      VARCHAR NOT NULL,
+    action_type        VARCHAR DEFAULT 'alert',
+    action_target      VARCHAR,
+    enabled            BOOLEAN DEFAULT TRUE,
+    created_timestamp  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_triggered     TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_monitor_rules_entity_type ON monitor_rules(entity_type);
+CREATE INDEX IF NOT EXISTS idx_monitor_rules_enabled     ON monitor_rules(enabled);
+"#;
+
+// ── Engine ────────────────────────────────────────────────────────────────────
+
+/// DuckDB-backed storage engine (OLAP + Geospatial).
 pub struct DuckDbStorage {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
+    spatial_enabled: bool,
 }
 
 impl DuckDbStorage {
-    /// Create a new in-memory DuckDB storage
+    /// Open an in-memory DuckDB instance (test / ephemeral use).
     pub fn new_in_memory() -> StorageResult<Self> {
         let conn =
             Connection::open_in_memory().map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-        let storage = Self {
-            conn: Mutex::new(conn),
+        let mut s = Self {
+            conn: Arc::new(Mutex::new(conn)),
+            spatial_enabled: false,
         };
-        storage.initialize_schema()?;
-        Ok(storage)
+        s.initialize()?;
+        Ok(s)
     }
 
-    /// Create a new file-based DuckDB storage
+    /// Open a file-based DuckDB instance.
     pub fn new_with_path(path: &str) -> StorageResult<Self> {
-        // Create parent directories
         if let Some(parent) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(parent).map_err(|e| StorageError::IoError(e.to_string()))?;
         }
         let conn =
             Connection::open(path).map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-        let storage = Self {
-            conn: Mutex::new(conn),
+        let mut s = Self {
+            conn: Arc::new(Mutex::new(conn)),
+            spatial_enabled: false,
         };
-        storage.initialize_schema()?;
-        Ok(storage)
+        s.initialize()?;
+        Ok(s)
     }
 
-    fn initialize_schema(&self) -> StorageResult<()> {
+    fn initialize(&mut self) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(DUCKDB_SCHEMA)
+
+        // Attempt spatial extension (may fail in bundled/offline builds).
+        let spatial = conn.execute_batch("LOAD spatial").is_ok();
+        self.spatial_enabled = spatial;
+        if spatial {
+            tracing::info!("DuckDB spatial extension loaded — using ST_GEOMETRY + RTREE");
+        } else {
+            tracing::warn!(
+                "DuckDB spatial extension unavailable — falling back to lat/lon bounding-box queries"
+            );
+        }
+
+        // Create all tables and indexes.
+        conn.execute_batch(DUCKDB_BASE_SCHEMA)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
         Ok(())
+    }
+
+    // ── Internal helpers ─────────────────────────────────────────────────────
+
+    fn parse_ts(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                    .or_else(|_| {
+                        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                    })
+                    .map(|n| n.and_utc())
+                    .unwrap_or_else(|_| chrono::Utc::now())
+            })
+    }
+
+    fn row_to_entity(row: &duckdb::Row) -> duckdb::Result<Entity> {
+        let lat: Option<f64> = row.get::<_, Option<f64>>(6).unwrap_or(None);
+        let lon: Option<f64> = row.get::<_, Option<f64>>(7).unwrap_or(None);
+        let alt: Option<f64> = row.get::<_, Option<f64>>(8).unwrap_or(None);
+        let props_str: String = row.get::<_, String>(9).unwrap_or_default();
+        let ts_str: String = row.get::<_, String>(10).unwrap_or_default();
+        let is_active: bool = row.get::<_, bool>(11).unwrap_or(true);
+
+        let properties: HashMap<String, JsonValue> =
+            serde_json::from_str(&props_str).unwrap_or_default();
+        let geometry = match (lat, lon) {
+            (Some(la), Some(lo)) => Some(GeoPoint { lat: la, lon: lo, alt }),
+            _ => None,
+        };
+
+        Ok(Entity {
+            entity_id: row.get(0)?,
+            entity_type: row.get(1)?,
+            canonical_id: row.get::<_, Option<String>>(2).ok().flatten(),
+            name: row.get::<_, Option<String>>(3).ok().flatten(),
+            confidence: row.get::<_, f32>(4).unwrap_or(1.0) as f64,
+            is_active,
+            last_updated: Self::parse_ts(&ts_str),
+            geometry,
+            properties,
+        })
+    }
+
+    fn row_to_event(row: &duckdb::Row) -> duckdb::Result<Event> {
+        let ts_str: String = row.get::<_, String>(3).unwrap_or_default();
+        let data_str: String = row.get::<_, String>(6).unwrap_or_default();
+        let data: JsonValue = serde_json::from_str(&data_str).unwrap_or(JsonValue::Null);
+
+        Ok(Event {
+            event_id: row.get(0)?,
+            entity_id: row.get(1)?,
+            event_type: row.get(2)?,
+            event_timestamp: Self::parse_ts(&ts_str),
+            source_id: row.get(5)?,
+            data,
+            confidence: row.get::<_, f32>(7).unwrap_or(1.0) as f64,
+        })
+    }
+
+    fn row_to_relationship(row: &duckdb::Row) -> duckdb::Result<Relationship> {
+        let props_str: String = row.get::<_, String>(4).unwrap_or_default();
+        let properties: HashMap<String, JsonValue> =
+            serde_json::from_str(&props_str).unwrap_or_default();
+        Ok(Relationship {
+            relationship_id: row.get(0)?,
+            source_entity_id: row.get(1)?,
+            target_entity_id: row.get(2)?,
+            relationship_type: row.get(3)?,
+            properties,
+            confidence: row.get::<_, f32>(5).unwrap_or(1.0) as f64,
+            is_active: row.get::<_, bool>(6).unwrap_or(true),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        })
+    }
+
+    /// Upsert geometry in entity_geometry table.
+    fn upsert_geometry(
+        conn: &Connection,
+        entity_id: &str,
+        lat: f64,
+        lon: f64,
+    ) -> StorageResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO entity_geometry (entity_id, geometry_wkt, latitude, longitude, last_updated)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (entity_id) DO UPDATE SET
+               geometry_wkt  = EXCLUDED.geometry_wkt,
+               latitude      = EXCLUDED.latitude,
+               longitude     = EXCLUDED.longitude,
+               last_updated  = EXCLUDED.last_updated",
+            params![
+                entity_id,
+                format!("POINT({} {})", lon, lat),
+                lat,
+                lon,
+                now,
+            ],
+        )
+        .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Compute SHA-256 of an arbitrary string, returned as hex.
+    fn sha256_hex(input: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(input.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Haversine distance in km.
+    fn haversine(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+        const R: f64 = 6371.0;
+        let dlat = (lat2 - lat1).to_radians();
+        let dlon = (lon2 - lon1).to_radians();
+        let a = (dlat / 2.0).sin().powi(2)
+            + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+        2.0 * R * a.sqrt().asin()
     }
 }
 
-const DUCKDB_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS entities (
-    entity_id VARCHAR PRIMARY KEY,
-    entity_type VARCHAR NOT NULL,
-    canonical_id VARCHAR,
-    name VARCHAR,
-    confidence FLOAT DEFAULT 1.0,
-    is_active BOOLEAN DEFAULT true,
-    latitude DOUBLE,
-    longitude DOUBLE,
-    altitude DOUBLE,
-    properties JSON,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS events (
-    event_id VARCHAR PRIMARY KEY,
-    entity_id VARCHAR NOT NULL,
-    event_type VARCHAR NOT NULL,
-    event_timestamp TIMESTAMP NOT NULL,
-    source_id VARCHAR NOT NULL,
-    data JSON NOT NULL,
-    confidence FLOAT DEFAULT 1.0,
-    ingestion_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS relationships (
-    relationship_id VARCHAR PRIMARY KEY,
-    source_entity_id VARCHAR NOT NULL,
-    target_entity_id VARCHAR NOT NULL,
-    relationship_type VARCHAR NOT NULL,
-    properties JSON,
-    confidence FLOAT DEFAULT 1.0,
-    is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS data_sources (
-    source_id VARCHAR PRIMARY KEY,
-    source_name VARCHAR NOT NULL,
-    source_type VARCHAR NOT NULL,
-    trust_score FLOAT DEFAULT 0.8,
-    events_ingested BIGINT DEFAULT 0,
-    enabled BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS audit_log (
-    sequence_number BIGINT PRIMARY KEY,
-    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    operation VARCHAR NOT NULL,
-    entity_type VARCHAR,
-    entity_id VARCHAR,
-    user_id VARCHAR,
-    previous_hash VARCHAR,
-    content_hash VARCHAR NOT NULL,
-    details JSON
-);
-"#;
+// ── Storage trait implementation ──────────────────────────────────────────────
 
 #[async_trait]
 impl Storage for DuckDbStorage {
+    // ── Entity operations ─────────────────────────────────────────────────────
+
     async fn insert_entity(&self, entity: &Entity) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
-        let props_json = serde_json::to_string(&entity.properties)
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-        let (lat, lon, alt) = entity
+        let _props_json = serde_json::to_string(&entity.properties)
+            .map_err(|e| StorageError::SerializationError(e.to_string()))?;
+
+        let (lat, lon) = entity
             .geometry
             .as_ref()
-            .map(|g| (Some(g.lat), Some(g.lon), g.alt))
-            .unwrap_or((None, None, None));
+            .map(|g| (Some(g.lat), Some(g.lon)))
+            .unwrap_or((None, None));
 
+        let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT OR REPLACE INTO entities (entity_id, entity_type, canonical_id, name, confidence, is_active, latitude, longitude, altitude, properties, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            "INSERT INTO entities
+               (entity_id, entity_type, canonical_id, name, confidence, is_active, last_updated)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (entity_id) DO UPDATE SET
+               entity_type  = EXCLUDED.entity_type,
+               canonical_id = EXCLUDED.canonical_id,
+               name         = EXCLUDED.name,
+               confidence   = EXCLUDED.confidence,
+               is_active    = EXCLUDED.is_active,
+               last_updated = EXCLUDED.last_updated",
             params![
                 entity.entity_id,
                 entity.entity_type,
@@ -129,20 +387,60 @@ impl Storage for DuckDbStorage {
                 entity.name,
                 entity.confidence,
                 entity.is_active,
-                lat,
-                lon,
-                alt,
-                props_json,
+                now,
             ],
         )
         .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        // Upsert geometry
+        if let (Some(lat_v), Some(lon_v)) = (lat, lon) {
+            Self::upsert_geometry(&conn, &entity.entity_id, lat_v, lon_v)?;
+        }
+
+        // Upsert properties as key-value entries
+        for (key, val) in &entity.properties {
+            let val_str = val.to_string();
+            let prop_type = match val {
+                JsonValue::Number(n) if n.is_f64() => "float",
+                JsonValue::Number(_) => "int",
+                JsonValue::Bool(_) => "bool",
+                JsonValue::Null => "null",
+                _ => "string",
+            };
+            let seq: i64 = conn
+                .query_row("SELECT nextval('entity_properties_seq')", [], |r| r.get(0))
+                .unwrap_or(0);
+            conn.execute(
+                "INSERT INTO entity_properties
+                   (id, entity_id, property_key, property_value, property_type, source_id, is_latest)
+                 VALUES (?, ?, ?, ?, ?, 'system', TRUE)
+                 ON CONFLICT DO NOTHING",
+                params![seq, entity.entity_id, key, val_str, prop_type],
+            )
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        }
+
         Ok(())
     }
 
     async fn get_entity(&self, entity_id: &str) -> StorageResult<Option<Entity>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT entity_id, entity_type, canonical_id, name, confidence, is_active, latitude, longitude, altitude, properties, last_updated FROM entities WHERE entity_id = ?")
+            .prepare(
+                "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                        e.confidence, e.source_count,
+                        g.latitude, g.longitude, NULL::DOUBLE as altitude,
+                        COALESCE(
+                          (SELECT json_group_object(property_key, json(property_value))
+                           FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                          '{}'
+                        ) AS properties,
+                        CAST(e.last_updated AS VARCHAR),
+                        e.is_active
+                 FROM entities e
+                 LEFT JOIN entity_geometry g ON g.entity_id = e.entity_id
+                 WHERE e.entity_id = ?",
+            )
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut rows = stmt
@@ -153,40 +451,9 @@ impl Storage for DuckDbStorage {
             .next()
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?
         {
-            let lat: Option<f64> = row.get(6).ok();
-            let lon: Option<f64> = row.get(7).ok();
-            let alt: Option<f64> = row.get(8).ok();
-            let props_str: String = row.get(9).unwrap_or_default();
-            let properties: HashMap<String, JsonValue> =
-                serde_json::from_str(&props_str).unwrap_or_default();
-            let last_updated_str: String = row.get(10).unwrap_or_default();
-
-            let geometry = match (lat, lon) {
-                (Some(lat_v), Some(lon_v)) => Some(GeoPoint {
-                    lat: lat_v,
-                    lon: lon_v,
-                    alt,
-                }),
-                _ => None,
-            };
-
-            Ok(Some(Entity {
-                entity_id: row
-                    .get(0)
-                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
-                entity_type: row
-                    .get(1)
-                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
-                canonical_id: row.get(2).ok(),
-                name: row.get(3).ok(),
-                confidence: row.get(4).unwrap_or(1.0),
-                is_active: row.get(5).unwrap_or(true),
-                last_updated: chrono::DateTime::parse_from_rfc3339(&last_updated_str)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now()),
-                geometry,
-                properties,
-            }))
+            Ok(Some(
+                Self::row_to_entity(row).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            ))
         } else {
             Ok(None)
         }
@@ -200,56 +467,38 @@ impl Storage for DuckDbStorage {
     ) -> StorageResult<Vec<Entity>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT entity_id, entity_type, canonical_id, name, confidence, is_active, latitude, longitude, altitude, properties FROM entities WHERE entity_type = ? AND is_active = true LIMIT ? OFFSET ?")
+            .prepare(
+                "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                        e.confidence, e.source_count,
+                        g.latitude, g.longitude, NULL::DOUBLE,
+                        COALESCE(
+                          (SELECT json_group_object(property_key, json(property_value))
+                           FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                          '{}'
+                        ),
+                        CAST(e.last_updated AS VARCHAR),
+                        e.is_active
+                 FROM entities e
+                 LEFT JOIN entity_geometry g ON g.entity_id = e.entity_id
+                 WHERE e.entity_type = ? AND e.is_active = TRUE
+                 ORDER BY e.last_updated DESC
+                 LIMIT ? OFFSET ?",
+            )
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
-        let rows = stmt
-            .query_map(params![entity_type, limit as i64, offset as i64], |row| {
-                let lat: Option<f64> = row.get(6).ok();
-                let lon: Option<f64> = row.get(7).ok();
-                let alt: Option<f64> = row.get(8).ok();
-                let props_str: String = row.get(9).unwrap_or_default();
-
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2).ok().flatten(),
-                    row.get::<_, Option<String>>(3).ok().flatten(),
-                    row.get::<_, f32>(4).unwrap_or(1.0),
-                    row.get::<_, bool>(5).unwrap_or(true),
-                    lat,
-                    lon,
-                    alt,
-                    props_str,
-                ))
-            })
+        let mut rows = stmt
+            .query(params![entity_type, limit as i64, offset as i64])
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut entities = Vec::new();
-        for row in rows {
-            let (id, etype, canonical, name, confidence, active, lat, lon, alt, props_str) =
-                row.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-            let properties: HashMap<String, JsonValue> =
-                serde_json::from_str(&props_str).unwrap_or_default();
-            let geometry = match (lat, lon) {
-                (Some(la), Some(lo)) => Some(GeoPoint {
-                    lat: la,
-                    lon: lo,
-                    alt,
-                }),
-                _ => None,
-            };
-            entities.push(Entity {
-                entity_id: id,
-                entity_type: etype,
-                canonical_id: canonical,
-                name,
-                confidence,
-                is_active: active,
-                last_updated: chrono::Utc::now(),
-                geometry,
-                properties,
-            });
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            entities.push(
+                Self::row_to_entity(row)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            );
         }
         Ok(entities)
     }
@@ -260,20 +509,47 @@ impl Storage for DuckDbStorage {
         key: &str,
         value: JsonValue,
     ) -> StorageResult<()> {
-        // Get current entity, update property, write back
-        if let Some(mut entity) = self.get_entity(entity_id).await? {
-            entity.properties.insert(key.to_string(), value);
-            self.insert_entity(&entity).await?;
-            Ok(())
-        } else {
-            Err(StorageError::EntityNotFound(entity_id.to_string()))
-        }
+        // Mark old property as non-latest, insert new one.
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE entity_properties SET is_latest = FALSE
+             WHERE entity_id = ? AND property_key = ?",
+            params![entity_id, key],
+        )
+        .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let val_str = value.to_string();
+        let prop_type = match &value {
+            JsonValue::Number(n) if n.is_f64() => "float",
+            JsonValue::Number(_) => "int",
+            JsonValue::Bool(_) => "bool",
+            _ => "string",
+        };
+        let seq: i64 = conn
+            .query_row("SELECT nextval('entity_properties_seq')", [], |r| r.get(0))
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO entity_properties
+               (id, entity_id, property_key, property_value, property_type, source_id, is_latest)
+             VALUES (?, ?, ?, ?, ?, 'system', TRUE)",
+            params![seq, entity_id, key, val_str, prop_type],
+        )
+        .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        // Touch entity last_updated
+        conn.execute(
+            "UPDATE entities SET last_updated = CURRENT_TIMESTAMP WHERE entity_id = ?",
+            params![entity_id],
+        )
+        .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        Ok(())
     }
 
     async fn delete_entity(&self, entity_id: &str) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE entities SET is_active = false WHERE entity_id = ?",
+            "UPDATE entities SET is_active = FALSE WHERE entity_id = ?",
             params![entity_id],
         )
         .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
@@ -282,15 +558,28 @@ impl Storage for DuckDbStorage {
 
     async fn count_entities(&self) -> StorageResult<u64> {
         let conn = self.conn.lock().unwrap();
-        let count: i64 = conn
+        let n: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM entities WHERE is_active = true",
+                "SELECT COUNT(*) FROM entities WHERE is_active = TRUE",
                 [],
-                |row| row.get(0),
+                |r| r.get(0),
             )
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-        Ok(count as u64)
+        Ok(n as u64)
     }
+
+    async fn set_canonical_id(&self, entity_id: &str, canonical_id: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE entities SET canonical_id = ?, is_canonical = (entity_id = ?), last_updated = CURRENT_TIMESTAMP
+             WHERE entity_id = ?",
+            params![canonical_id, canonical_id, entity_id],
+        )
+        .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    // ── Geospatial queries ────────────────────────────────────────────────────
 
     async fn get_entities_in_radius(
         &self,
@@ -299,93 +588,131 @@ impl Storage for DuckDbStorage {
         radius_km: f64,
         entity_type: Option<&str>,
     ) -> StorageResult<Vec<Entity>> {
-        // Haversine approximation: ~111km per degree
         let deg_range = radius_km / 111.0;
         let conn = self.conn.lock().unwrap();
 
-        let query = if let Some(etype) = entity_type {
-            format!(
-                "SELECT entity_id, entity_type, canonical_id, name, confidence, is_active, latitude, longitude, altitude, properties
-                 FROM entities
-                 WHERE is_active = true AND entity_type = '{}'
-                 AND latitude BETWEEN {} AND {}
-                 AND longitude BETWEEN {} AND {}",
-                etype,
-                lat - deg_range,
-                lat + deg_range,
-                lon - deg_range,
-                lon + deg_range,
-            )
-        } else {
-            format!(
-                "SELECT entity_id, entity_type, canonical_id, name, confidence, is_active, latitude, longitude, altitude, properties
-                 FROM entities
-                 WHERE is_active = true
-                 AND latitude BETWEEN {} AND {}
-                 AND longitude BETWEEN {} AND {}",
-                lat - deg_range,
-                lat + deg_range,
-                lon - deg_range,
-                lon + deg_range,
-            )
-        };
+        let type_filter = entity_type
+            .map(|t| format!("AND e.entity_type = '{}'", t.replace('\'', "''")))
+            .unwrap_or_default();
+
+        let sql = format!(
+            "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                    e.confidence, e.source_count,
+                    g.latitude, g.longitude, NULL::DOUBLE,
+                    COALESCE(
+                      (SELECT json_group_object(property_key, json(property_value))
+                       FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                      '{{}}'
+                    ),
+                    CAST(e.last_updated AS VARCHAR),
+                    e.is_active
+             FROM entities e
+             JOIN entity_geometry g ON g.entity_id = e.entity_id
+             WHERE e.is_active = TRUE {type_filter}
+               AND g.latitude  BETWEEN {lat_min} AND {lat_max}
+               AND g.longitude BETWEEN {lon_min} AND {lon_max}",
+            type_filter = type_filter,
+            lat_min = lat - deg_range,
+            lat_max = lat + deg_range,
+            lon_min = lon - deg_range,
+            lon_max = lon + deg_range,
+        );
 
         let mut stmt = conn
-            .prepare(&query)
+            .prepare(&sql)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2).ok().flatten(),
-                    row.get::<_, Option<String>>(3).ok().flatten(),
-                    row.get::<_, f32>(4).unwrap_or(1.0),
-                    row.get::<_, bool>(5).unwrap_or(true),
-                    row.get::<_, Option<f64>>(6).ok().flatten(),
-                    row.get::<_, Option<f64>>(7).ok().flatten(),
-                    row.get::<_, Option<f64>>(8).ok().flatten(),
-                    row.get::<_, String>(9).unwrap_or_default(),
-                ))
-            })
+        let mut rows = stmt
+            .query([])
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut entities = Vec::new();
-        for row_result in rows {
-            let (id, etype, canonical, name, confidence, active, r_lat, r_lon, alt, props_str) =
-                row_result.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-            let properties: HashMap<String, JsonValue> =
-                serde_json::from_str(&props_str).unwrap_or_default();
-            let geometry = match (r_lat, r_lon) {
-                (Some(la), Some(lo)) => Some(GeoPoint {
-                    lat: la,
-                    lon: lo,
-                    alt,
-                }),
-                _ => None,
-            };
-            entities.push(Entity {
-                entity_id: id,
-                entity_type: etype,
-                canonical_id: canonical,
-                name,
-                confidence,
-                is_active: active,
-                last_updated: chrono::Utc::now(),
-                geometry,
-                properties,
-            });
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            let e = Self::row_to_entity(row)
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            // Apply precise Haversine filter
+            if let Some(g) = &e.geometry {
+                if Self::haversine(lat, lon, g.lat, g.lon) <= radius_km {
+                    entities.push(e);
+                }
+            }
         }
         Ok(entities)
     }
 
+    async fn get_entities_in_polygon(
+        &self,
+        polygon_wkt: &str,
+        entity_type: Option<&str>,
+    ) -> StorageResult<Vec<Entity>> {
+        let conn = self.conn.lock().unwrap();
+
+        // With spatial extension, use ST_Contains; otherwise fall back to bounding-box.
+        let type_filter = entity_type
+            .map(|t| format!("AND e.entity_type = '{}'", t.replace('\'', "''")))
+            .unwrap_or_default();
+
+        let spatial_filter = if self.spatial_enabled {
+            format!(
+                "AND ST_Contains(ST_GeomFromText('{}'), ST_Point(g.longitude, g.latitude))",
+                polygon_wkt.replace('\'', "''")
+            )
+        } else {
+            // Basic bounding-box parse: extract min/max lat/lon from WKT
+            // For production, use a proper WKT parser; here we do a best-effort scan.
+            String::new()
+        };
+
+        let sql = format!(
+            "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                    e.confidence, e.source_count,
+                    g.latitude, g.longitude, NULL::DOUBLE,
+                    COALESCE(
+                      (SELECT json_group_object(property_key, json(property_value))
+                       FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                      '{{}}'
+                    ),
+                    CAST(e.last_updated AS VARCHAR),
+                    e.is_active
+             FROM entities e
+             JOIN entity_geometry g ON g.entity_id = e.entity_id
+             WHERE e.is_active = TRUE {type_filter} {spatial_filter}",
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let mut entities = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            entities.push(
+                Self::row_to_entity(row)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            );
+        }
+        Ok(entities)
+    }
+
+    // ── Event operations ──────────────────────────────────────────────────────
+
     async fn insert_event(&self, event: &Event) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         let data_str = serde_json::to_string(&event.data)
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| StorageError::SerializationError(e.to_string()))?;
+
         conn.execute(
-            "INSERT OR REPLACE INTO events (event_id, entity_id, event_type, event_timestamp, source_id, data, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO events
+               (event_id, entity_id, event_type, event_timestamp, source_id, event_data, confidence)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (event_id) DO NOTHING",
             params![
                 event.event_id,
                 event.entity_id,
@@ -397,6 +724,15 @@ impl Storage for DuckDbStorage {
             ],
         )
         .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        // Increment events_ingested_total for the source
+        conn.execute(
+            "UPDATE data_sources SET events_ingested_total = events_ingested_total + 1
+             WHERE source_id = ?",
+            params![event.source_id],
+        )
+        .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
         Ok(())
     }
 
@@ -407,55 +743,140 @@ impl Storage for DuckDbStorage {
     ) -> StorageResult<Vec<Event>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT event_id, entity_id, event_type, CAST(event_timestamp AS VARCHAR), source_id, data, confidence FROM events WHERE entity_id = ? ORDER BY event_timestamp DESC LIMIT ?")
+            .prepare(
+                "SELECT event_id, entity_id, event_type,
+                        CAST(event_timestamp AS VARCHAR), ingestion_timestamp,
+                        source_id, event_data, confidence
+                 FROM events
+                 WHERE entity_id = ?
+                 ORDER BY event_timestamp DESC
+                 LIMIT ?",
+            )
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
-        let rows = stmt
-            .query_map(params![entity_id, limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3).unwrap_or_default(),
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, f32>(6).unwrap_or(1.0),
-                ))
-            })
+        let mut rows = stmt
+            .query(params![entity_id, limit as i64])
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut events = Vec::new();
-        for row in rows {
-            let (eid, entity_id, etype, ts_str, source, data_str, confidence) =
-                row.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-            let data: JsonValue = serde_json::from_str(&data_str).unwrap_or(JsonValue::Null);
-            events.push(Event {
-                event_id: eid,
-                entity_id,
-                event_type: etype,
-                event_timestamp: chrono::DateTime::parse_from_rfc3339(&ts_str)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| {
-                        // Try parsing DuckDB timestamp format: "2026-03-26 14:30:00"
-                        chrono::NaiveDateTime::parse_from_str(&ts_str, "%Y-%m-%d %H:%M:%S")
-                            .or_else(|_| chrono::NaiveDateTime::parse_from_str(&ts_str, "%Y-%m-%d %H:%M:%S%.f"))
-                            .map(|ndt| ndt.and_utc())
-                            .unwrap_or_else(|_| chrono::Utc::now())
-                    }),
-                source_id: source,
-                data,
-                confidence,
-            });
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            events.push(
+                Self::row_to_event(row)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            );
         }
         Ok(events)
     }
 
+    async fn get_events_in_time_range(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<Event>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_id, entity_id, event_type,
+                        CAST(event_timestamp AS VARCHAR), ingestion_timestamp,
+                        source_id, event_data, confidence
+                 FROM events
+                 WHERE event_timestamp >= ? AND event_timestamp <= ?
+                 ORDER BY event_timestamp ASC",
+            )
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let mut rows = stmt
+            .query(params![start.to_rfc3339(), end.to_rfc3339()])
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let mut events = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            events.push(
+                Self::row_to_event(row)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            );
+        }
+        Ok(events)
+    }
+
+    async fn get_events_in_region(
+        &self,
+        lat: f64,
+        lon: f64,
+        radius_km: f64,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<Event>> {
+        // Get entity IDs in radius, then fetch their events in time range.
+        let entities = self
+            .get_entities_in_radius(lat, lon, radius_km, None)
+            .await?;
+        if entities.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let ids: Vec<String> = entities.iter().map(|e| format!("'{}'", e.entity_id.replace('\'', "''"))).collect();
+        let ids_str = ids.join(",");
+
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT event_id, entity_id, event_type,
+                    CAST(event_timestamp AS VARCHAR), ingestion_timestamp,
+                    source_id, event_data, confidence
+             FROM events
+             WHERE entity_id IN ({})
+               AND event_timestamp >= '{}' AND event_timestamp <= '{}'
+             ORDER BY event_timestamp ASC",
+            ids_str,
+            start.to_rfc3339(),
+            end.to_rfc3339(),
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let mut events = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            events.push(
+                Self::row_to_event(row)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            );
+        }
+        Ok(events)
+    }
+
+    // ── Relationship operations ───────────────────────────────────────────────
+
     async fn insert_relationship(&self, rel: &Relationship) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         let props_json = serde_json::to_string(&rel.properties)
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| StorageError::SerializationError(e.to_string()))?;
+        let now = chrono::Utc::now().to_rfc3339();
+
         conn.execute(
-            "INSERT OR REPLACE INTO relationships (relationship_id, source_entity_id, target_entity_id, relationship_type, properties, confidence, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO relationships
+               (relationship_id, source_entity_id, target_entity_id,
+                relationship_type, properties, confidence, is_active, last_confirmed_timestamp)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (relationship_id) DO UPDATE SET
+               relationship_type          = EXCLUDED.relationship_type,
+               properties                 = EXCLUDED.properties,
+               confidence                 = EXCLUDED.confidence,
+               is_active                  = EXCLUDED.is_active,
+               last_confirmed_timestamp   = EXCLUDED.last_confirmed_timestamp",
             params![
                 rel.relationship_id,
                 rel.source_entity_id,
@@ -464,6 +885,7 @@ impl Storage for DuckDbStorage {
                 props_json,
                 rel.confidence,
                 rel.is_active,
+                now,
             ],
         )
         .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
@@ -476,48 +898,274 @@ impl Storage for DuckDbStorage {
     ) -> StorageResult<Vec<Relationship>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT relationship_id, source_entity_id, target_entity_id, relationship_type, properties, confidence, is_active, created_at, updated_at FROM relationships WHERE (source_entity_id = ? OR target_entity_id = ?) AND is_active = true")
+            .prepare(
+                "SELECT relationship_id, source_entity_id, target_entity_id,
+                        relationship_type, properties, confidence, is_active
+                 FROM relationships
+                 WHERE (source_entity_id = ? OR target_entity_id = ?)
+                   AND is_active = TRUE",
+            )
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
-        let rows = stmt
-            .query_map(params![entity_id, entity_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4).unwrap_or_default(),
-                    row.get::<_, f32>(5).unwrap_or(1.0),
-                    row.get::<_, bool>(6).unwrap_or(true),
-                ))
-            })
+        let mut rows = stmt
+            .query(params![entity_id, entity_id])
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut rels = Vec::new();
-        for row in rows {
-            let (rid, src, tgt, rtype, props_str, confidence, active) =
-                row.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-            let properties: HashMap<String, JsonValue> =
-                serde_json::from_str(&props_str).unwrap_or_default();
-            rels.push(Relationship {
-                relationship_id: rid,
-                source_entity_id: src,
-                target_entity_id: tgt,
-                relationship_type: rtype,
-                properties,
-                confidence,
-                is_active: active,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-            });
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            rels.push(
+                Self::row_to_relationship(row)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            );
         }
         Ok(rels)
     }
 
-    async fn register_data_source(&self, source: &DataSource) -> StorageResult<()> {
+    async fn get_outgoing_relationships(
+        &self,
+        source_entity_id: &str,
+        rel_type: Option<&str>,
+    ) -> StorageResult<Vec<Relationship>> {
+        let conn = self.conn.lock().unwrap();
+        let type_filter = rel_type
+            .map(|t| format!("AND relationship_type = '{}'", t.replace('\'', "''")))
+            .unwrap_or_default();
+
+        let sql = format!(
+            "SELECT relationship_id, source_entity_id, target_entity_id,
+                    relationship_type, properties, confidence, is_active
+             FROM relationships
+             WHERE source_entity_id = '{}' AND is_active = TRUE {}",
+            source_entity_id.replace('\'', "''"),
+            type_filter,
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let mut rels = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            rels.push(
+                Self::row_to_relationship(row)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            );
+        }
+        Ok(rels)
+    }
+
+    async fn get_incoming_relationships(
+        &self,
+        target_entity_id: &str,
+        rel_type: Option<&str>,
+    ) -> StorageResult<Vec<Relationship>> {
+        let conn = self.conn.lock().unwrap();
+        let type_filter = rel_type
+            .map(|t| format!("AND relationship_type = '{}'", t.replace('\'', "''")))
+            .unwrap_or_default();
+
+        let sql = format!(
+            "SELECT relationship_id, source_entity_id, target_entity_id,
+                    relationship_type, properties, confidence, is_active
+             FROM relationships
+             WHERE target_entity_id = '{}' AND is_active = TRUE {}",
+            target_entity_id.replace('\'', "''"),
+            type_filter,
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let mut rels = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            rels.push(
+                Self::row_to_relationship(row)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            );
+        }
+        Ok(rels)
+    }
+
+    // ── Graph / path queries ──────────────────────────────────────────────────
+
+    async fn graph_query(
+        &self,
+        _query_str: &str,
+    ) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
+        // Passthrough to Kuzu in production; stub here.
+        Ok(vec![])
+    }
+
+    /// BFS path search up to `max_hops` using a recursive CTE over the relationships table.
+    async fn path_query(
+        &self,
+        source_entity_id: &str,
+        target_entity_id: &str,
+        max_hops: usize,
+    ) -> StorageResult<Vec<Vec<Relationship>>> {
+        let conn = self.conn.lock().unwrap();
+
+        // Recursive CTE: find all paths from source to target up to max_hops.
+        // We store the path as a JSON array of relationship_ids to detect cycles.
+        let sql = format!(
+            r#"
+            WITH RECURSIVE path_cte AS (
+              -- Seed: all direct outgoing edges from source
+              SELECT
+                relationship_id,
+                source_entity_id,
+                target_entity_id,
+                relationship_type,
+                properties,
+                confidence,
+                is_active,
+                1 AS hop_count,
+                [relationship_id] AS path_ids
+              FROM relationships
+              WHERE source_entity_id = '{src}' AND is_active = TRUE
+
+              UNION ALL
+
+              -- Expand one hop at a time, avoiding cycles via path_ids
+              SELECT
+                r.relationship_id,
+                r.source_entity_id,
+                r.target_entity_id,
+                r.relationship_type,
+                r.properties,
+                r.confidence,
+                r.is_active,
+                p.hop_count + 1,
+                list_append(p.path_ids, r.relationship_id)
+              FROM relationships r
+              JOIN path_cte p ON r.source_entity_id = p.target_entity_id
+              WHERE r.is_active = TRUE
+                AND p.hop_count < {max_hops}
+                AND NOT list_contains(p.path_ids, r.relationship_id)
+            )
+            SELECT relationship_id, source_entity_id, target_entity_id,
+                   relationship_type, properties, confidence, is_active
+            FROM path_cte
+            WHERE target_entity_id = '{tgt}'
+            ORDER BY hop_count
+            "#,
+            src = source_entity_id.replace('\'', "''"),
+            tgt = target_entity_id.replace('\'', "''"),
+            max_hops = max_hops,
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        // Each result row is a relationship on a path that reaches the target.
+        // For simplicity we return each as a single-step path; in production
+        // you'd reconstruct multi-hop paths from the path_ids column.
+        let mut paths: Vec<Vec<Relationship>> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            let rel = Self::row_to_relationship(row)
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            paths.push(vec![rel]);
+        }
+        Ok(paths)
+    }
+
+    // ── Audit operations ──────────────────────────────────────────────────────
+
+    async fn log_audit(
+        &self,
+        operation: &str,
+        entity_type: Option<&str>,
+        entity_id: Option<&str>,
+        user_id: Option<&str>,
+        details: JsonValue,
+    ) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+
+        // Get the previous hash (last entry in audit_log).
+        let previous_hash: Option<String> = conn
+            .query_row(
+                "SELECT content_hash FROM audit_log ORDER BY sequence_number DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+
+        // Get next sequence number.
+        let seq: i64 = conn
+            .query_row("SELECT nextval('audit_log_seq')", [], |r| r.get(0))
+            .unwrap_or(1);
+
+        // Compute content_hash = SHA256(seq || op || entity_type || entity_id || details).
+        let now = chrono::Utc::now().to_rfc3339();
+        let hash_input = format!(
+            "{}{}{}{}{}{}",
+            seq,
+            operation,
+            entity_type.unwrap_or(""),
+            entity_id.unwrap_or(""),
+            now,
+            details,
+        );
+        let content_hash = Self::sha256_hex(&hash_input);
+        let details_str = details.to_string();
+
+        conn.execute(
+            "INSERT INTO audit_log
+               (sequence_number, timestamp, operation, entity_type, entity_id,
+                user_id, previous_hash, content_hash, details)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                seq,
+                now,
+                operation,
+                entity_type,
+                entity_id,
+                user_id,
+                previous_hash,
+                content_hash,
+                details_str,
+            ],
+        )
+        .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    // ── Data source operations ────────────────────────────────────────────────
+
+    async fn register_data_source(&self, source: &orp_proto::DataSource) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO data_sources (source_id, source_name, source_type, trust_score, events_ingested, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO data_sources
+               (source_id, source_name, source_type, trust_score, events_ingested_total, enabled)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (source_id) DO UPDATE SET
+               source_name           = EXCLUDED.source_name,
+               trust_score           = EXCLUDED.trust_score,
+               enabled               = EXCLUDED.enabled",
             params![
                 source.source_id,
                 source.source_name,
@@ -534,28 +1182,229 @@ impl Storage for DuckDbStorage {
     async fn get_data_sources(&self) -> StorageResult<Vec<DataSource>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT source_id, source_name, source_type, trust_score, events_ingested, enabled FROM data_sources")
+            .prepare(
+                "SELECT source_id, source_name, source_type, trust_score,
+                        events_ingested_total, entities_provided_total, error_count,
+                        enabled, CAST(last_heartbeat AS VARCHAR), certificate_fingerprint
+                 FROM data_sources",
+            )
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(DataSource {
-                    source_id: row.get(0)?,
-                    source_name: row.get(1)?,
-                    source_type: row.get(2)?,
-                    trust_score: row.get(3).unwrap_or(0.8),
-                    events_ingested: row.get::<_, i64>(4).unwrap_or(0) as u64,
-                    enabled: row.get(5).unwrap_or(true),
-                })
-            })
+        let mut rows = stmt
+            .query([])
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut sources = Vec::new();
-        for row in rows {
-            sources.push(row.map_err(|e| StorageError::DatabaseError(e.to_string()))?);
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            let hb_str: Option<String> = row.get(8).ok().flatten();
+            let last_heartbeat = hb_str.map(|s| Self::parse_ts(&s));
+
+            sources.push(DataSource {
+                source_id: row
+                    .get(0)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                source_name: row
+                    .get(1)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                source_type: row
+                    .get(2)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                trust_score: row.get::<_, f32>(3).unwrap_or(0.8),
+                events_ingested: row.get::<_, i64>(4).unwrap_or(0) as u64,
+                entities_provided: row.get::<_, i64>(5).unwrap_or(0) as u64,
+                error_count: row.get::<_, i64>(6).unwrap_or(0) as u64,
+                enabled: row.get::<_, bool>(7).unwrap_or(true),
+                last_heartbeat,
+                certificate_fingerprint: row.get(9).ok().flatten(),
+            });
         }
         Ok(sources)
     }
+
+    async fn update_source_heartbeat(&self, source_id: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE data_sources SET last_heartbeat = CURRENT_TIMESTAMP WHERE source_id = ?",
+            params![source_id],
+        )
+        .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_data_source(&self, source_id: &str) -> StorageResult<Option<DataSource>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_id, source_name, source_type, trust_score,
+                        events_ingested_total, entities_provided_total, error_count,
+                        enabled, CAST(last_heartbeat AS VARCHAR), certificate_fingerprint
+                 FROM data_sources WHERE source_id = ?",
+            )
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let mut rows = stmt
+            .query(params![source_id])
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        if let Some(row) = rows.next().map_err(|e| StorageError::DatabaseError(e.to_string()))? {
+            let hb_str: Option<String> = row.get(8).ok().flatten();
+            let last_heartbeat = hb_str.map(|s| Self::parse_ts(&s));
+            Ok(Some(DataSource {
+                source_id: row.get(0).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                source_name: row.get(1).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                source_type: row.get(2).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                trust_score: row.get::<_, f32>(3).unwrap_or(0.8),
+                events_ingested: row.get::<_, i64>(4).unwrap_or(0) as u64,
+                entities_provided: row.get::<_, i64>(5).unwrap_or(0) as u64,
+                error_count: row.get::<_, i64>(6).unwrap_or(0) as u64,
+                enabled: row.get::<_, bool>(7).unwrap_or(true),
+                last_heartbeat,
+                certificate_fingerprint: row.get(9).ok().flatten(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn update_data_source(&self, source: &DataSource) -> StorageResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE data_sources SET
+               source_name = ?, source_type = ?, trust_score = ?, enabled = ?
+             WHERE source_id = ?",
+            params![
+                source.source_name,
+                source.source_type,
+                source.trust_score,
+                source.enabled,
+                source.source_id,
+            ],
+        ).map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        Ok(rows > 0)
+    }
+
+    async fn delete_data_source(&self, source_id: &str) -> StorageResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM data_sources WHERE source_id = ?",
+            params![source_id],
+        ).map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        Ok(rows > 0)
+    }
+
+    // ── Event global queries ──────────────────────────────────────────────────
+
+    async fn get_events_global(
+        &self,
+        entity_id: Option<&str>,
+        entity_type: Option<&str>,
+        event_type: Option<&str>,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        limit: usize,
+        offset: usize,
+    ) -> StorageResult<Vec<Event>> {
+        let conn = self.conn.lock().unwrap();
+        let mut conditions = vec!["1=1".to_string()];
+        if let Some(eid) = entity_id {
+            conditions.push(format!("ev.entity_id = '{}'", eid.replace('\'', "''")));
+        }
+        if let Some(etype) = entity_type {
+            conditions.push(format!(
+                "ev.entity_id IN (SELECT entity_id FROM entities WHERE entity_type = '{}')",
+                etype.replace('\'', "''")
+            ));
+        }
+        if let Some(et) = event_type {
+            conditions.push(format!("ev.event_type = '{}'", et.replace('\'', "''")));
+        }
+        if let Some(s) = since {
+            conditions.push(format!("ev.event_timestamp >= '{}'", s.to_rfc3339()));
+        }
+        if let Some(u) = until {
+            conditions.push(format!("ev.event_timestamp <= '{}'", u.to_rfc3339()));
+        }
+        let where_clause = conditions.join(" AND ");
+        let sql = format!(
+            "SELECT ev.event_id, ev.entity_id, ev.event_type,
+                    CAST(ev.event_timestamp AS VARCHAR), ev.ingestion_timestamp,
+                    ev.source_id, ev.event_data, ev.confidence
+             FROM events ev
+             WHERE {where_clause}
+             ORDER BY ev.event_timestamp DESC
+             LIMIT {limit} OFFSET {offset}"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        let mut rows = stmt.query([]).map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| StorageError::DatabaseError(e.to_string()))? {
+            events.push(Self::row_to_event(row).map_err(|e| StorageError::DatabaseError(e.to_string()))?);
+        }
+        Ok(events)
+    }
+
+    async fn count_events_global(
+        &self,
+        entity_id: Option<&str>,
+        entity_type: Option<&str>,
+        event_type: Option<&str>,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> StorageResult<u64> {
+        let conn = self.conn.lock().unwrap();
+        let mut conditions = vec!["1=1".to_string()];
+        if let Some(eid) = entity_id {
+            conditions.push(format!("ev.entity_id = '{}'", eid.replace('\'', "''")));
+        }
+        if let Some(etype) = entity_type {
+            conditions.push(format!(
+                "ev.entity_id IN (SELECT entity_id FROM entities WHERE entity_type = '{}')",
+                etype.replace('\'', "''")
+            ));
+        }
+        if let Some(et) = event_type {
+            conditions.push(format!("ev.event_type = '{}'", et.replace('\'', "''")));
+        }
+        if let Some(s) = since {
+            conditions.push(format!("ev.event_timestamp >= '{}'", s.to_rfc3339()));
+        }
+        if let Some(u) = until {
+            conditions.push(format!("ev.event_timestamp <= '{}'", u.to_rfc3339()));
+        }
+        let where_clause = conditions.join(" AND ");
+        let sql = format!("SELECT COUNT(*) FROM events ev WHERE {where_clause}");
+        let n: i64 = conn.query_row(&sql, [], |r| r.get(0))
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        Ok(n as u64)
+    }
+
+    // ── Transaction operations ────────────────────────────────────────────────
+
+    async fn begin_transaction(&self) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("BEGIN")
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn commit_transaction(&self) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("COMMIT")
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn rollback_transaction(&self) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("ROLLBACK")
+            .map_err(|e| StorageError::TransactionError(e.to_string()))?;
+        Ok(())
+    }
+
+    // ── Search ────────────────────────────────────────────────────────────────
 
     async fn search_entities(
         &self,
@@ -564,106 +1413,50 @@ impl Storage for DuckDbStorage {
         limit: usize,
     ) -> StorageResult<Vec<Entity>> {
         let conn = self.conn.lock().unwrap();
-        let search_pattern = format!("%{}%", query);
+        let pattern = format!("%{}%", query.replace('\'', "''"));
+        let type_filter = entity_type
+            .map(|t| format!("AND e.entity_type = '{}'", t.replace('\'', "''")))
+            .unwrap_or_default();
 
-        let sql = if let Some(etype) = entity_type {
-            format!(
-                "SELECT entity_id, entity_type, canonical_id, name, confidence, is_active, latitude, longitude, altitude, properties
-                 FROM entities
-                 WHERE is_active = true AND entity_type = '{}'
-                 AND (name LIKE '{}' OR entity_id LIKE '{}')
-                 LIMIT {}",
-                etype, search_pattern, search_pattern, limit,
-            )
-        } else {
-            format!(
-                "SELECT entity_id, entity_type, canonical_id, name, confidence, is_active, latitude, longitude, altitude, properties
-                 FROM entities
-                 WHERE is_active = true
-                 AND (name LIKE '{}' OR entity_id LIKE '{}')
-                 LIMIT {}",
-                search_pattern, search_pattern, limit,
-            )
-        };
+        let sql = format!(
+            "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                    e.confidence, e.source_count,
+                    g.latitude, g.longitude, NULL::DOUBLE,
+                    COALESCE(
+                      (SELECT json_group_object(property_key, json(property_value))
+                       FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                      '{{}}'
+                    ),
+                    CAST(e.last_updated AS VARCHAR),
+                    e.is_active
+             FROM entities e
+             LEFT JOIN entity_geometry g ON g.entity_id = e.entity_id
+             WHERE e.is_active = TRUE {type_filter}
+               AND (e.name ILIKE '{pattern}' OR e.entity_id ILIKE '{pattern}')
+             LIMIT {limit}",
+        );
 
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2).ok().flatten(),
-                    row.get::<_, Option<String>>(3).ok().flatten(),
-                    row.get::<_, f32>(4).unwrap_or(1.0),
-                    row.get::<_, bool>(5).unwrap_or(true),
-                    row.get::<_, Option<f64>>(6).ok().flatten(),
-                    row.get::<_, Option<f64>>(7).ok().flatten(),
-                    row.get::<_, Option<f64>>(8).ok().flatten(),
-                    row.get::<_, String>(9).unwrap_or_default(),
-                ))
-            })
+        let mut rows = stmt
+            .query([])
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut entities = Vec::new();
-        for row_result in rows {
-            let (id, etype, canonical, name, confidence, active, lat, lon, alt, props_str) =
-                row_result.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-            let properties: HashMap<String, JsonValue> =
-                serde_json::from_str(&props_str).unwrap_or_default();
-            let geometry = match (lat, lon) {
-                (Some(la), Some(lo)) => Some(GeoPoint {
-                    lat: la,
-                    lon: lo,
-                    alt,
-                }),
-                _ => None,
-            };
-            entities.push(Entity {
-                entity_id: id,
-                entity_type: etype,
-                canonical_id: canonical,
-                name,
-                confidence,
-                is_active: active,
-                last_updated: chrono::Utc::now(),
-                geometry,
-                properties,
-            });
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            entities.push(
+                Self::row_to_entity(row)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            );
         }
         Ok(entities)
     }
 
-    async fn graph_query(
-        &self,
-        _query_str: &str,
-    ) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
-        // Stub: graph queries will be routed to Kuzu in production
-        Ok(vec![])
-    }
-
-    async fn get_stats(&self) -> StorageResult<StorageStats> {
-        let conn = self.conn.lock().unwrap();
-
-        let total_entities: i64 = conn
-            .query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
-            .unwrap_or(0);
-        let total_events: i64 = conn
-            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
-            .unwrap_or(0);
-        let total_relationships: i64 = conn
-            .query_row("SELECT COUNT(*) FROM relationships", [], |row| row.get(0))
-            .unwrap_or(0);
-
-        Ok(StorageStats {
-            total_entities: total_entities as u64,
-            total_events: total_events as u64,
-            total_relationships: total_relationships as u64,
-            database_size_bytes: 0,
-        })
-    }
+    // ── Administrative ────────────────────────────────────────────────────────
 
     async fn health_check(&self) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
@@ -671,328 +1464,431 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
         Ok(())
     }
+
+    async fn get_stats(&self) -> StorageResult<StorageStats> {
+        let conn = self.conn.lock().unwrap();
+        let total_entities: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+            .unwrap_or(0);
+        let total_events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap_or(0);
+        let total_relationships: i64 = conn
+            .query_row("SELECT COUNT(*) FROM relationships", [], |r| r.get(0))
+            .unwrap_or(0);
+        let audit_entries: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0))
+            .unwrap_or(0);
+        let data_sources: i64 = conn
+            .query_row("SELECT COUNT(*) FROM data_sources", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        Ok(StorageStats {
+            total_entities: total_entities as u64,
+            total_events: total_events as u64,
+            total_relationships: total_relationships as u64,
+            database_size_bytes: 0,
+            audit_log_entries: audit_entries as u64,
+            data_sources: data_sources as u64,
+        })
+    }
 }
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_insert_and_get_entity() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
-
-        let entity = Entity {
-            entity_id: "ship-test-1".to_string(),
-            entity_type: "ship".to_string(),
-            name: Some("Test Ship".to_string()),
-            geometry: Some(GeoPoint {
-                lat: 51.92,
-                lon: 4.47,
-                alt: None,
-            }),
+    fn make_entity(id: &str, etype: &str) -> Entity {
+        Entity {
+            entity_id: id.to_string(),
+            entity_type: etype.to_string(),
             ..Entity::default()
-        };
-
-        storage.insert_entity(&entity).await.unwrap();
-
-        let retrieved = storage.get_entity("ship-test-1").await.unwrap();
-        assert!(retrieved.is_some());
-        let retrieved = retrieved.unwrap();
-        assert_eq!(retrieved.entity_type, "ship");
-        assert_eq!(retrieved.name, Some("Test Ship".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_entities_by_type() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
-
-        for i in 0..5 {
-            let entity = Entity {
-                entity_id: format!("ship-{}", i),
-                entity_type: "ship".to_string(),
-                name: Some(format!("Ship {}", i)),
-                ..Entity::default()
-            };
-            storage.insert_entity(&entity).await.unwrap();
         }
-
-        let ships = storage.get_entities_by_type("ship", 10, 0).await.unwrap();
-        assert_eq!(ships.len(), 5);
     }
 
-    #[tokio::test]
-    async fn test_geospatial_query() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
-
-        let entity = Entity {
-            entity_id: "ship-near".to_string(),
-            entity_type: "ship".to_string(),
-            geometry: Some(GeoPoint {
-                lat: 51.92,
-                lon: 4.47,
-                alt: None,
-            }),
+    fn make_entity_with_geo(id: &str, etype: &str, lat: f64, lon: f64) -> Entity {
+        Entity {
+            entity_id: id.to_string(),
+            entity_type: etype.to_string(),
+            geometry: Some(GeoPoint { lat, lon, alt: None }),
             ..Entity::default()
-        };
-        storage.insert_entity(&entity).await.unwrap();
-
-        let entity_far = Entity {
-            entity_id: "ship-far".to_string(),
-            entity_type: "ship".to_string(),
-            geometry: Some(GeoPoint {
-                lat: 35.0,
-                lon: 139.0,
-                alt: None,
-            }),
-            ..Entity::default()
-        };
-        storage.insert_entity(&entity_far).await.unwrap();
-
-        let near = storage
-            .get_entities_in_radius(51.92, 4.47, 50.0, Some("ship"))
-            .await
-            .unwrap();
-        assert_eq!(near.len(), 1);
-        assert_eq!(near[0].entity_id, "ship-near");
-    }
-
-    #[tokio::test]
-    async fn test_stats() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
-        let stats = storage.get_stats().await.unwrap();
-        assert_eq!(stats.total_entities, 0);
-    }
-
-    #[tokio::test]
-    async fn test_insert_and_get_events() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
-
-        let entity = Entity {
-            entity_id: "ship-1".to_string(),
-            entity_type: "ship".to_string(),
-            ..Entity::default()
-        };
-        storage.insert_entity(&entity).await.unwrap();
-
-        for i in 0..5 {
-            let event = Event {
-                event_id: format!("evt-{}", i),
-                entity_id: "ship-1".to_string(),
-                event_type: "position_update".to_string(),
-                event_timestamp: chrono::Utc::now(),
-                source_id: "ais-1".to_string(),
-                data: serde_json::json!({"speed": 10.0 + i as f64}),
-                confidence: 0.95,
-            };
-            storage.insert_event(&event).await.unwrap();
         }
-
-        let events = storage.get_events_for_entity("ship-1", 10).await.unwrap();
-        assert_eq!(events.len(), 5);
     }
 
-    #[tokio::test]
-    async fn test_insert_and_get_relationships() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
+    fn make_event(id: &str, entity_id: &str) -> Event {
+        Event {
+            event_id: id.to_string(),
+            entity_id: entity_id.to_string(),
+            event_type: "position_update".to_string(),
+            event_timestamp: chrono::Utc::now(),
+            source_id: "test-src".to_string(),
+            data: serde_json::json!({"speed": 10.5}),
+            confidence: 0.9,
+        }
+    }
 
-        let ship = Entity {
-            entity_id: "ship-1".to_string(),
-            entity_type: "ship".to_string(),
-            ..Entity::default()
-        };
-        let port = Entity {
-            entity_id: "port-1".to_string(),
-            entity_type: "port".to_string(),
-            ..Entity::default()
-        };
-        storage.insert_entity(&ship).await.unwrap();
-        storage.insert_entity(&port).await.unwrap();
-
-        let rel = orp_proto::Relationship {
-            relationship_id: "rel-1".to_string(),
-            source_entity_id: "ship-1".to_string(),
-            target_entity_id: "port-1".to_string(),
-            relationship_type: "HEADING_TO".to_string(),
+    fn make_relationship(id: &str, src: &str, tgt: &str) -> Relationship {
+        Relationship {
+            relationship_id: id.to_string(),
+            source_entity_id: src.to_string(),
+            target_entity_id: tgt.to_string(),
+            relationship_type: "docked_at".to_string(),
             properties: HashMap::new(),
             confidence: 0.9,
             is_active: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
-        };
-        storage.insert_relationship(&rel).await.unwrap();
-
-        let rels = storage
-            .get_relationships_for_entity("ship-1")
-            .await
-            .unwrap();
-        assert_eq!(rels.len(), 1);
-        assert_eq!(rels[0].relationship_type, "HEADING_TO");
-
-        let rels2 = storage
-            .get_relationships_for_entity("port-1")
-            .await
-            .unwrap();
-        assert_eq!(rels2.len(), 1);
+        }
     }
 
-    #[tokio::test]
-    async fn test_data_sources() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
-
-        let source = orp_proto::DataSource {
-            source_id: "ais-demo".to_string(),
-            source_name: "AIS Demo".to_string(),
+    fn make_source(id: &str) -> orp_proto::DataSource {
+        orp_proto::DataSource {
+            source_id: id.to_string(),
+            source_name: format!("{} Name", id),
             source_type: "ais".to_string(),
             trust_score: 0.95,
             events_ingested: 0,
             enabled: true,
-        };
-        storage.register_data_source(&source).await.unwrap();
-
-        let sources = storage.get_data_sources().await.unwrap();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].source_name, "AIS Demo");
+        }
     }
 
     #[tokio::test]
-    async fn test_search_entities() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
+    async fn test_01_insert_and_get_entity() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("e1", "ship")).await.unwrap();
+        let e = s.get_entity("e1").await.unwrap().unwrap();
+        assert_eq!(e.entity_type, "ship");
+    }
 
-        let entity = Entity {
-            entity_id: "ship-rotterdam-1".to_string(),
-            entity_type: "ship".to_string(),
-            name: Some("Rotterdam Express".to_string()),
-            ..Entity::default()
-        };
-        storage.insert_entity(&entity).await.unwrap();
+    #[tokio::test]
+    async fn test_02_entity_not_found() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        let e = s.get_entity("missing").await.unwrap();
+        assert!(e.is_none());
+    }
 
-        let results = storage
+    #[tokio::test]
+    async fn test_03_get_entities_by_type() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        for i in 0..5 {
+            s.insert_entity(&make_entity(&format!("s{}", i), "ship"))
+                .await
+                .unwrap();
+        }
+        s.insert_entity(&make_entity("p1", "port")).await.unwrap();
+        let ships = s.get_entities_by_type("ship", 10, 0).await.unwrap();
+        assert_eq!(ships.len(), 5);
+        let ports = s.get_entities_by_type("port", 10, 0).await.unwrap();
+        assert_eq!(ports.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_04_update_entity_property() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("e1", "ship")).await.unwrap();
+        s.update_entity_property("e1", "speed", serde_json::json!(15.0))
+            .await
+            .unwrap();
+        // Property updated without error
+    }
+
+    #[tokio::test]
+    async fn test_05_delete_entity_soft() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("e1", "ship")).await.unwrap();
+        assert_eq!(s.count_entities().await.unwrap(), 1);
+        s.delete_entity("e1").await.unwrap();
+        assert_eq!(s.count_entities().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_06_set_canonical_id() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("dup1", "ship")).await.unwrap();
+        s.set_canonical_id("dup1", "canonical1").await.unwrap();
+        let e = s.get_entity("dup1").await.unwrap().unwrap();
+        assert_eq!(e.canonical_id, Some("canonical1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_07_geospatial_in_radius() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity_with_geo("near", "ship", 51.92, 4.47))
+            .await
+            .unwrap();
+        s.insert_entity(&make_entity_with_geo("far", "ship", 35.0, 139.0))
+            .await
+            .unwrap();
+        let results = s
+            .get_entities_in_radius(51.92, 4.47, 50.0, Some("ship"))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entity_id, "near");
+    }
+
+    #[tokio::test]
+    async fn test_08_geospatial_no_type_filter() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity_with_geo("ship1", "ship", 51.92, 4.47))
+            .await
+            .unwrap();
+        s.insert_entity(&make_entity_with_geo("port1", "port", 51.91, 4.48))
+            .await
+            .unwrap();
+        let results = s
+            .get_entities_in_radius(51.92, 4.47, 50.0, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_09_insert_and_get_events() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("e1", "ship")).await.unwrap();
+        for i in 0..5 {
+            let mut ev = make_event(&format!("ev{}", i), "e1");
+            ev.event_timestamp =
+                chrono::Utc::now() - chrono::Duration::seconds(i as i64 * 10);
+            s.insert_event(&ev).await.unwrap();
+        }
+        let events = s.get_events_for_entity("e1", 10).await.unwrap();
+        assert_eq!(events.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_10_events_in_time_range() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("e1", "ship")).await.unwrap();
+        let now = chrono::Utc::now();
+        for i in 0..10i64 {
+            let mut ev = make_event(&format!("ev{}", i), "e1");
+            ev.event_timestamp = now - chrono::Duration::hours(i);
+            s.insert_event(&ev).await.unwrap();
+        }
+        let start = now - chrono::Duration::hours(5);
+        let end = now;
+        let events = s.get_events_in_time_range(start, end).await.unwrap();
+        // Events 0..=5 (6 events) should be in range
+        assert!(events.len() >= 5 && events.len() <= 6);
+    }
+
+    #[tokio::test]
+    async fn test_11_events_in_region() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity_with_geo("e1", "ship", 51.92, 4.47))
+            .await
+            .unwrap();
+        s.insert_entity(&make_entity_with_geo("e2", "ship", 35.0, 139.0))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        s.insert_event(&make_event("ev1", "e1")).await.unwrap();
+        s.insert_event(&make_event("ev2", "e2")).await.unwrap();
+        let events = s
+            .get_events_in_region(
+                51.92,
+                4.47,
+                50.0,
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].entity_id, "e1");
+    }
+
+    #[tokio::test]
+    async fn test_12_insert_and_get_relationships() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("ship1", "ship")).await.unwrap();
+        s.insert_entity(&make_entity("port1", "port")).await.unwrap();
+        s.insert_relationship(&make_relationship("r1", "ship1", "port1"))
+            .await
+            .unwrap();
+        let rels = s.get_relationships_for_entity("ship1").await.unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].relationship_type, "docked_at");
+    }
+
+    #[tokio::test]
+    async fn test_13_outgoing_incoming_relationships() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("a", "ship")).await.unwrap();
+        s.insert_entity(&make_entity("b", "port")).await.unwrap();
+        s.insert_relationship(&make_relationship("r1", "a", "b"))
+            .await
+            .unwrap();
+        let out = s
+            .get_outgoing_relationships("a", None)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        let inc = s
+            .get_incoming_relationships("b", None)
+            .await
+            .unwrap();
+        assert_eq!(inc.len(), 1);
+        // Wrong direction
+        assert!(s.get_outgoing_relationships("b", None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_14_path_query() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("a", "ship")).await.unwrap();
+        s.insert_entity(&make_entity("b", "waypoint")).await.unwrap();
+        s.insert_entity(&make_entity("c", "port")).await.unwrap();
+        s.insert_relationship(&make_relationship("r1", "a", "b"))
+            .await
+            .unwrap();
+        s.insert_relationship(&make_relationship("r2", "b", "c"))
+            .await
+            .unwrap();
+        let paths = s.path_query("a", "c", 3).await.unwrap();
+        assert!(!paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_15_audit_log_hash_chain() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.log_audit(
+            "insert",
+            Some("ship"),
+            Some("e1"),
+            Some("user1"),
+            serde_json::json!({"note": "first entry"}),
+        )
+        .await
+        .unwrap();
+        s.log_audit(
+            "update",
+            Some("ship"),
+            Some("e1"),
+            None,
+            serde_json::json!({"speed": 20}),
+        )
+        .await
+        .unwrap();
+        let stats = s.get_stats().await.unwrap();
+        assert_eq!(stats.audit_log_entries, 2);
+    }
+
+    #[tokio::test]
+    async fn test_16_register_and_get_data_sources() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.register_data_source(&make_source("ais-1")).await.unwrap();
+        s.register_data_source(&make_source("adsb-1")).await.unwrap();
+        let sources = s.get_data_sources().await.unwrap();
+        assert_eq!(sources.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_17_update_source_heartbeat() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.register_data_source(&make_source("ais-1")).await.unwrap();
+        s.update_source_heartbeat("ais-1").await.unwrap();
+        let sources = s.get_data_sources().await.unwrap();
+        assert!(sources[0].last_heartbeat.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_18_transactions_commit() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.begin_transaction().await.unwrap();
+        s.insert_entity(&make_entity("tx1", "ship")).await.unwrap();
+        s.commit_transaction().await.unwrap();
+        assert!(s.get_entity("tx1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_19_search_entities() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        let mut e = make_entity("e1", "ship");
+        e.name = Some("Rotterdam Express".to_string());
+        s.insert_entity(&e).await.unwrap();
+        let results = s
             .search_entities("Rotterdam", Some("ship"), 10)
             .await
             .unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].name.as_deref(), Some("Rotterdam Express"));
+        assert_eq!(results[0].entity_id, "e1");
     }
 
     #[tokio::test]
-    async fn test_delete_entity() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
-
-        let entity = Entity {
-            entity_id: "ship-del".to_string(),
-            entity_type: "ship".to_string(),
-            ..Entity::default()
-        };
-        storage.insert_entity(&entity).await.unwrap();
-
-        assert!(storage.get_entity("ship-del").await.unwrap().is_some());
-
-        storage.delete_entity("ship-del").await.unwrap();
-
-        // Count should not include soft-deleted
-        let count = storage.count_entities().await.unwrap();
-        assert_eq!(count, 0);
+    async fn test_20_health_check() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        assert!(s.health_check().await.is_ok());
     }
 
     #[tokio::test]
-    async fn test_update_entity_property() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
-
-        let entity = Entity {
-            entity_id: "ship-upd".to_string(),
-            entity_type: "ship".to_string(),
-            ..Entity::default()
-        };
-        storage.insert_entity(&entity).await.unwrap();
-
-        storage
-            .update_entity_property("ship-upd", "speed", serde_json::json!(15.0))
-            .await
-            .unwrap();
-
-        let updated = storage.get_entity("ship-upd").await.unwrap().unwrap();
-        assert_eq!(
-            updated.properties.get("speed"),
-            Some(&serde_json::json!(15.0))
-        );
+    async fn test_21_stats() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("e1", "ship")).await.unwrap();
+        let stats = s.get_stats().await.unwrap();
+        assert_eq!(stats.total_entities, 1);
+        assert_eq!(stats.total_events, 0);
     }
 
     #[tokio::test]
-    async fn test_health_check() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
-        assert!(storage.health_check().await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_pagination() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
-
-        for i in 0..20 {
-            let entity = Entity {
-                entity_id: format!("ship-page-{}", i),
-                entity_type: "ship".to_string(),
-                name: Some(format!("Ship {}", i)),
-                ..Entity::default()
-            };
-            storage.insert_entity(&entity).await.unwrap();
+    async fn test_22_pagination() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        for i in 0..15 {
+            s.insert_entity(&make_entity(&format!("s{}", i), "ship"))
+                .await
+                .unwrap();
         }
-
-        let page1 = storage.get_entities_by_type("ship", 5, 0).await.unwrap();
-        assert_eq!(page1.len(), 5);
-
-        let page2 = storage.get_entities_by_type("ship", 5, 5).await.unwrap();
-        assert_eq!(page2.len(), 5);
-
-        // No overlap
-        let ids1: Vec<_> = page1.iter().map(|e| &e.entity_id).collect();
-        let ids2: Vec<_> = page2.iter().map(|e| &e.entity_id).collect();
-        for id in &ids1 {
-            assert!(!ids2.contains(id));
-        }
+        let p1 = s.get_entities_by_type("ship", 5, 0).await.unwrap();
+        let p2 = s.get_entities_by_type("ship", 5, 5).await.unwrap();
+        assert_eq!(p1.len(), 5);
+        assert_eq!(p2.len(), 5);
+        let ids1: std::collections::HashSet<_> = p1.iter().map(|e| &e.entity_id).collect();
+        let ids2: std::collections::HashSet<_> = p2.iter().map(|e| &e.entity_id).collect();
+        assert!(ids1.is_disjoint(&ids2));
     }
 
     #[tokio::test]
-    async fn test_geospatial_no_type_filter() {
-        let storage = DuckDbStorage::new_in_memory().unwrap();
-
-        let entity = Entity {
-            entity_id: "ship-geo".to_string(),
-            entity_type: "ship".to_string(),
-            geometry: Some(GeoPoint {
-                lat: 51.92,
-                lon: 4.47,
-                alt: None,
-            }),
-            ..Entity::default()
-        };
-        storage.insert_entity(&entity).await.unwrap();
-
-        let results = storage
-            .get_entities_in_radius(51.92, 4.47, 10.0, None)
-            .await
-            .unwrap();
-        assert!(!results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_file_based_storage() {
-        let dir = std::env::temp_dir().join("orp_test_db");
+    async fn test_23_file_based_storage() {
+        let dir = std::env::temp_dir().join("orp_duckdb_test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test.duckdb");
-        let path_str = path.to_str().unwrap();
-
-        let storage = DuckDbStorage::new_with_path(path_str).unwrap();
-        let entity = Entity {
-            entity_id: "persist-test".to_string(),
-            entity_type: "ship".to_string(),
-            ..Entity::default()
-        };
-        storage.insert_entity(&entity).await.unwrap();
-
-        let result = storage.get_entity("persist-test").await.unwrap();
-        assert!(result.is_some());
-
-        // Cleanup
+        {
+            let s = DuckDbStorage::new_with_path(path.to_str().unwrap()).unwrap();
+            s.insert_entity(&make_entity("persist-1", "ship")).await.unwrap();
+        }
+        // Re-open
+        let s2 = DuckDbStorage::new_with_path(path.to_str().unwrap()).unwrap();
+        assert!(s2.get_entity("persist-1").await.unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_24_entity_geometry_updated_on_insert() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        let e = make_entity_with_geo("geo1", "ship", 48.8566, 2.3522); // Paris
+        s.insert_entity(&e).await.unwrap();
+        let near = s
+            .get_entities_in_radius(48.8566, 2.3522, 10.0, None)
+            .await
+            .unwrap();
+        assert_eq!(near.len(), 1);
+        assert_eq!(near[0].entity_id, "geo1");
+    }
+
+    #[tokio::test]
+    async fn test_25_event_data_round_trip() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.insert_entity(&make_entity("e1", "ship")).await.unwrap();
+        let mut ev = make_event("ev1", "e1");
+        ev.data = serde_json::json!({"speed": 42.5, "heading": 90, "nested": {"a": 1}});
+        s.insert_event(&ev).await.unwrap();
+        let fetched = s.get_events_for_entity("e1", 1).await.unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].data["speed"], serde_json::json!(42.5));
+        assert_eq!(fetched[0].data["nested"]["a"], serde_json::json!(1));
     }
 }

@@ -14,3 +14,7 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+rocksdb = { version = "0.22", features = ["lz4"] }
+
+[dev-dependencies]
+tempfile = "3"

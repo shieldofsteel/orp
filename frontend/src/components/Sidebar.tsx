@@ -1,102 +1,259 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAppStore } from '../store/useAppStore';
-import { useConnectors, useHealth } from '../hooks/useEntities';
+import { QueryBar } from './QueryBar';
 import { AlertFeed } from './AlertFeed';
+import type { Connector } from '../types';
 
-const STATUS_DOT: Record<string, string> = {
-  healthy: 'bg-green-500',
-  degraded: 'bg-yellow-500',
-  error: 'bg-red-500',
-  unhealthy: 'bg-red-500',
+const API_BASE = 'http://localhost:9090/api/v1';
+
+const MOCK_CONNECTORS: Connector[] = [
+  {
+    id: 'ais-live',
+    name: 'AIS Live Feed',
+    type: 'ais',
+    enabled: true,
+    status: 'healthy',
+    stats: { events_per_sec: 42.1, last_event_at: new Date().toISOString(), error_count: 0, total_ingested: 1_204_880 },
+  },
+  {
+    id: 'port-db',
+    name: 'Port Database',
+    type: 'database',
+    enabled: true,
+    status: 'healthy',
+    stats: { events_per_sec: 0.3, last_event_at: new Date(Date.now() - 120_000).toISOString(), error_count: 0, total_ingested: 887 },
+  },
+  {
+    id: 'weather-api',
+    name: 'Weather API',
+    type: 'rest',
+    enabled: true,
+    status: 'degraded',
+    stats: { events_per_sec: 1.2, last_event_at: new Date(Date.now() - 5_000).toISOString(), error_count: 3, total_ingested: 12_440 },
+  },
+  {
+    id: 'sat-imagery',
+    name: 'Satellite Imagery',
+    type: 'grpc',
+    enabled: false,
+    status: 'error',
+    stats: { events_per_sec: 0, last_event_at: new Date(Date.now() - 3_600_000).toISOString(), error_count: 18, total_ingested: 0 },
+  },
+];
+
+const STATUS_CONFIG = {
+  healthy: { dot: 'bg-green-500', text: 'text-green-400', label: 'Healthy' },
+  degraded: { dot: 'bg-amber-400', text: 'text-amber-400', label: 'Degraded' },
+  error: { dot: 'bg-red-500', text: 'text-red-400', label: 'Error' },
 };
 
-export const Sidebar: React.FC = () => {
-  const sidebarOpen = useAppStore((s) => s.sidebarOpen);
-  const wsConnected = useAppStore((s) => s.wsConnected);
-  const entities = useAppStore((s) => s.entities);
+function formatLastEvent(ts: string): string {
+  const d = new Date(ts);
+  const diff = Date.now() - d.getTime();
+  if (diff < 5_000) return 'just now';
+  if (diff < 60_000) return `${Math.floor(diff / 1_000)}s ago`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  return `${Math.floor(diff / 3_600_000)}h ago`;
+}
 
-  const { data: health } = useHealth();
-  const { data: connectors } = useConnectors();
-
-  if (!sidebarOpen) return null;
-
-  const healthData = health as Record<string, unknown> | undefined;
-  const systemStatus = (healthData?.status as string) ?? 'unknown';
-  const version = (healthData?.version as string) ?? '—';
-  const uptime = (healthData?.uptime_seconds as number) ?? 0;
-
-  const connectorList = (connectors?.data ?? []) as Array<Record<string, unknown>>;
+function ConnectorCard({ connector }: { connector: Connector }) {
+  const cfg = STATUS_CONFIG[connector.status] ?? STATUS_CONFIG.error;
 
   return (
-    <aside className="w-64 bg-gray-900 border-r border-gray-800 flex flex-col overflow-hidden">
-      {/* System Status */}
-      <div className="px-3 py-3 border-b border-gray-800">
-        <div className="flex items-center gap-2 mb-2">
-          <span
-            className={`w-2 h-2 rounded-full ${
-              STATUS_DOT[systemStatus] ?? 'bg-gray-500'
-            }`}
-          />
-          <span className="text-xs text-gray-300 font-medium">
-            ORP {version}
-          </span>
-        </div>
-        <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">
-          <div className="text-gray-500">Status</div>
-          <div className="text-gray-300">{systemStatus}</div>
-          <div className="text-gray-500">Uptime</div>
-          <div className="text-gray-300">{formatUptime(uptime)}</div>
-          <div className="text-gray-500">WebSocket</div>
-          <div className={wsConnected ? 'text-green-400' : 'text-red-400'}>
-            {wsConnected ? 'Connected' : 'Disconnected'}
+    <div className={`rounded-md border bg-gray-800/50 p-2.5 transition-colors ${
+      connector.enabled ? 'border-gray-700' : 'border-gray-800 opacity-50'
+    }`}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5">
+            <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${cfg.dot}`} />
+            <span className="text-[11px] font-medium text-gray-200 truncate">
+              {connector.name}
+            </span>
           </div>
-          <div className="text-gray-500">Entities</div>
-          <div className="text-gray-300">{entities.size.toLocaleString()}</div>
+          <div className="flex items-center gap-1.5 mt-1">
+            <span className="text-[9px] text-gray-600 bg-gray-800 border border-gray-700 rounded px-1 py-0.5">
+              {connector.type}
+            </span>
+            <span className={`text-[9px] ${cfg.text}`}>{cfg.label}</span>
+          </div>
         </div>
-      </div>
-
-      {/* Data Sources */}
-      <div className="px-3 py-2 border-b border-gray-800">
-        <h3 className="text-xs font-medium text-gray-400 uppercase tracking-wide mb-2">
-          Data Sources
-        </h3>
-        {connectorList.length === 0 ? (
-          <p className="text-xs text-gray-500">No connectors configured</p>
-        ) : (
-          <ul className="space-y-1.5">
-            {connectorList.map((c, i) => {
-              const name = (c.source_name as string) ?? (c.name as string) ?? `Connector ${i + 1}`;
-              const cType = (c.source_type as string) ?? (c.type as string) ?? 'unknown';
-              const enabled = c.enabled !== false;
-              return (
-                <li key={i} className="flex items-center gap-2">
-                  <span
-                    className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                      enabled ? 'bg-green-500' : 'bg-gray-600'
-                    }`}
-                  />
-                  <div className="min-w-0 flex-1">
-                    <p className="text-xs text-gray-300 truncate">{name}</p>
-                    <p className="text-[10px] text-gray-500">{cType}</p>
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
+        {!connector.enabled && (
+          <span className="text-[9px] text-gray-600 flex-shrink-0">disabled</span>
         )}
       </div>
 
-      {/* Alert Feed fills remaining space */}
-      <div className="flex-1 overflow-hidden flex flex-col min-h-0">
-        <AlertFeed />
+      {connector.enabled && (
+        <div className="mt-2 grid grid-cols-3 gap-1">
+          <div className="text-center">
+            <div className="text-[11px] font-mono text-blue-300">
+              {connector.stats.events_per_sec.toFixed(1)}
+            </div>
+            <div className="text-[8px] text-gray-600">evt/s</div>
+          </div>
+          <div className="text-center">
+            <div className="text-[11px] font-mono text-gray-300">
+              {connector.stats.error_count > 0 ? (
+                <span className="text-red-400">{connector.stats.error_count}</span>
+              ) : (
+                <span className="text-green-400">0</span>
+              )}
+            </div>
+            <div className="text-[8px] text-gray-600">errors</div>
+          </div>
+          <div className="text-center">
+            <div className="text-[10px] font-mono text-gray-400 truncate">
+              {formatLastEvent(connector.stats.last_event_at)}
+            </div>
+            <div className="text-[8px] text-gray-600">last evt</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface SectionProps {
+  title: string;
+  badge?: number;
+  collapsed: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
+}
+
+function Section({ title, badge, collapsed, onToggle, children }: SectionProps) {
+  return (
+    <div className="flex flex-col min-h-0">
+      <button
+        onClick={onToggle}
+        className="flex items-center justify-between px-3 py-2 hover:bg-gray-800/50 transition-colors flex-shrink-0 group"
+      >
+        <div className="flex items-center gap-2">
+          <span className={`text-[9px] text-gray-600 transition-transform ${collapsed ? '' : 'rotate-90'}`}>▶</span>
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-500 group-hover:text-gray-400">
+            {title}
+          </span>
+          {badge != null && badge > 0 && (
+            <span className="text-[9px] bg-red-900/70 border border-red-800/60 text-red-300 rounded-full px-1.5 min-w-[18px] text-center">
+              {badge}
+            </span>
+          )}
+        </div>
+      </button>
+      {!collapsed && (
+        <div className="flex-1 overflow-y-auto orp-scrollbar min-h-0 px-3 pb-3">
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export const Sidebar: React.FC = () => {
+  const sidebarOpen = useAppStore((s) => s.sidebarOpen);
+  const sidebarSections = useAppStore((s) => s.sidebarSections);
+  const toggleSidebarSection = useAppStore((s) => s.toggleSidebarSection);
+  const alerts = useAppStore((s) => s.alerts);
+  const wsConnected = useAppStore((s) => s.wsConnected);
+  const showHeatmapLayer = useAppStore((s) => s.showHeatmapLayer);
+  const showWeatherLayer = useAppStore((s) => s.showWeatherLayer);
+  const showShipTracksLayer = useAppStore((s) => s.showShipTracksLayer);
+  const toggleHeatmapLayer = useAppStore((s) => s.toggleHeatmapLayer);
+  const toggleWeatherLayer = useAppStore((s) => s.toggleWeatherLayer);
+  const toggleShipTracksLayer = useAppStore((s) => s.toggleShipTracksLayer);
+
+  const [connectors, setConnectors] = useState<Connector[]>(MOCK_CONNECTORS);
+
+  const unackedAlerts = alerts.filter((a) => !a.acknowledged).length;
+
+  // Attempt to fetch real connectors
+  useEffect(() => {
+    fetch(`${API_BASE}/connectors`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => {
+        if (Array.isArray((data as { data?: Connector[] })?.data)) {
+          setConnectors((data as { data: Connector[] }).data);
+        }
+      })
+      .catch(() => {/* use mock */});
+  }, []);
+
+  const section = (id: 'datasources' | 'query' | 'alerts') =>
+    sidebarSections.find((s) => s.id === id) ?? { collapsed: false };
+
+  if (!sidebarOpen) return null;
+
+  return (
+    <div className="flex-shrink-0 w-72 bg-gray-900 border-r border-gray-800 flex flex-col overflow-hidden">
+      {/* Layer Toggles */}
+      <div className="flex-shrink-0 px-3 py-2 border-b border-gray-800">
+        <div className="text-[9px] uppercase tracking-wider text-gray-600 mb-1.5 font-semibold">
+          Layers
+        </div>
+        <div className="flex gap-1.5 flex-wrap">
+          {[
+            { label: 'Weather', active: showWeatherLayer, toggle: toggleWeatherLayer },
+            { label: 'Tracks', active: showShipTracksLayer, toggle: toggleShipTracksLayer },
+            { label: 'Heatmap', active: showHeatmapLayer, toggle: toggleHeatmapLayer },
+          ].map(({ label, active, toggle }) => (
+            <button
+              key={label}
+              onClick={toggle}
+              className={`text-[9px] px-2 py-0.5 rounded border transition-colors ${
+                active
+                  ? 'bg-blue-900/50 border-blue-700 text-blue-300'
+                  : 'border-gray-700 text-gray-600 hover:border-gray-600 hover:text-gray-400'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
-    </aside>
+
+      {/* Sections */}
+      <div className="flex-1 flex flex-col min-h-0 divide-y divide-gray-800">
+        <Section
+          title="Data Sources"
+          collapsed={section('datasources').collapsed}
+          onToggle={() => toggleSidebarSection('datasources')}
+        >
+          <div className="space-y-2 pt-1">
+            {connectors.map((c) => (
+              <ConnectorCard key={c.id} connector={c} />
+            ))}
+          </div>
+        </Section>
+
+        <Section
+          title="Query"
+          collapsed={section('query').collapsed}
+          onToggle={() => toggleSidebarSection('query')}
+        >
+          <div className="pt-1">
+            <QueryBar />
+          </div>
+        </Section>
+
+        <Section
+          title="Alerts"
+          badge={unackedAlerts}
+          collapsed={section('alerts').collapsed}
+          onToggle={() => toggleSidebarSection('alerts')}
+        >
+          <div className="pt-1 flex flex-col flex-1 min-h-0" style={{ height: 220 }}>
+            <AlertFeed />
+          </div>
+        </Section>
+      </div>
+
+      {/* Footer */}
+      <div className="flex-shrink-0 px-3 py-2 border-t border-gray-800 flex items-center gap-2">
+        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${wsConnected ? 'bg-green-500' : 'bg-red-500'}`} />
+        <span className="text-[9px] text-gray-600">
+          {wsConnected ? 'WS connected' : 'WS disconnected'}
+        </span>
+      </div>
+    </div>
   );
 };
-
-function formatUptime(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
-  return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`;
-}

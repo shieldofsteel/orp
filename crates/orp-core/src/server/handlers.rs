@@ -80,7 +80,7 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResp
     };
     let db_latency = start.elapsed().as_secs_f64() * 1000.0;
 
-    let _proc_stats = state.processor.stats().await;
+    let _proc_stats = state.processor.stats();
     let uptime = state.started_at.elapsed().as_secs();
 
     Json(HealthResponse {
@@ -111,7 +111,7 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResp
 
 pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
     let stats = state.storage.get_stats().await.unwrap_or_default();
-    let proc_stats = state.processor.stats().await;
+    let proc_stats = state.processor.stats();
     let uptime = state.started_at.elapsed().as_secs();
     let alert_count = state.monitor_engine.get_alerts(10000).await.len();
 
@@ -187,7 +187,7 @@ struct EntityResponse {
     name: Option<String>,
     properties: HashMap<String, serde_json::Value>,
     geometry: Option<GeoJsonPoint>,
-    confidence: f32,
+    confidence: f64,
     is_active: bool,
     created_at: String,
     updated_at: String,
@@ -270,7 +270,7 @@ pub struct CreateEntityRequest {
     name: Option<String>,
     properties: Option<HashMap<String, serde_json::Value>>,
     geometry: Option<CreateGeoJson>,
-    confidence: Option<f32>,
+    confidence: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -609,7 +609,7 @@ pub struct CreateRelationshipRequest {
     #[serde(rename = "type")]
     rel_type: String,
     properties: Option<HashMap<String, serde_json::Value>>,
-    confidence: Option<f32>,
+    confidence: Option<f64>,
 }
 
 pub async fn create_relationship(
@@ -752,7 +752,7 @@ pub struct CreateConnectorRequest {
     connector_type: String,
     url: Option<String>,
     entity_type: String,
-    trust_score: Option<f32>,
+    trust_score: Option<f64>,
 }
 
 pub async fn create_connector(

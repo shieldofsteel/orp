@@ -1,102 +1,171 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import { useAppStore } from '../store/useAppStore';
-import { useAlerts } from '../hooks/useEntities';
+import type { AlertEvent } from '../types';
 
-const SEVERITY_STYLES: Record<string, string> = {
-  critical: 'bg-red-900/30 border-red-700 text-red-300',
-  warning: 'bg-yellow-900/30 border-yellow-700 text-yellow-300',
-  info: 'bg-blue-900/30 border-blue-700 text-blue-300',
+const SEVERITY_CONFIG = {
+  critical: {
+    badge: 'bg-red-900/80 text-red-300 border border-red-700',
+    indicator: 'bg-red-500',
+    border: 'border-l-red-500',
+    label: 'CRIT',
+  },
+  warning: {
+    badge: 'bg-amber-900/70 text-amber-300 border border-amber-700',
+    indicator: 'bg-amber-400',
+    border: 'border-l-amber-400',
+    label: 'WARN',
+  },
+  info: {
+    badge: 'bg-blue-900/60 text-blue-300 border border-blue-700',
+    indicator: 'bg-blue-400',
+    border: 'border-l-blue-400',
+    label: 'INFO',
+  },
 };
 
-const SEVERITY_DOT: Record<string, string> = {
-  critical: 'bg-red-500',
-  warning: 'bg-yellow-500',
-  info: 'bg-blue-500',
-};
+function formatTimestamp(ts: string): string {
+  const d = new Date(ts);
+  const now = Date.now();
+  const diffMs = now - d.getTime();
+  if (diffMs < 60_000) return 'just now';
+  if (diffMs < 3_600_000) return `${Math.floor(diffMs / 60_000)}m ago`;
+  if (diffMs < 86_400_000) return `${Math.floor(diffMs / 3_600_000)}h ago`;
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
 
-export const AlertFeed: React.FC = () => {
-  const alerts = useAppStore((s) => s.alerts);
-  const selectEntity = useAppStore((s) => s.selectEntity);
-  const { data: serverAlerts } = useAlerts(50);
+interface AlertCardProps {
+  alert: AlertEvent;
+  onAck: (id: string) => void;
+  onSelectEntity: (id: string) => void;
+}
 
-  // Merge local WS alerts with server-fetched alerts
-  const allAlerts = React.useMemo(() => {
-    const wsAlerts = alerts;
-    const fetched = (serverAlerts?.data ?? []).map((a) => ({
-      id: (a.alert_id as string) ?? String(Math.random()),
-      monitor_id: (a.rule_id as string) ?? '',
-      monitor_name: (a.rule_name as string) ?? '',
-      severity: ((a.severity as string) ?? 'info').toLowerCase() as 'info' | 'warning' | 'critical',
-      affected_entities: (a.affected_entities as Array<{ entity_id: string; entity_type: string; reason: string }>) ?? [],
-      timestamp: (a.timestamp as string) ?? new Date().toISOString(),
-      acknowledged: (a.acknowledged as boolean) ?? false,
-    }));
-
-    // Deduplicate by id
-    const seen = new Set(wsAlerts.map((a) => a.id));
-    return [
-      ...wsAlerts,
-      ...fetched.filter((a) => !seen.has(a.id)),
-    ].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-  }, [alerts, serverAlerts]);
+function AlertCard({ alert, onAck, onSelectEntity }: AlertCardProps) {
+  const cfg = SEVERITY_CONFIG[alert.severity] ?? SEVERITY_CONFIG.info;
+  const firstEntity = alert.affected_entities[0];
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="px-3 py-2 border-b border-gray-800 flex items-center justify-between">
-        <h3 className="text-xs font-medium text-gray-400 uppercase tracking-wide">
-          Alerts
-        </h3>
-        {allAlerts.length > 0 && (
-          <span className="text-[10px] bg-red-600 text-white px-1.5 py-0.5 rounded-full font-medium">
-            {allAlerts.length}
+    <div
+      className={`border-l-2 ${cfg.border} bg-gray-800/60 hover:bg-gray-800 rounded-r-md p-2.5 transition-colors ${
+        alert.acknowledged ? 'opacity-50' : ''
+      }`}
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex items-start gap-2 min-w-0">
+          <span className={`mt-0.5 flex-shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold tracking-wider ${cfg.badge}`}>
+            {cfg.label}
           </span>
+          <div className="min-w-0">
+            <div className="text-xs font-medium text-gray-200 truncate">{alert.monitor_name}</div>
+            {firstEntity && (
+              <button
+                onClick={() => onSelectEntity(firstEntity.entity_id)}
+                className="mt-0.5 text-[10px] text-blue-400 hover:text-blue-300 truncate block text-left"
+              >
+                {firstEntity.entity_id}
+              </button>
+            )}
+            {firstEntity?.reason && (
+              <div className="mt-0.5 text-[10px] text-gray-500 truncate">{firstEntity.reason}</div>
+            )}
+            {alert.affected_entities.length > 1 && (
+              <div className="mt-0.5 text-[10px] text-gray-500">
+                +{alert.affected_entities.length - 1} more entities
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="flex flex-col items-end gap-1 flex-shrink-0">
+          <span className="text-[9px] text-gray-500 whitespace-nowrap">
+            {formatTimestamp(alert.timestamp)}
+          </span>
+          {!alert.acknowledged && (
+            <button
+              onClick={() => onAck(alert.id)}
+              className="text-[9px] text-gray-500 hover:text-gray-300 border border-gray-700 hover:border-gray-500 rounded px-1.5 py-0.5 transition-colors"
+            >
+              ACK
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface AlertFeedProps {
+  maxVisible?: number;
+}
+
+export const AlertFeed: React.FC<AlertFeedProps> = ({ maxVisible = 50 }) => {
+  const alerts = useAppStore((s) => s.alerts);
+  const acknowledgeAlert = useAppStore((s) => s.acknowledgeAlert);
+  const clearAlerts = useAppStore((s) => s.clearAlerts);
+  const selectEntity = useAppStore((s) => s.selectEntity);
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const autoScrollRef = useRef(true);
+
+  // Auto-scroll to top when new alert arrives (alerts are prepended)
+  useEffect(() => {
+    if (autoScrollRef.current && scrollRef.current) {
+      scrollRef.current.scrollTop = 0;
+    }
+  }, [alerts.length]);
+
+  const visible = alerts.slice(0, maxVisible);
+  const unacknowledged = alerts.filter((a) => !a.acknowledged).length;
+  const critical = alerts.filter((a) => a.severity === 'critical' && !a.acknowledged).length;
+
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-2 px-0.5">
+        <div className="flex items-center gap-2">
+          {critical > 0 && (
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500" />
+            </span>
+          )}
+          <span className="text-[10px] text-gray-500">
+            {unacknowledged > 0 ? (
+              <span className="text-amber-400">{unacknowledged} unacked</span>
+            ) : (
+              'All clear'
+            )}
+          </span>
+        </div>
+        {alerts.length > 0 && (
+          <button
+            onClick={clearAlerts}
+            className="text-[9px] text-gray-600 hover:text-gray-400 transition-colors"
+          >
+            Clear all
+          </button>
         )}
       </div>
-      <div className="flex-1 overflow-y-auto">
-        {allAlerts.length === 0 ? (
-          <div className="p-3 text-xs text-gray-500 text-center">
+
+      {/* Feed */}
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto orp-scrollbar space-y-1.5 min-h-0"
+        onScroll={(e) => {
+          autoScrollRef.current = (e.currentTarget.scrollTop < 50);
+        }}
+      >
+        {visible.length === 0 ? (
+          <div className="text-center py-6 text-[10px] text-gray-600">
             No alerts
           </div>
         ) : (
-          <ul className="divide-y divide-gray-800/50">
-            {allAlerts.slice(0, 50).map((alert) => (
-              <li
-                key={alert.id}
-                className={`px-3 py-2 border-l-2 ${
-                  SEVERITY_STYLES[alert.severity] ?? SEVERITY_STYLES.info
-                }`}
-              >
-                <div className="flex items-start gap-2">
-                  <span
-                    className={`w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0 ${
-                      SEVERITY_DOT[alert.severity] ?? SEVERITY_DOT.info
-                    }`}
-                  />
-                  <div className="min-w-0 flex-1">
-                    <p className="text-xs font-medium truncate">
-                      {alert.monitor_name || 'Alert'}
-                    </p>
-                    {alert.affected_entities?.length > 0 && (
-                      <div className="mt-0.5">
-                        {alert.affected_entities.slice(0, 3).map((ae, i) => (
-                          <button
-                            key={i}
-                            onClick={() => selectEntity(ae.entity_id)}
-                            className="text-[10px] text-blue-400 hover:text-blue-300 mr-2 underline"
-                          >
-                            {ae.entity_id}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                    <p className="text-[10px] text-gray-500 mt-0.5">
-                      {new Date(alert.timestamp).toLocaleTimeString()}
-                    </p>
-                  </div>
-                </div>
-              </li>
-            ))}
-          </ul>
+          visible.map((alert) => (
+            <AlertCard
+              key={alert.id}
+              alert={alert}
+              onAck={acknowledgeAlert}
+              onSelectEntity={selectEntity}
+            />
+          ))
         )}
       </div>
     </div>

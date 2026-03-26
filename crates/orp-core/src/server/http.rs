@@ -16,7 +16,7 @@ use tower_http::trace::TraceLayer;
 pub struct AppState {
     pub storage: Arc<dyn Storage>,
     pub query_executor: Arc<QueryExecutor>,
-    pub processor: Arc<StreamProcessor>,
+    pub processor: Arc<dyn StreamProcessor>,
     pub monitor_engine: Arc<MonitorEngine>,
     pub started_at: std::time::Instant,
 }
@@ -24,7 +24,7 @@ pub struct AppState {
 pub async fn start_server(
     storage: Arc<dyn Storage>,
     query_executor: Arc<QueryExecutor>,
-    processor: Arc<StreamProcessor>,
+    processor: Arc<dyn StreamProcessor>,
     monitor_engine: Arc<MonitorEngine>,
     port: u16,
 ) -> Result<()> {

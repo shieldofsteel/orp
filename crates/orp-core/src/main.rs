@@ -1,4 +1,6 @@
 mod cli;
+pub mod error;
+pub mod retry;
 mod server;
 
 use anyhow::Result;

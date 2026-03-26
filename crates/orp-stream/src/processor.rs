@@ -1,18 +1,36 @@
-use orp_proto::{Entity, Event, GeoPoint, OrpEvent, EventPayload};
-use orp_storage::traits::{Storage, StorageResult};
-use std::collections::HashMap;
+//! Stream processor — deduplicates, batches, and persists ORP events.
+//!
+//! Uses `RocksDbDedupWindow` for crash-safe deduplication and exposes
+//! the `StreamProcessor` trait for testability / mock injection.
+
+use crate::dedup::{DedupError, RocksDbDedupWindow};
+use crate::dlq::DeadLetterQueue;
+use async_trait::async_trait;
+use orp_proto::{Entity, Event, EventPayload, GeoPoint, OrpEvent};
+use orp_storage::traits::{Storage, StorageError};
+use serde_json::json;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::sync::Mutex;
 
-/// Stream processor: deduplicates, batches, and stores events
-pub struct StreamProcessor {
-    storage: Arc<dyn Storage>,
-    dedup_window: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
-    buffer: Mutex<Vec<OrpEvent>>,
-    batch_size: usize,
-    dedup_window_seconds: i64,
-    stats: Mutex<ProcessorStats>,
+// ── Errors ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum ProcessorError {
+    #[error("Storage error: {0}")]
+    Storage(#[from] StorageError),
+    #[error("Dedup error: {0}")]
+    Dedup(#[from] DedupError),
+    #[error("Serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("Processor error: {0}")]
+    Other(String),
 }
+
+pub type ProcessorResult<T> = Result<T, ProcessorError>;
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Default)]
 pub struct ProcessorStats {
@@ -20,85 +38,91 @@ pub struct ProcessorStats {
     pub events_deduplicated: u64,
     pub events_stored: u64,
     pub errors: u64,
+    /// Rolling average latency in milliseconds per stored event.
+    pub average_latency_ms: f64,
 }
 
-impl StreamProcessor {
-    pub fn new(storage: Arc<dyn Storage>, batch_size: usize, dedup_window_seconds: i64) -> Self {
+// ── Context ───────────────────────────────────────────────────────────────────
+
+/// Carries an event and processing parameters through the pipeline.
+#[derive(Clone, Debug)]
+pub struct StreamContext {
+    pub event: OrpEvent,
+    pub dedup_window_seconds: u64,
+    pub batch_size: usize,
+}
+
+// ── Trait ─────────────────────────────────────────────────────────────────────
+
+/// Canonical interface for stream processors.
+#[async_trait]
+pub trait StreamProcessor: Send + Sync {
+    /// Process a single event (dedup → buffer → maybe flush).
+    async fn process_event(&self, ctx: StreamContext) -> ProcessorResult<()>;
+
+    /// Force-flush the internal buffer to storage immediately.
+    async fn flush(&self) -> ProcessorResult<()>;
+
+    /// Current number of buffered (not-yet-flushed) events.
+    fn buffer_size(&self) -> usize;
+
+    /// Processing statistics snapshot.
+    fn stats(&self) -> ProcessorStats;
+}
+
+// ── Default implementation ────────────────────────────────────────────────────
+
+/// Concrete stream processor backed by RocksDB dedup window + optional DLQ.
+pub struct DefaultStreamProcessor {
+    storage: Arc<dyn Storage>,
+    dedup: Arc<RocksDbDedupWindow>,
+    dlq: Option<Arc<DeadLetterQueue>>,
+    buffer: Mutex<Vec<OrpEvent>>,
+    default_batch_size: usize,
+    stats: Mutex<ProcessorStats>,
+    /// Latency accumulator for rolling average.
+    latency_sum_ms: Mutex<f64>,
+    latency_count: Mutex<u64>,
+}
+
+impl DefaultStreamProcessor {
+    /// Create a new processor.
+    ///
+    /// `dedup`      — pre-opened RocksDB dedup window.
+    /// `dlq`        — optional dead-letter queue for failed events.
+    /// `batch_size` — flush to storage after this many events are buffered.
+    pub fn new(
+        storage: Arc<dyn Storage>,
+        dedup: Arc<RocksDbDedupWindow>,
+        dlq: Option<Arc<DeadLetterQueue>>,
+        batch_size: usize,
+    ) -> Self {
         Self {
             storage,
-            dedup_window: Mutex::new(HashMap::new()),
+            dedup,
+            dlq,
             buffer: Mutex::new(Vec::new()),
-            batch_size,
-            dedup_window_seconds,
+            default_batch_size: batch_size,
             stats: Mutex::new(ProcessorStats::default()),
+            latency_sum_ms: Mutex::new(0.0),
+            latency_count: Mutex::new(0),
         }
     }
 
-    /// Process a single OrpEvent from a connector
-    pub async fn process_event(&self, event: OrpEvent) -> StorageResult<()> {
-        let mut stats = self.stats.lock().await;
-        stats.events_processed += 1;
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-        // Dedup check
-        let dedup_key = format!("{}:{}:{}", event.entity_id, event.event_type, event.source_id);
-        {
-            let mut dedup = self.dedup_window.lock().await;
-            if let Some(last_seen) = dedup.get(&dedup_key) {
-                let elapsed = (event.event_timestamp - *last_seen).num_seconds();
-                if elapsed < self.dedup_window_seconds {
-                    stats.events_deduplicated += 1;
-                    return Ok(());
-                }
-            }
-            dedup.insert(dedup_key, event.event_timestamp);
-        }
-
-        // Buffer the event
-        let should_flush = {
-            let mut buffer = self.buffer.lock().await;
-            buffer.push(event);
-            buffer.len() >= self.batch_size
-        };
-
-        if should_flush {
-            drop(stats);
-            self.flush().await?;
-        }
-
-        Ok(())
+    /// Compute a stable hash of the event payload (for dedup key).
+    fn event_hash(event: &OrpEvent) -> String {
+        // Use event_type + source_id + payload JSON as hash input.
+        let payload_str = serde_json::to_string(&event.payload).unwrap_or_default();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        event.event_type_str().hash(&mut hasher);
+        event.source_id.hash(&mut hasher);
+        payload_str.hash(&mut hasher);
+        format!("{:x}", hasher.finish())
     }
 
-    /// Flush buffered events to storage
-    pub async fn flush(&self) -> StorageResult<()> {
-        let events: Vec<OrpEvent> = {
-            let mut buffer = self.buffer.lock().await;
-            std::mem::take(&mut *buffer)
-        };
-
-        for event in &events {
-            // Upsert entity from event
-            self.upsert_entity_from_event(event).await?;
-
-            // Store the event itself
-            let stored_event = Event {
-                event_id: event.event_id.clone(),
-                entity_id: event.entity_id.clone(),
-                event_type: event.event_type.clone(),
-                event_timestamp: event.event_timestamp,
-                source_id: event.source_id.clone(),
-                data: serde_json::to_value(&event.payload).unwrap_or_default(),
-                confidence: event.confidence,
-            };
-            self.storage.insert_event(&stored_event).await?;
-        }
-
-        let mut stats = self.stats.lock().await;
-        stats.events_stored += events.len() as u64;
-
-        Ok(())
-    }
-
-    async fn upsert_entity_from_event(&self, event: &OrpEvent) -> StorageResult<()> {
+    async fn upsert_entity(&self, event: &OrpEvent) -> ProcessorResult<()> {
         let mut entity = self
             .storage
             .get_entity(&event.entity_id)
@@ -109,7 +133,6 @@ impl StreamProcessor {
                 ..Entity::default()
             });
 
-        // Update geometry and properties based on payload
         match &event.payload {
             EventPayload::PositionUpdate {
                 latitude,
@@ -118,128 +141,327 @@ impl StreamProcessor {
                 speed_knots,
                 heading_degrees,
                 course_degrees,
+                ..
             } => {
                 entity.geometry = Some(GeoPoint {
                     lat: *latitude,
                     lon: *longitude,
                     alt: *altitude,
                 });
-                if let Some(speed) = speed_knots {
-                    entity
-                        .properties
-                        .insert("speed".to_string(), serde_json::json!(speed));
+                if let Some(v) = speed_knots {
+                    entity.properties.insert("speed".into(), json!(v));
                 }
-                if let Some(heading) = heading_degrees {
-                    entity
-                        .properties
-                        .insert("heading".to_string(), serde_json::json!(heading));
+                if let Some(v) = heading_degrees {
+                    entity.properties.insert("heading".into(), json!(v));
                 }
-                if let Some(course) = course_degrees {
-                    entity
-                        .properties
-                        .insert("course".to_string(), serde_json::json!(course));
+                if let Some(v) = course_degrees {
+                    entity.properties.insert("course".into(), json!(v));
                 }
             }
             EventPayload::PropertyChange {
-                property_key,
+                key,
                 new_value,
                 ..
             } => {
-                entity
-                    .properties
-                    .insert(property_key.clone(), new_value.clone());
+                entity.properties.insert(key.clone(), new_value.clone());
             }
             _ => {}
         }
 
-        entity.last_updated = event.event_timestamp;
+        entity.last_updated = event.timestamp;
         entity.confidence = event.confidence;
-
         self.storage.insert_entity(&entity).await?;
         Ok(())
     }
 
-    pub async fn stats(&self) -> ProcessorStats {
-        self.stats.lock().await.clone()
+    async fn store_event(&self, event: &OrpEvent) -> ProcessorResult<()> {
+        let stored = Event {
+            event_id: event.id.to_string(),
+            entity_id: event.entity_id.clone(),
+            event_type: event.event_type_str().to_string(),
+            event_timestamp: event.timestamp,
+            source_id: event.source_id.clone(),
+            data: serde_json::to_value(&event.payload)?,
+            confidence: event.confidence,
+        };
+        self.storage.insert_event(&stored).await?;
+        Ok(())
     }
 
-    pub async fn buffer_size(&self) -> usize {
-        self.buffer.lock().await.len()
-    }
-
-    /// Clean expired entries from dedup window
-    pub async fn clean_dedup_window(&self) {
-        let now = chrono::Utc::now();
-        let mut dedup = self.dedup_window.lock().await;
-        dedup.retain(|_, ts| (now - *ts).num_seconds() < self.dedup_window_seconds * 2);
+    async fn update_latency(&self, latency_ms: f64) {
+        let mut sum = self.latency_sum_ms.lock().await;
+        let mut count = self.latency_count.lock().await;
+        *sum += latency_ms;
+        *count += 1;
+        let mut stats = self.stats.lock().await;
+        stats.average_latency_ms = *sum / (*count as f64);
     }
 }
+
+#[async_trait]
+impl StreamProcessor for DefaultStreamProcessor {
+    async fn process_event(&self, ctx: StreamContext) -> ProcessorResult<()> {
+        let start = std::time::Instant::now();
+        let event = ctx.event;
+
+        {
+            let mut stats = self.stats.lock().await;
+            stats.events_processed += 1;
+        }
+
+        // Dedup check.
+        let hash = Self::event_hash(&event);
+        match self.dedup.is_duplicate(&event.entity_id, &hash) {
+            Ok(true) => {
+                let mut stats = self.stats.lock().await;
+                stats.events_deduplicated += 1;
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!("Dedup check failed (proceeding): {}", e);
+            }
+        }
+
+        // Buffer the event.
+        let batch_size = ctx.batch_size.max(self.default_batch_size);
+        let should_flush = {
+            let mut buf = self.buffer.lock().await;
+            buf.push(event);
+            buf.len() >= batch_size
+        };
+
+        if should_flush {
+            self.flush().await?;
+        }
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        self.update_latency(elapsed_ms).await;
+        Ok(())
+    }
+
+    async fn flush(&self) -> ProcessorResult<()> {
+        let events: Vec<OrpEvent> = {
+            let mut buf = self.buffer.lock().await;
+            std::mem::take(&mut *buf)
+        };
+
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut stored = 0u64;
+        let mut errors = 0u64;
+
+        for event in &events {
+            let result: ProcessorResult<()> = async {
+                self.upsert_entity(event).await?;
+                self.store_event(event).await?;
+                Ok(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => stored += 1,
+                Err(e) => {
+                    errors += 1;
+                    tracing::error!(
+                        event_id = %event.id,
+                        entity_id = %event.entity_id,
+                        error = %e,
+                        "StreamProcessor: failed to store event"
+                    );
+                    if let Some(dlq) = &self.dlq {
+                        let payload = serde_json::to_vec(event).unwrap_or_default();
+                        let _ = dlq.record_failure(
+                            &event.id.to_string(),
+                            &payload,
+                            &e.to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut stats = self.stats.lock().await;
+        stats.events_stored += stored;
+        stats.errors += errors;
+        Ok(())
+    }
+
+    fn buffer_size(&self) -> usize {
+        // Non-async snapshot — try_lock to avoid blocking.
+        self.buffer.try_lock().map(|b| b.len()).unwrap_or(0)
+    }
+
+    fn stats(&self) -> ProcessorStats {
+        self.stats.try_lock().map(|s| s.clone()).unwrap_or_default()
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orp_proto::EventPayload;
     use orp_storage::DuckDbStorage;
+    use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn test_process_event() {
+    fn make_processor(
+        batch_size: usize,
+        dedup_secs: u64,
+    ) -> (DefaultStreamProcessor, TempDir, TempDir) {
+        let dedup_dir = TempDir::new().unwrap();
+        let dlq_dir = TempDir::new().unwrap();
         let storage = Arc::new(DuckDbStorage::new_in_memory().unwrap());
-        let processor = StreamProcessor::new(storage.clone(), 1, 5);
+        let dedup = Arc::new(RocksDbDedupWindow::open(dedup_dir.path(), dedup_secs).unwrap());
+        let dlq = Arc::new(DeadLetterQueue::open(dlq_dir.path()).unwrap());
+        let p = DefaultStreamProcessor::new(storage, dedup, Some(dlq), batch_size);
+        (p, dedup_dir, dlq_dir)
+    }
 
-        let event = OrpEvent::new(
-            "ship-1".to_string(),
+    fn pos_event(entity_id: &str) -> OrpEvent {
+        OrpEvent::new(
+            entity_id.to_string(),
             "ship".to_string(),
-            "position_update".to_string(),
             EventPayload::PositionUpdate {
                 latitude: 51.92,
                 longitude: 4.47,
                 altitude: None,
+                accuracy_meters: None,
                 speed_knots: Some(12.0),
                 heading_degrees: Some(180.0),
                 course_degrees: Some(185.0),
             },
-            "ais-connector".to_string(),
+            "ais".to_string(),
             0.95,
-        );
+        )
+    }
 
-        processor.process_event(event).await.unwrap();
-
-        let stats = processor.stats().await;
-        assert_eq!(stats.events_processed, 1);
-        assert_eq!(stats.events_stored, 1);
-
-        // Entity should exist now
-        let entity = storage.get_entity("ship-1").await.unwrap();
-        assert!(entity.is_some());
+    fn make_ctx(event: OrpEvent, batch_size: usize) -> StreamContext {
+        StreamContext {
+            event,
+            dedup_window_seconds: 60,
+            batch_size,
+        }
     }
 
     #[tokio::test]
-    async fn test_dedup() {
-        let storage = Arc::new(DuckDbStorage::new_in_memory().unwrap());
-        let processor = StreamProcessor::new(storage.clone(), 10, 60);
+    async fn test_process_single_event() {
+        let (p, _dd, _dq) = make_processor(1, 60);
+        p.process_event(make_ctx(pos_event("ship-1"), 1))
+            .await
+            .unwrap();
+        assert_eq!(p.stats().events_processed, 1);
+        assert_eq!(p.stats().events_stored, 1);
+    }
 
-        let event1 = OrpEvent::new(
+    #[tokio::test]
+    async fn test_dedup_suppresses_duplicate() {
+        let (p, _dd, _dq) = make_processor(10, 60);
+        let ev = pos_event("ship-1");
+        p.process_event(make_ctx(ev.clone(), 10)).await.unwrap();
+        p.process_event(make_ctx(ev.clone(), 10)).await.unwrap();
+        assert_eq!(p.stats().events_processed, 2);
+        assert_eq!(p.stats().events_deduplicated, 1);
+    }
+
+    #[tokio::test]
+    async fn test_flush_on_batch_size() {
+        let (p, _dd, _dq) = make_processor(5, 60);
+        for i in 0..5 {
+            let mut ev = pos_event(&format!("ship-{}", i));
+            // Give each a unique payload so dedup doesn't fire
+            ev.id = uuid::Uuid::now_v7();
+            p.process_event(make_ctx(ev, 5)).await.unwrap();
+        }
+        assert_eq!(p.stats().events_stored, 5);
+    }
+
+    #[tokio::test]
+    async fn test_manual_flush() {
+        let (p, _dd, _dq) = make_processor(100, 60);
+        let mut ev = pos_event("ship-1");
+        ev.id = uuid::Uuid::now_v7();
+        p.process_event(make_ctx(ev, 100)).await.unwrap();
+        assert_eq!(p.stats().events_stored, 0); // not flushed yet
+        p.flush().await.unwrap();
+        assert_eq!(p.stats().events_stored, 1);
+    }
+
+    #[tokio::test]
+    async fn test_average_latency_populated() {
+        let (p, _dd, _dq) = make_processor(1, 60);
+        p.process_event(make_ctx(pos_event("s1"), 1))
+            .await
+            .unwrap();
+        assert!(p.stats().average_latency_ms >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_size() {
+        let (p, _dd, _dq) = make_processor(100, 60);
+        assert_eq!(p.buffer_size(), 0);
+        let mut ev = pos_event("s1");
+        ev.id = uuid::Uuid::now_v7();
+        p.process_event(make_ctx(ev, 100)).await.unwrap();
+        assert_eq!(p.buffer_size(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_entity_created_from_event() {
+        let dedup_dir = TempDir::new().unwrap();
+        let storage = Arc::new(DuckDbStorage::new_in_memory().unwrap());
+        let dedup = Arc::new(RocksDbDedupWindow::open(dedup_dir.path(), 60).unwrap());
+        let p = DefaultStreamProcessor::new(storage.clone(), dedup, None, 1);
+
+        p.process_event(make_ctx(pos_event("ship-xyz"), 1))
+            .await
+            .unwrap();
+
+        let entity = storage.get_entity("ship-xyz").await.unwrap();
+        assert!(entity.is_some());
+        let e = entity.unwrap();
+        assert_eq!(e.entity_type, "ship");
+        assert!(e.geometry.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_property_change_event() {
+        let dedup_dir = TempDir::new().unwrap();
+        let storage = Arc::new(DuckDbStorage::new_in_memory().unwrap());
+        let dedup = Arc::new(RocksDbDedupWindow::open(dedup_dir.path(), 60).unwrap());
+        let p = DefaultStreamProcessor::new(storage.clone(), dedup, None, 1);
+
+        // First create entity
+        storage
+            .insert_entity(&Entity {
+                entity_id: "ship-1".into(),
+                entity_type: "ship".into(),
+                ..Entity::default()
+            })
+            .await
+            .unwrap();
+
+        let ev = OrpEvent::new(
             "ship-1".to_string(),
             "ship".to_string(),
-            "position_update".to_string(),
-            EventPayload::PositionUpdate {
-                latitude: 51.92,
-                longitude: 4.47,
-                altitude: None,
-                speed_knots: Some(12.0),
-                heading_degrees: None,
-                course_degrees: None,
+            EventPayload::PropertyChange {
+                key: "destination".to_string(),
+                old_value: None,
+                new_value: serde_json::json!("Rotterdam"),
+                is_derived: false,
             },
-            "ais".to_string(),
-            0.95,
+            "internal".to_string(),
+            0.99,
         );
+        p.process_event(make_ctx(ev, 1)).await.unwrap();
 
-        let event2 = event1.clone();
-
-        processor.process_event(event1).await.unwrap();
-        processor.process_event(event2).await.unwrap();
-
-        let stats = processor.stats().await;
-        assert_eq!(stats.events_processed, 2);
-        assert_eq!(stats.events_deduplicated, 1);
+        let entity = storage.get_entity("ship-1").await.unwrap().unwrap();
+        assert_eq!(
+            entity.properties.get("destination"),
+            Some(&serde_json::json!("Rotterdam"))
+        );
     }
 }

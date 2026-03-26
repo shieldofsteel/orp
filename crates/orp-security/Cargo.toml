@@ -9,3 +9,26 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+
+# JWT
+jsonwebtoken = "9"
+
+# HTTP client for OIDC discovery
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Encoding
+base64 = "0.22"
+hex = "0.4"
+
+# Async traits
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -5,6 +5,17 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Classification of query type for routing to the appropriate executor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryType {
+    /// Analytical query — routes to DuckDB
+    Analytical,
+    /// Graph traversal query — routes to Kuzu
+    Graph,
+    /// Hybrid query — both DuckDB and Kuzu
+    Hybrid,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct QueryResult {
     pub rows: Vec<HashMap<String, JsonValue>>,

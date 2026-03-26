@@ -229,15 +229,20 @@ impl MonitorEngine {
             AlertSeverity::Critical => EventSeverity::Critical,
         };
 
+        let alert_severity = match alert.severity {
+            AlertSeverity::Info => orp_proto::AlertSeverity::Info,
+            AlertSeverity::Warning => orp_proto::AlertSeverity::Warning,
+            AlertSeverity::Critical => orp_proto::AlertSeverity::Critical,
+        };
+
         let mut event = OrpEvent::new(
             alert.entity_id.clone(),
             alert.entity_type.clone(),
-            "alert_triggered".to_string(),
             EventPayload::AlertTriggered {
-                alert_rule_id: alert.rule_id.clone(),
-                alert_rule_name: alert.rule_name.clone(),
-                condition: format!("{:?}", alert.evidence),
+                monitor_id: alert.rule_id.clone(),
+                severity: alert_severity,
                 message: alert.message.clone(),
+                evidence: alert.evidence.clone(),
             },
             source_id.to_string(),
             1.0,
@@ -528,7 +533,7 @@ mod tests {
 
         let event = MonitorEngine::alert_to_event(&alert, "monitor-engine");
         assert_eq!(event.entity_id, "ship-1");
-        assert_eq!(event.event_type, "alert_triggered");
+        assert_eq!(event.event_type_str(), "alert_triggered");
         assert!(event.severity.is_some());
     }
 

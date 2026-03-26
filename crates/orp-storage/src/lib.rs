@@ -2,4 +2,4 @@ pub mod duckdb_engine;
 pub mod traits;
 
 pub use duckdb_engine::DuckDbStorage;
-pub use traits::Storage;
+pub use traits::{DataSource, Storage, StorageError, StorageResult, StorageStats};
