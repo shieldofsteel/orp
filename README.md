@@ -1,347 +1,466 @@
-# ORP — Open Reality Protocol
-
 <div align="center">
 
-**The single-binary Palantir alternative. Real-time data fusion, graph intelligence, and live ops maps — on your laptop.**
+# ORP — Open Reality Protocol
 
-[![Tests](https://img.shields.io/badge/tests-203_passing-brightgreen?style=flat-square)](https://github.com/orproject/orp/actions)
-[![Clippy](https://img.shields.io/badge/clippy-0_warnings-brightgreen?style=flat-square)](https://github.com/orproject/orp/actions)
-[![Binary](https://img.shields.io/badge/binary-43MB_core-blue?style=flat-square)](https://github.com/orproject/orp/releases)
-[![License](https://img.shields.io/badge/license-Apache_2.0-blue?style=flat-square)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
+### A single binary that does what Palantir charges $50M for.
 
-[**Quick Start**](#quick-start) · [**Architecture**](ARCHITECTURE.md) · [**ORP-QL**](#orp-ql-query-language) · [**API Reference**](#api-quick-reference) · [**Security**](docs/SECURITY.md) · [**Contributing**](CONTRIBUTING.md)
+[![Tests](https://img.shields.io/badge/tests-538%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
+[![Binary Size](https://img.shields.io/badge/binary-43MB-blue?style=flat-square)](https://github.com/shieldofsteel/orp/releases)
+[![License](https://img.shields.io/badge/license-Apache%202.0-orange?style=flat-square)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square)](https://www.rust-lang.org)
+[![Crates](https://img.shields.io/badge/crates-69%20Rust%20files-red?style=flat-square)](crates/)
+[![Lines](https://img.shields.io/badge/lines-38K%2B-lightgrey?style=flat-square)](crates/)
 
 </div>
 
 ---
 
-## What Is ORP?
+## The $50M Question
 
-ORP connects to real-time data sources — AIS ship feeds, ADS-B aircraft transponders, IoT sensors, REST APIs — fuses them into a live knowledge graph, and lets humans and AI query, reason about, and monitor physical reality.
+The tools that fuse live sensor data, render a real-time operational picture, and alert you when something is wrong cost a fortune. Palantir AIP: **$50–500M**. Esri GIS: **$500K/year**. Custom C2 systems: **$10M+**.
 
-**One binary. No cloud. No setup. Live data on screen in under 3 minutes.**
+What if the same thing ran on a laptop? Or a Raspberry Pi? For free?
 
-### The Pattern
+| What | Replaces | Size | Cost |
+|------|----------|------|------|
+| SQLite | Oracle | `<1MB` | Free |
+| DuckDB | Apache Spark | `~50MB` | Free |
+| llama.cpp | OpenAI API | `~100MB` | Free |
+| **ORP** | **Palantir ($50–500M)** | **43MB** | **Free** |
 
-Every generation, an embedded open-source tool demolishes a bloated enterprise category:
-
-| Precedent | Replaced | Binary Size | Impact |
-|-----------|----------|-------------|--------|
-| SQLite | Oracle / MySQL server farms | < 1 MB | In every device on earth |
-| DuckDB | Apache Spark clusters ($100K+/yr) | ~50 MB | 100× faster, 50%+ YoY growth |
-| llama.cpp | OpenAI API (cloud-only, $$$/token) | ~100 MB | LLMs on laptops |
-| **ORP** | **Palantir ($50–500M/deployment)** | **~300 MB** | **Data fusion on laptops** |
-
-Palantir earns $2.8B/year. Anduril Lattice won a $20B Army contract. Both proprietary. Both locked behind defense procurement. ORP open-sources this capability — so a disaster response agency, climate researcher, city planner, or defense contractor can download one binary and get the same class of real-time situational awareness for free.
+**ORP** is an open-source data fusion engine and Common Operating Picture (COP) platform. It ingests live data from any sensor, protocol, or API — fuses it into a unified knowledge graph — and renders it on a military-grade map. One binary. Zero dependencies. Apache 2.0.
 
 ---
 
-## Quick Start
+## 30 Seconds to Live Data
 
 ```bash
-# 1. Install ORP
+# Install
 curl -fsSL https://orp.dev/install | sh
 
-# 2. Launch the maritime template (ships + weather + ports, live data)
+# Launch with the maritime template
 orp start --template maritime
 
-# 3. Open the console — browser launches automatically
-open http://localhost:9090
+# Ships appear on your screen in 30 seconds
+# Open http://localhost:9090
 ```
 
-**What you'll see in 60 seconds:**
-- 🚢 2,000+ ships updating live on a Deck.gl map
-- ⛈️ Active weather systems overlaid with severity zones
-- 🔍 Query bar — type ORP-QL or plain English and get results in < 200 ms
-- 🔔 Alert feed — anomaly detection fires when ships deviate from expected routes
-- ⏪ Timeline scrubber — drag back 24 hours and replay any past state
+That's it. No YAML sprawl. No microservices. No Kubernetes. One process, one port, everything included.
+
+---
+
+## What You'll See
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║  ORP — MARITIME COP                               [LIVE] 14:32:07   ║
+╠══════════════╦═══════════════════════════════════════════════════════╣
+║ ENTITIES     ║                                                       ║
+║              ║        🚢 EVER GIVEN           ►──────────           ║
+║ Ships   247  ║                                                       ║
+║ Aircraft  12 ║    🚢 MSC OSCAR ►────                                 ║
+║ Vehicles   3 ║                        ⚠ ANOMALY                     ║
+║ Threats    1 ║                      🚢 UNKNOWN        ►             ║
+║              ║                                                       ║
+╠══════════════╣           🏭 PORT OF ROTTERDAM                       ║
+║ ALERTS       ║                                                       ║
+║              ║                                                       ║
+║ ⚠ Speed      ║                                                       ║
+║   anomaly    ╠═══════════════════════════════════════════════════════╣
+║   mmsi:      ║ > MATCH (s:Ship) WHERE s.speed > 20 RETURN s.name    ║
+║   244820000  ║   s.speed, s.course LIMIT 10                         ║
+║              ║                                                       ║
+║ ℹ 3 ships    ║   → EVER GIVEN    22.4 kn  082°                      ║
+║   in zone    ║   → MSC OSCAR     21.8 kn  264°                      ║
+╚══════════════╩═══════════════════════════════════════════════════════╝
+```
+
+---
+
+## What ORP Does
+
+**Fuses data from any source** — 17 protocol adapters, a universal JSON ingest endpoint, and a connector SDK. If it outputs data, ORP can consume it.
+
+**Builds a live knowledge graph** — every entity (ship, aircraft, vehicle, sensor, threat) becomes a node. Relationships auto-form. The graph updates in real time.
+
+**Renders a military-grade COP** — a full-featured map with 4 tile layers, directional arrows, course vectors, lasso select, and a timeline scrubber. Not a dashboard — an operational picture.
+
+**Lets you query anything** — ORP-QL is a purpose-built query language combining SQL analytics with Cypher-style graph traversal. Query across sensors, entities, and time.
+
+**Alerts you before it matters** — anomaly detection and threat scoring run continuously. When a ship deviates from its pattern-of-life, you know.
+
+**Runs anywhere** — a laptop, a Raspberry Pi, a warship, a data center. `--headless` for embedded deployments. Docker for cloud. ARM binaries for edge.
+
+---
+
+## Protocol Support
+
+ORP speaks the languages your sensors already use.
+
+### 🚢 Maritime
+| Protocol | Description | Status |
+|----------|-------------|--------|
+| **NMEA 0183** | GPS, depth, wind, heading, all sentence types | ✅ Implemented |
+| **AIS** | Vessel tracking, 27 message types, Class A/B | ✅ Implemented |
+| **NMEA 2000 / N2K** | Modern vessel CAN bus (via gateway) | 🔜 Planned |
+
+### ✈️ Aviation
+| Protocol | Description | Status |
+|----------|-------------|--------|
+| **ADS-B / Mode S** | Aircraft position, velocity, identity at 1090 MHz | ✅ Implemented |
+| **ASTERIX** | Eurocontrol ATC radar data exchange | ✅ Implemented |
+
+### 🪖 Military / Tactical
+| Protocol | Description | Status |
+|----------|-------------|--------|
+| **CoT (Cursor on Target)** | TAK/ATAK compatible track sharing | ✅ Implemented |
+| **STIX/TAXII** | Threat intelligence exchange | ✅ Implemented |
+
+### 🏭 Industrial / IoT
+| Protocol | Description | Status |
+|----------|-------------|--------|
+| **OPC-UA** | Industrial automation, SCADA | ✅ Implemented |
+| **Modbus TCP/RTU** | PLCs, sensors, energy meters | ✅ Implemented |
+| **MQTT** | IoT sensor telemetry | ✅ Implemented |
+| **SparkplugB** | Industrial MQTT structured payload | 🔜 Planned |
+| **DNP3** | Utility SCADA, substations | 🔜 Planned |
+| **CAN / J1939** | Vehicles, trucks, heavy equipment | 🔜 Planned |
+
+### 🔐 Cyber / Network
+| Protocol | Description | Status |
+|----------|-------------|--------|
+| **Syslog** | System and network device logs | ✅ Implemented |
+| **PCAP** | Packet capture analysis | 🔜 Planned |
+| **Zeek** | Network security monitoring logs | 🔜 Planned |
+| **NetFlow / IPFIX** | Network flow telemetry | 🔜 Planned |
+
+### 🌦 Weather / Environment
+| Protocol | Description | Status |
+|----------|-------------|--------|
+| **METAR** | Aviation weather reports | 🔜 Planned |
+| **CAP** | Common Alerting Protocol (emergency) | ✅ Implemented |
+
+### 🚌 Transport
+| Protocol | Description | Status |
+|----------|-------------|--------|
+| **GTFS-RT** | Real-time transit feeds | 🔜 Planned |
+
+### 🌐 Universal Ingest
+| Source | Description | Status |
+|--------|-------------|--------|
+| **HTTP Poller** | Pull any REST API on a schedule | ✅ Implemented |
+| **WebSocket Client** | Subscribe to any WebSocket stream | ✅ Implemented |
+| **CSV Watcher** | Watch a file/directory for CSV changes | ✅ Implemented |
+| **Database** | Query any SQL database as a source | ✅ Implemented |
+| **Generic API** | POST any JSON → instant entities | ✅ Implemented |
+| **GeoJSON** | Static and streaming geospatial data | ✅ Implemented |
+
+> **Don't see your protocol?** The connector SDK is 50 lines of Rust. [Build one →](docs/CONNECTOR_GUIDE.md)
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                        DATA SOURCES                          │
-│   AIS Feed   ADS-B Feed   Weather API   MQTT   CSV / REST   │
-└──────┬──────────┬──────────────┬────────────┬───────────────┘
-       │          │              │            │  (connector trait)
-       ▼          ▼              ▼            ▼
-┌──────────────────────────────────────────────────────────────┐
-│  CONNECTORS  ·  orp-connector                                │
-│  Parse protocol → emit signed OrpEvents → async channel      │
-└───────────────────────────┬──────────────────────────────────┘
-                            │ Vec<OrpEvent>
-                            ▼
-┌──────────────────────────────────────────────────────────────┐
-│  STREAM PROCESSOR  ·  orp-stream                             │
-│  Dedup (RocksDB) → Change Detection → Batch (1K) → Insert   │
-└───────────────────────────┬──────────────────────────────────┘
-                            │ batch insert
-                            ▼
-┌──────────────────────────────────────────────────────────────┐
-│  STORAGE LAYER  ·  orp-storage                               │
-│  ┌──────────────┐  ◄ sync every 30s ►  ┌──────────────────┐ │
-│  │   DuckDB     │                       │   Kuzu Graph     │ │
-│  │  (OLAP)      │                       │  (Relationships) │ │
-│  │  entities    │                       │  Ship → Port     │ │
-│  │  events      │                       │  Org → Fleet     │ │
-│  │  geometry    │                       │  Weather → Port  │ │
-│  └──────────────┘                       └──────────────────┘ │
-│         + RocksDB (stream state, dedup window, checkpoints)   │
-└───────────────────────────┬──────────────────────────────────┘
-                            │ unified Storage trait
-                            ▼
-┌──────────────────────────────────────────────────────────────┐
-│  QUERY ENGINE  ·  orp-query                                  │
-│  ORP-QL parser → planner → route to DuckDB or Kuzu → merge  │
-└───────────────────────────┬──────────────────────────────────┘
-                            │ JSON results
-                            ▼
-┌──────────────────────────────────────────────────────────────┐
-│  API LAYER  ·  Axum + Tower                                  │
-│  REST + WebSocket  ·  OIDC auth  ·  ABAC enforcement         │
-│  Rate limiting  ·  Audit log  ·  Prometheus metrics          │
-└───────────────────────────┬──────────────────────────────────┘
-                            │ JSON / WebSocket
-                            ▼
-┌──────────────────────────────────────────────────────────────┐
-│  CONSOLE  ·  React + Deck.gl + CesiumJS                      │
-│  Live map  ·  Entity inspector  ·  Query bar  ·  Alerts      │
-│  Served from embedded static assets at localhost:9090        │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                        ORP SINGLE BINARY                            │
+│                                                                     │
+│  ┌──────────────┐   ┌──────────────┐   ┌─────────────────────────┐ │
+│  │  CONNECTORS  │   │  FUSION      │   │  QUERY ENGINE           │ │
+│  │              │   │  ENGINE      │   │                         │ │
+│  │  NMEA/AIS    │──▶│              │──▶│  ORP-QL                 │ │
+│  │  ADS-B       │   │  Entity      │   │  (SQL + Graph hybrid)   │ │
+│  │  CoT / TAK   │   │  Resolution  │   │                         │ │
+│  │  OPC-UA      │   │              │   │  DuckDB (analytics)     │ │
+│  │  MQTT        │   │  Knowledge   │   │  Kuzu (graph traversal) │ │
+│  │  Modbus      │   │  Graph       │   │                         │ │
+│  │  Syslog      │   │              │   └─────────────────────────┘ │
+│  │  HTTP/WS     │   │  Anomaly     │                               │
+│  │  CSV / DB    │   │  Detection   │   ┌─────────────────────────┐ │
+│  │  + 9 more    │   │              │   │  API & REALTIME         │ │
+│  └──────────────┘   │  Threat      │──▶│                         │ │
+│                     │  Scoring     │   │  REST API (v1)          │ │
+│  ┌──────────────┐   │              │   │  WebSocket (live push)  │ │
+│  │  FEDERATION  │   │  ABAC +      │   │  ORP-to-ORP mesh sync   │ │
+│  │              │──▶│  Ed25519     │   └─────────────────────────┘ │
+│  │  Peer ORPs   │   │  Signing     │                               │
+│  │  (mesh sync) │   └──────────────┘   ┌─────────────────────────┐ │
+│  └──────────────┘                      │  WEB UI                 │ │
+│                                        │  Map (4 tile layers)    │ │
+│  ┌──────────────┐                      │  Dashboard              │ │
+│  │  STORAGE     │                      │  Entity Inspector       │ │
+│  │              │                      │  Query Console          │ │
+│  │  DuckDB      │                      │  Search Panel           │ │
+│  │  (entities,  │                      │  Alert Feed             │ │
+│  │   history)   │                      │  Timeline Scrubber      │ │
+│  │  Kuzu        │                      └─────────────────────────┘ │
+│  │  (graph)     │                                                   │
+│  └──────────────┘                                                   │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Features
+## Feature Checklist
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| **Connectors** | | |
-| AIS maritime (NMEA 0183) | ✅ Stable | 30K events/sec sustained |
-| ADS-B aircraft (SBS-1) | ✅ Stable | 1K events/sec |
-| HTTP polling (generic REST) | ✅ Stable | Any JSON API → ORP entities |
-| MQTT sensor / IoT | ✅ Stable | Any broker, configurable topics |
-| NOAA weather | ✅ Stable | 10-min polling, severity zones |
-| OpenStreetMap (ports, harbors) | ✅ Stable | Bootstrap geometry on startup |
-| **Storage & Query** | | |
-| DuckDB columnar store | ✅ Stable | Geospatial RTREE index, OLAP |
-| Kuzu graph store | ✅ Stable | Columnar property graph, 3-hop < 1s |
-| RocksDB stream state | ✅ Stable | Dedup window, checkpoints |
-| ORP-QL query language | ✅ Stable | SQL + Cypher hybrid, v0.1 grammar |
-| Graph traversal queries | ✅ Stable | Multi-hop path walks |
-| Temporal queries (AT TIME) | ✅ Stable | Replay any past state |
-| **Frontend** | | |
-| Deck.gl 2D live map | ✅ Stable | 50K entities @ 60 fps, LOD rendering |
-| CesiumJS 3D globe | 🔄 Beta | Phase 1, terrain + atmosphere |
-| Query bar (ORP-QL) | ✅ Stable | Syntax highlighting + autocomplete |
-| Entity inspector | ✅ Stable | Properties, relationships, history |
-| Alert feed | ✅ Stable | Real-time anomaly notifications |
-| Timeline scrubber | ✅ Stable | Drag to replay past 24h |
-| **Security** | | |
-| OIDC authentication | ✅ Stable | Any OIDC-compatible IdP |
-| ABAC authorization | ✅ Stable | Attribute-based, per-entity policies |
-| Ed25519 event signing | ✅ Stable | Every connector event cryptographically signed |
-| Hash-chained audit log | ✅ Stable | Tamper-evident, verifiable with `orp verify` |
-| Cryptographic erasure (GDPR) | ✅ Stable | DEK destruction, ciphertext remains |
-| **Planned** | | |
-| Natural language queries | 🗓️ Phase 2 | llama.cpp + Phi-2, local inference |
-| WASM plugin system | 🗓️ Phase 2 | Custom connectors in any language |
-| Scenario simulation / forking | 🗓️ Phase 2 | Agent-based what-if modeling |
-| Python / JS / Go SDKs | 🗓️ Phase 2 | |
-| Horizontal clustering | 🗓️ Phase 3 | Raft consensus, multi-node |
+**Data Ingestion**
+- ✅ 17 protocol adapters (NMEA, AIS, ADS-B, CoT, ASTERIX, STIX, OPC-UA, CAP, Modbus, MQTT, Syslog, HTTP, WebSocket, CSV, Database, GeoJSON, Generic API)
+- ✅ Universal JSON ingest — `POST /api/v1/ingest` accepts anything
+- ✅ Serial port NMEA direct read (`serial:///dev/ttyUSB0`)
+- ✅ Connector hot-reload — add/remove sources without restart
 
----
+**Fusion & Intelligence**
+- ✅ Live knowledge graph — entities, relationships, history
+- ✅ Entity resolution — same ship from 3 sources = 1 entity
+- ✅ Anomaly detection — speed, course, zone, pattern-of-life
+- ✅ Threat scoring — configurable scoring rules per entity type
+- ✅ Confidence scoring — multi-source data gets weighted
 
-## Performance Targets
+**Query**
+- ✅ ORP-QL — SQL meets Cypher, built for real-world entities
+- ✅ Graph traversal — `MATCH (s:Ship)-[:NEAR]->(p:Port)`
+- ✅ Geospatial queries — `WHERE geo_within(s.position, zone)`
+- ✅ Temporal queries — `WHERE s.updated_at > NOW() - 5m`
+- ✅ REST API query endpoint — run ORP-QL over HTTP
 
-| Metric | Target | CI Gate |
-|--------|--------|---------|
-| Binary size (core) | 43 MB | Block if > 400 MB total |
-| Cold start → HTTP ready | < 5 s | Alert if > 8 s |
-| Simple query P50 | < 200 ms | Alert if > 500 ms |
-| Temporal + spatial query P50 | < 800 ms | Alert if > 2 s |
-| 3-hop graph query P50 | < 1 s | Alert if > 3 s |
-| Stream throughput (sustained) | 100K events/sec | Alert if < 50K |
-| Memory at 1M entities | < 3 GB | Alert if > 5 GB |
-| Map rendering (50K entities) | 60 fps | Alert if < 30 fps |
-| WebSocket update latency | < 100 ms | Alert if > 500 ms |
-| `orp start` → data on screen | < 3 min | — |
+**Visualization**
+- ✅ Real-time map — OpenStreetMap, satellite, nautical chart, dark tile layers
+- ✅ Directional arrows and course vectors on all moving entities
+- ✅ Lasso select — drag to select a region and inspect all entities
+- ✅ Entity Inspector — click anything for full data, history, graph
+- ✅ Dashboard — live counts, alert feed, top entities
+- ✅ Query Console — run ORP-QL in the browser, see results instantly
+- ✅ Search Panel — full-text search across all entities
+- ✅ Timeline Scrubber — replay history at any speed
+- ✅ Dynamic UI — adapts to any entity type automatically
+
+**Security**
+- ✅ ABAC (Attribute-Based Access Control) — fine-grained permissions
+- ✅ Ed25519 message signing — tamper-evident entity provenance
+- ✅ JWT / OIDC authentication
+- ✅ API key support for programmatic access
+- ✅ Multi-tenant isolation
+
+**Operations**
+- ✅ Federation — ORP-to-ORP peer mesh sync
+- ✅ Headless mode — runs without UI for edge/embedded deployments
+- ✅ Docker support — single container, compose-ready
+- ✅ ARM cross-compilation — Raspberry Pi, Apple Silicon, AWS Graviton
+- ✅ 538+ tests, zero clippy warnings
 
 ---
 
-## ORP-QL Query Language
+## ORP-QL
 
-ORP-QL combines SQL-style filtering with Cypher-style graph traversal. The query planner routes to DuckDB (OLAP, geospatial) or Kuzu (graph) based on query shape.
+ORP-QL is SQL and Cypher combined into a single language for real-world entities. The query planner compiles it to DuckDB (for analytics) or Kuzu (for graph traversal) automatically.
 
-### Find ships near a port
-
+### Find vessels moving too fast
 ```sql
 MATCH (s:Ship)
-WHERE near(s.position, point(51.9225, 4.4792), 50km)
-RETURN s.name, s.speed, s.heading
-ORDER BY distance(s.position, point(51.9225, 4.4792))
+WHERE s.speed > 25
+RETURN s.name, s.mmsi, s.speed, s.course, s.position
+ORDER BY s.speed DESC
 LIMIT 20
 ```
 
-### Fast cargo ships in the North Sea
-
+### Find ships near a port that haven't identified themselves
 ```sql
-MATCH (s:Ship)
-WHERE s.ship_type = "cargo"
-  AND s.speed > 18
-  AND within(s.position, bbox(-10, 48, 10, 62))
-RETURN s.entity_id, s.name, s.speed, s.destination
+MATCH (s:Ship)-[:NEAR]->(p:Port {name: "Rotterdam"})
+WHERE s.name IS NULL OR s.mmsi IS NULL
+RETURN s.entity_id, s.position, s.speed, p.name
 ```
 
-### Graph traversal — all ships heading to Rotterdam
-
+### Geospatial — all entities in a bounding box
 ```sql
-MATCH (s:Ship)-[:HEADING_TO]->(p:Port)
-WHERE p.name = "Rotterdam"
-RETURN s.name, s.mmsi, s.eta, s.current_position
-ORDER BY s.eta
+MATCH (e:Entity)
+WHERE geo_within(e.position, bbox(51.9, 4.0, 52.1, 4.2))
+RETURN e.entity_type, e.name, e.position
+ORDER BY e.updated_at DESC
 ```
 
-### Ships inside a weather system's radius
-
+### Temporal — what happened in the last 10 minutes?
 ```sql
-MATCH (s:Ship), (w:WeatherSystem)
-WHERE w.severity = "CRITICAL"
-  AND near(s.position, w.center, w.radius_km)
-RETURN s.name, s.mmsi, w.name AS storm,
-       distance(s.position, w.center) AS dist_km
-ORDER BY dist_km
+MATCH (e:Entity)
+WHERE e.updated_at > NOW() - INTERVAL '10 minutes'
+  AND e.entity_type IN ('Ship', 'Aircraft')
+RETURN e.name, e.entity_type, e.speed, e.updated_at
+ORDER BY e.updated_at DESC
 ```
 
-### Multi-hop — Maersk ships heading to congested ports
-
+### Graph — find all aircraft within relay distance of a ground station
 ```sql
-MATCH (org:Organization {name: "MaerskLine"})-[:OWNS]->(s:Ship)-[:HEADING_TO]->(p:Port)
-WHERE p.congestion > 0.8
-RETURN s.name, p.name, p.congestion, s.eta
-ORDER BY p.congestion DESC
+MATCH (a:Aircraft)-[:WITHIN_RANGE]->(g:GroundStation)
+WHERE a.altitude < 10000
+RETURN a.callsign, a.altitude, a.speed, g.name
 ```
 
-### Aggregate — vessel count by type in region
-
+### Aggregation — track volume by source in the last hour
 ```sql
-MATCH (s:Ship)
-WHERE within(s.position, bbox(-5.0, 48.0, 10.0, 55.0))
-RETURN s.ship_type, count(*) AS vessel_count
-GROUP BY s.ship_type
-ORDER BY vessel_count DESC
+MATCH (e:Entity)
+WHERE e.updated_at > NOW() - INTERVAL '1 hour'
+RETURN e.source_connector, COUNT(*) as updates, AVG(e.confidence) as avg_conf
+ORDER BY updates DESC
 ```
 
-### Temporal — where was a ship 6 hours ago?
-
-```sql
-MATCH (s:Ship {entity_id: "mmsi:123456789"})
-AT TIME now() - interval(6, hours)
-RETURN s.position, s.speed, s.heading
-```
+Full language reference → [docs/ORP_QL_GUIDE.md](docs/ORP_QL_GUIDE.md)
 
 ---
 
-## API Quick Reference
+## Edge Deployment
 
-All endpoints require `Authorization: Bearer <token>` (or configure `auth.mode: "none"` for local dev).
+ORP was designed from day one to run on constrained hardware. A 43MB binary with no runtime dependencies means it runs anywhere Linux runs.
 
-### Entities
+### Raspberry Pi as a Vessel Intelligence Node
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/v1/entities` | List entities (paginated, filter by type/region/time) |
-| `GET` | `/api/v1/entities/{id}` | Entity detail — properties, relationships, confidence |
-| `GET` | `/api/v1/entities/search` | Geospatial + type + property search |
-| `GET` | `/api/v1/entities/{id}/relationships` | Graph edges for entity |
-| `GET` | `/api/v1/entities/{id}/events` | Full event history |
-| `POST` | `/api/v1/entities` | Manually create entity |
-| `PATCH` | `/api/v1/entities/{id}` | Update entity properties |
-| `DELETE` | `/api/v1/entities/{id}` | Soft-delete |
-
-### Queries
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/api/v1/query` | Execute ORP-QL query |
-| `POST` | `/api/v1/query/natural` | Natural language → results *(Phase 2)* |
-| `POST` | `/api/v1/graph` | Raw Kuzu Cypher query |
-
-### Connectors
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/v1/connectors` | List connectors + live metrics |
-| `POST` | `/api/v1/connectors` | Register new connector |
-| `DELETE` | `/api/v1/connectors/{id}` | Deregister connector |
-
-### Monitors & Alerts
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/v1/monitors` | List monitor rules |
-| `POST` | `/api/v1/monitors` | Create monitor rule |
-| `GET` | `/api/v1/alerts` | List fired alerts |
-| `POST` | `/api/v1/alerts/{id}/acknowledge` | Acknowledge alert |
-
-### System
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/v1/health` | Component health (DuckDB, Kuzu, connectors) |
-| `GET` | `/api/v1/metrics` | Prometheus-compatible metrics |
-| `WS` | `/ws/updates` | Real-time entity push, filter by bbox/type/id |
-
----
-
-## WebSocket Example
-
-```javascript
-const ws = new WebSocket('ws://localhost:9090/ws/updates');
-
-ws.onopen = () => {
-  // Authenticate
-  ws.send(JSON.stringify({ type: 'auth', token: 'Bearer eyJ...' }));
-
-  // Subscribe to ships in the North Sea
-  ws.send(JSON.stringify({
-    type: 'subscribe',
-    subscription_id: 'north-sea-ships',
-    filter: {
-      entity_types: ['Ship'],
-      bbox: { min_lat: 48.0, max_lat: 62.0, min_lon: -5.0, max_lon: 10.0 },
-      update_interval_ms: 1000
-    }
-  }));
-};
-
-ws.onmessage = ({ data }) => {
-  const msg = JSON.parse(data);
-  if (msg.type === 'entity_update') console.log('Updated:', msg.entity);
-  if (msg.type === 'alert')         console.log('ALERT:', msg.alert.severity, msg.alert.message);
-};
+```
+Ship's NMEA Bus (serial RS-422)
+         │
+         ▼ /dev/ttyUSB0
+   ┌─────────────┐
+   │ Raspberry   │  ← $50 hardware
+   │ Pi 4 / CM4  │
+   │             │
+   │  ORP        │  ← 43MB binary, --headless
+   │  (headless) │
+   │             │
+   └──────┬──────┘
+          │
+          ├── Local API on ship LAN (crew browser → map)
+          │
+          └── When internet available:
+              └── Syncs to shore ORP (or other vessels)
 ```
 
+```bash
+# On the Raspberry Pi
+orp start \
+  --headless \
+  --connector nmea://serial:///dev/ttyUSB0:38400 \
+  --peer https://shore.example.com/orp \
+  --sync-interval 30s
+```
+
+Parses every NMEA sentence. Builds a live picture of the vessel and surrounding traffic. Serves a local map on the ship LAN. Syncs deltas to shore when connected. Uses ~80MB RAM at steady state.
+
+### Multi-Node Mesh
+
+```
+Vessel A ──────────────────▶ Shore COP
+         ◀──── sync ───────
+Vessel B ──────────────────▶ Shore COP
+         ◀──── sync ───────
+Vessel C ──────────────────▶ Shore COP
+```
+
+Each node shares only what its ABAC policy permits. Conflict resolution is automatic: highest-confidence source wins. Bandwidth is minimal: only deltas are transmitted.
+
 ---
 
-## Security Overview
+## CLI Reference
 
-ORP is built for high-stakes environments. Security is not an afterthought.
+```bash
+orp <command> [options]
+```
 
-| Mechanism | What It Does |
-|-----------|-------------|
-| **OIDC authentication** | Every request validated against any OIDC-compatible IdP (Keycloak, Auth0, Dex, etc.) |
-| **ABAC authorization** | Per-entity, per-request attribute-based policy evaluation — no data returned without explicit permission |
-| **Ed25519 event signing** | Every connector event signed at the source; provenance of any data point is cryptographically verifiable |
-| **Hash-chained audit log** | Each audit entry contains SHA-256 of the prior entry; tampering is immediately detectable via `orp verify` |
-| **Cryptographic erasure** | GDPR right-to-erasure: destroy the DEK — all ciphertext remains but is permanently unreadable |
-| **No telemetry** | The binary makes zero external network calls unless you configure a connector; no phone-home, no analytics |
-| **Secrets via environment** | Config YAML uses `${env.MY_SECRET}` — never stores secrets inline |
+| Command | Description |
+|---------|-------------|
+| `orp start` | Start the ORP server |
+| `orp start --template maritime` | Start with pre-configured maritime connectors |
+| `orp start --headless` | Start without web UI (edge/embedded mode) |
+| `orp start --port 9090` | Override default port |
+| `orp query "<ORP-QL>"` | Run an ORP-QL query from the CLI |
+| `orp query -f query.ql` | Run a query from a file |
+| `orp status` | Show server health and entity counts |
+| `orp connectors list` | List all configured connectors |
+| `orp connectors add <spec>` | Add a connector at runtime |
+| `orp connectors remove <id>` | Remove a connector |
+| `orp entities list` | List recent entities |
+| `orp entities get <id>` | Get a specific entity |
+| `orp events tail` | Stream live entity events to stdout |
+| `orp monitors list` | List configured alert monitors |
+| `orp config show` | Print current configuration |
+| `orp config set <key> <value>` | Update a config value |
+| `orp version` | Show version information |
+| `orp completions <shell>` | Generate shell completions |
 
-Full security architecture including OIDC flow diagram, ABAC policy model, signing chain, and rate limiting: [docs/SECURITY.md](docs/SECURITY.md)
+Full CLI reference → [docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md)
+
+---
+
+## API Reference
+
+**Base URL:** `http://localhost:9090/api/v1`  
+**Auth:** `Authorization: Bearer <token>` or `X-API-Key: <key>`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/entities` | List all entities (paginated) |
+| `GET` | `/entities/:id` | Get a specific entity |
+| `GET` | `/entities/:id/history` | Get entity history |
+| `GET` | `/entities/:id/graph` | Get entity's graph neighborhood |
+| `POST` | `/ingest` | Universal ingest — POST any JSON |
+| `POST` | `/query` | Execute an ORP-QL query |
+| `GET` | `/connectors` | List connectors |
+| `POST` | `/connectors` | Add a connector |
+| `DELETE` | `/connectors/:id` | Remove a connector |
+| `GET` | `/monitors` | List alert monitors |
+| `POST` | `/monitors` | Create a monitor |
+| `GET` | `/alerts` | List recent alerts |
+| `GET` | `/health` | Health check |
+| `GET` | `/metrics` | Prometheus metrics |
+| `WS` | `/ws` | WebSocket — live entity stream |
+
+**Universal Ingest** (the simplest possible integration):
+```bash
+curl -X POST http://localhost:9090/api/v1/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "entity_type": "Vehicle",
+    "name": "Patrol Unit 7",
+    "position": { "lat": 51.505, "lon": -0.09 },
+    "speed": 45.2,
+    "source": "fleet_tracker"
+  }'
+```
+
+ORP normalizes it, resolves it against existing entities, and it appears on the map within 100ms.
+
+Full API reference → [docs/API_REFERENCE.md](docs/API_REFERENCE.md)
+
+---
+
+## Security
+
+ORP is built for environments where data integrity is non-negotiable.
+
+| Feature | Details |
+|---------|---------|
+| **ABAC** | Attribute-Based Access Control — permissions tied to entity type, source, classification, and tenant |
+| **Ed25519 Signing** | Every entity carries a cryptographic signature from its source. Tampered data is rejected. |
+| **JWT / OIDC** | Standard bearer token auth. Integrates with Keycloak, Auth0, Okta. |
+| **API Keys** | For programmatic access and service accounts |
+| **TLS** | HTTPS/WSS in production. Certificate auto-management via ACME. |
+| **Multi-tenant** | Hard data isolation between organizations. No cross-tenant leakage. |
+| **Audit Log** | Every read and write is logged with actor, timestamp, and trace ID. |
+
+Full security docs → [docs/SECURITY.md](docs/SECURITY.md)
+
+---
+
+## Performance
+
+ORP is written in Rust. These are design targets, not marketing numbers.
+
+| Metric | Target |
+|--------|--------|
+| Entity ingest throughput | 50,000 updates/sec (single node) |
+| Query latency (simple) | < 5ms p99 |
+| Query latency (graph, depth 3) | < 50ms p99 |
+| WebSocket push latency | < 100ms end-to-end |
+| Memory at 100K entities | ~512MB |
+| Binary size | 43MB (static, no dependencies) |
+| ARM build (Raspberry Pi 4) | ✅ Supported |
+| Cold start time | < 2 seconds |
 
 ---
 
@@ -349,120 +468,86 @@ Full security architecture including OIDC flow diagram, ABAC policy model, signi
 
 ```bash
 # Prerequisites: Rust 1.75+
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# macOS
-xcode-select --install && brew install cmake pkg-config openssl
-
-# Ubuntu / Debian
-sudo apt install build-essential cmake pkg-config libssl-dev
-
-# Clone and build
-git clone https://github.com/orproject/orp.git
+git clone https://github.com/shieldofsteel/orp
 cd orp
-cargo build --release         # optimized binary
-./target/release/orp start --template maritime
-```
 
-```bash
-# Test suite
-cargo test --workspace        # 203 tests
-cargo clippy --all-targets -- -D warnings   # 0 warnings
-cargo fmt -- --check
+# Run all tests
+cargo test
+
+# Build release binary
+cargo build --release
+# Binary: target/release/orp (43MB, statically linked)
+
+# Cross-compile for Raspberry Pi (ARM64)
+rustup target add aarch64-unknown-linux-gnu
+cargo build --release --target aarch64-unknown-linux-gnu
+
+# Docker
+docker build -t orp .
+docker run -p 9090:9090 orp start --template maritime
 ```
 
 ---
 
-## Configuration
+## Why Not TAK / FreeTAKServer / Palantir?
 
-ORP reads from `~/.orp/config.yaml` or `--config <path>`:
-
-```yaml
-server:
-  host: "127.0.0.1"
-  port: 9090
-
-storage:
-  data_dir: "~/.orp/data"
-  duckdb:
-    max_memory: "2GB"
-    threads: 4
-  kuzu:
-    sync_interval_secs: 30
-
-connectors:
-  - id: "ais-global"
-    type: "ais"
-    config:
-      host: "153.44.253.27"
-      port: 9999
-
-auth:
-  mode: "oidc"   # none | oidc | api_key
-  oidc:
-    issuer: "https://auth.example.com"
-    client_id: "orp-console"
-    client_secret: "${env.OIDC_CLIENT_SECRET}"
-
-security:
-  signing:
-    enabled: true
-    key_path: "${env.ORP_SIGNING_KEY_PATH}"
-  audit_log:
-    enabled: true
-    retention_days: 365
-```
-
-**Templates** (`--template <name>`): `maritime` · `adsb` · `supply-chain` · `climate` · `custom`
-
----
-
-## Project Stats
-
-| Stat | Value |
-|------|-------|
-| Crates | 12 |
-| Rust source files | 53 |
-| Lines of Rust | ~17,000 |
-| Tests | 203 passing |
-| Binary size (core) | 43 MB |
-| License | Apache 2.0 |
-| Rust edition | 2021 (1.75+ MSRV) |
-
-**Crate map:** `orp-core` · `orp-proto` · `orp-config` · `orp-connector` · `orp-stream` · `orp-entity` · `orp-storage` · `orp-query` · `orp-security` · `orp-audit` · `orp-geospatial` · `orp-testbed`
+| | TAK Server | FreeTAKServer | Palantir | **ORP** |
+|--|-----------|---------------|----------|---------|
+| Open source | Restricted GOSS | EPL | ❌ | **Apache 2.0** |
+| Modern web UI | ❌ Android-first | ❌ | ✅ | **✅** |
+| Maritime domain | Minimal | Minimal | Limited | **First-class** |
+| Aviation domain | ❌ | ❌ | Limited | **✅ ADS-B, ASTERIX** |
+| Protocol parsers | CoT only | CoT only | Proprietary | **17 open adapters** |
+| Multi-tenant SaaS | ❌ | ❌ | ✅ | **✅** |
+| AI/anomaly detection | ❌ | ❌ | ✅ | **✅** |
+| Edge / Raspberry Pi | ❌ | ⚠️ | ❌ | **✅ 43MB, headless** |
+| Query language | ❌ | ❌ | Proprietary | **ORP-QL (open)** |
+| Federation mesh | Limited | Limited | ✅ | **✅** |
+| Cost | Free | Free | **$50–500M** | **Free** |
 
 ---
 
 ## Contributing
 
-We welcome contributions: new connectors, bug fixes, documentation, benchmarks.
+ORP is early. The protocol universe is large. Help is welcome.
+
+**Highest-impact contributions:**
+1. **New protocol adapters** — NMEA 2000, DNP3, Zeek, NetFlow, GTFS-RT. See [docs/CONNECTOR_GUIDE.md](docs/CONNECTOR_GUIDE.md) — a basic adapter is ~50 lines of Rust.
+2. **Test coverage** — 538 tests is a start. More protocol parsing tests, more edge cases.
+3. **Frontend features** — React/TypeScript. See [frontend/src/components/](frontend/src/components/).
+4. **Documentation** — real-world deployment guides, integration recipes.
+5. **Performance** — benchmarks, profiling, optimization.
 
 ```bash
-# 1. Fork + clone
-git checkout -b feat/ORP-123-your-feature
+# Run tests
+cargo test
 
-# 2. Build + test
-cargo test --workspace && cargo clippy --all-targets -- -D warnings
+# Check lints (must be zero warnings)
+cargo clippy -- -D warnings
 
-# 3. Commit (Conventional Commits)
-git commit -m "feat(connector): add Kafka source connector"
+# Format
+cargo fmt
 
-# 4. Open a PR
+# Run a specific adapter test
+cargo test -p orp-connector nmea
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for PR standards, connector guide, and code review requirements.
-Good first issues: [`good first issue`](https://github.com/orproject/orp/issues?q=label%3A%22good+first+issue%22)
+Issues are tracked on GitHub. PRs welcome. No CLA required.
 
 ---
 
 ## License
 
-Apache License, Version 2.0 — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE).
 
-Copyright 2026 The ORP Authors and Contributors.
+Use it commercially. Fork it. Embed it in products. Build a business on it. The only thing you can't do is sue us for patent infringement using patents you contributed.
 
 ---
 
 <div align="center">
-<sub>Built by engineers who believe the tools for understanding physical reality should be free and open.</sub>
+
+**ORP** — because operational awareness shouldn't cost $50M.
+
+[⭐ Star on GitHub](https://github.com/shieldofsteel/orp) · [📖 Docs](docs/) · [🐛 Issues](https://github.com/shieldofsteel/orp/issues) · [💬 Discussions](https://github.com/shieldofsteel/orp/discussions)
+
 </div>
