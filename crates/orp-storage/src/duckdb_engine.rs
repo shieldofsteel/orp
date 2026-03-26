@@ -670,7 +670,8 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut rows = if has_type {
-            stmt.query(params![entity_type.unwrap(), lat_min, lat_max, lon_min, lon_max])
+            let et = entity_type.ok_or_else(|| StorageError::QueryError("entity_type is required".into()))?;
+            stmt.query(params![et, lat_min, lat_max, lon_min, lon_max])
         } else {
             stmt.query(params![lat_min, lat_max, lon_min, lon_max])
         }
@@ -781,11 +782,13 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut rows = if self.spatial_enabled && use_type {
-            stmt.query(params![entity_type.unwrap(), polygon_wkt])
+            let et = entity_type.ok_or_else(|| StorageError::QueryError("entity_type is required".into()))?;
+            stmt.query(params![et, polygon_wkt])
         } else if self.spatial_enabled {
             stmt.query(params![polygon_wkt])
         } else if use_type {
-            stmt.query(params![entity_type.unwrap()])
+            let et = entity_type.ok_or_else(|| StorageError::QueryError("entity_type is required".into()))?;
+            stmt.query(params![et])
         } else {
             stmt.query([])
         }
@@ -1602,7 +1605,8 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut rows = if use_type {
-            stmt.query(params![entity_type.unwrap(), pattern, pattern, limit as i64])
+            let et = entity_type.ok_or_else(|| StorageError::QueryError("entity_type is required".into()))?;
+            stmt.query(params![et, pattern, pattern, limit as i64])
         } else {
             stmt.query(params![pattern, pattern, limit as i64])
         }

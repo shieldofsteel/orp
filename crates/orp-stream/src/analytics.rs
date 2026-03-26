@@ -656,7 +656,7 @@ pub fn detect_dark_targets(
     }
 
     // Most suspicious first
-    alerts.sort_by(|a, b| b.dark_duration_minutes.partial_cmp(&a.dark_duration_minutes).unwrap());
+    alerts.sort_by(|a, b| b.dark_duration_minutes.total_cmp(&a.dark_duration_minutes));
     alerts
 }
 

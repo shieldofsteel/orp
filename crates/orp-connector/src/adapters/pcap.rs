@@ -264,12 +264,18 @@ pub fn parse_pcap_global_header(data: &[u8]) -> Result<PcapGlobalHeader, Connect
     Ok(PcapGlobalHeader {
         endian,
         ts_resolution,
-        version_major: read_u16(data, 4, endian).unwrap(),
-        version_minor: read_u16(data, 6, endian).unwrap(),
-        thiszone: read_i32(data, 8, endian).unwrap(),
-        sigfigs: read_u32(data, 12, endian).unwrap(),
-        snaplen: read_u32(data, 16, endian).unwrap(),
-        network: read_u32(data, 20, endian).unwrap(),
+        version_major: read_u16(data, 4, endian)
+            .ok_or_else(|| ConnectorError::ParseError("PCAP: global header truncated at version_major".into()))?,
+        version_minor: read_u16(data, 6, endian)
+            .ok_or_else(|| ConnectorError::ParseError("PCAP: global header truncated at version_minor".into()))?,
+        thiszone: read_i32(data, 8, endian)
+            .ok_or_else(|| ConnectorError::ParseError("PCAP: global header truncated at thiszone".into()))?,
+        sigfigs: read_u32(data, 12, endian)
+            .ok_or_else(|| ConnectorError::ParseError("PCAP: global header truncated at sigfigs".into()))?,
+        snaplen: read_u32(data, 16, endian)
+            .ok_or_else(|| ConnectorError::ParseError("PCAP: global header truncated at snaplen".into()))?,
+        network: read_u32(data, 20, endian)
+            .ok_or_else(|| ConnectorError::ParseError("PCAP: global header truncated at network".into()))?,
     })
 }
 
@@ -284,10 +290,14 @@ pub fn parse_pcap_packet_header(
             "PCAP: packet header truncated".into(),
         ));
     }
-    let ts_sec = read_u32(data, offset, endian).unwrap();
-    let ts_usec = read_u32(data, offset + 4, endian).unwrap();
-    let incl_len = read_u32(data, offset + 8, endian).unwrap();
-    let orig_len = read_u32(data, offset + 12, endian).unwrap();
+    let ts_sec = read_u32(data, offset, endian)
+        .ok_or_else(|| ConnectorError::ParseError("PCAP: packet header truncated at ts_sec".into()))?;
+    let ts_usec = read_u32(data, offset + 4, endian)
+        .ok_or_else(|| ConnectorError::ParseError("PCAP: packet header truncated at ts_usec".into()))?;
+    let incl_len = read_u32(data, offset + 8, endian)
+        .ok_or_else(|| ConnectorError::ParseError("PCAP: packet header truncated at incl_len".into()))?;
+    let orig_len = read_u32(data, offset + 12, endian)
+        .ok_or_else(|| ConnectorError::ParseError("PCAP: packet header truncated at orig_len".into()))?;
     let next = offset + 16 + incl_len as usize;
     if next > data.len() {
         return Err(ConnectorError::ParseError(

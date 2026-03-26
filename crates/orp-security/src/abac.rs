@@ -230,7 +230,9 @@ impl AbacEngine {
                 description: Some("Development permissive policy — disable in production".to_string()),
                 priority: -100,
             })
-            .expect("default policy is valid");
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to register default permissive policy: {e}");
+            });
         engine
     }
 
@@ -258,7 +260,9 @@ impl AbacEngine {
                 description: None,
                 priority: 100,
             })
-            .expect("valid");
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to register admin-allow-all policy: {e}");
+            });
 
         // Allow users with entities:read to read entities
         engine
@@ -278,7 +282,9 @@ impl AbacEngine {
                 description: None,
                 priority: 0,
             })
-            .expect("valid");
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to register entities-read policy: {e}");
+            });
 
         // Deny access to sensitive resources for non-admin users
         engine
@@ -303,7 +309,9 @@ impl AbacEngine {
                 description: None,
                 priority: 50, // Evaluated before allow rules
             })
-            .expect("valid");
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to register deny-secret-resources policy: {e}");
+            });
 
         engine
     }

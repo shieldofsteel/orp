@@ -32,16 +32,25 @@ pub struct StixBundle {
     pub objects: Vec<StixObject>,
 }
 
+fn default_spec_version() -> String {
+    "2.1".to_string()
+}
+
 /// A single STIX 2.1 object (generic representation).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StixObject {
     #[serde(rename = "type")]
     pub object_type: String,
     pub id: String,
+    /// STIX 2.1 spec_version field (required per spec, defaults to "2.1" for leniency).
+    #[serde(default = "default_spec_version")]
+    pub spec_version: String,
+    /// Created timestamp (required per STIX 2.1 spec for SDOs).
     #[serde(default)]
-    pub created: Option<String>,
+    pub created: String,
+    /// Modified timestamp (required per STIX 2.1 spec for SDOs).
     #[serde(default)]
-    pub modified: Option<String>,
+    pub modified: String,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -174,6 +183,7 @@ impl StixObject {
             serde_json::json!(self.object_type),
         );
         properties.insert("stix_id".into(), serde_json::json!(self.id));
+        properties.insert("spec_version".into(), serde_json::json!(self.spec_version));
 
         if let Some(ref name) = self.name {
             properties.insert("name".into(), serde_json::json!(name));
@@ -267,12 +277,14 @@ impl StixObject {
             properties.insert("last_seen".into(), serde_json::json!(ls));
         }
 
-        let ts = self
-            .created
-            .as_deref()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
+        let ts = if self.created.is_empty() {
+            Utc::now()
+        } else {
+            chrono::DateTime::parse_from_rfc3339(&self.created)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now)
+        };
 
         SourceEvent {
             connector_id: connector_id.to_string(),

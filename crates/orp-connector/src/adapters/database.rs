@@ -371,7 +371,7 @@ impl DatabaseConnector {
     #[allow(dead_code)]
     fn update_watermark(&self, rows: &[HashMap<String, JsonValue>]) {
         if let Some(ref wf) = self.db_config.watermark_field {
-            let mut lock = self.watermark.lock().unwrap();
+            let mut lock = self.watermark.lock().unwrap_or_else(|e| e.into_inner());
             for row in rows {
                 if let Some(v) = row.get(wf) {
                     let s = if let Some(str_val) = v.as_str() {
@@ -425,7 +425,7 @@ impl Connector for DatabaseConnector {
             while running.load(Ordering::SeqCst) {
                 interval.tick().await;
 
-                let wm = watermark.lock().unwrap().clone();
+                let wm = watermark.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 match executor.execute(&db_config.query, wm.as_deref()).await {
                     Ok(rows) => {
                         // Update watermark before sending events to avoid re-processing on error
@@ -434,7 +434,7 @@ impl Connector for DatabaseConnector {
 
                         // Update watermark
                         if let Some(ref wf) = config_clone.watermark_field {
-                            let mut lock = watermark_clone.lock().unwrap();
+                            let mut lock = watermark_clone.lock().unwrap_or_else(|e| e.into_inner());
                             for row in &rows {
                                 if let Some(v) = row.get(wf) {
                                     let s = if let Some(str_val) = v.as_str() {

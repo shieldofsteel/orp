@@ -748,6 +748,15 @@ impl AisAssembler {
 }
 
 /// Decode an assembled AIS payload into `NmeaData`.
+/// Check whether an AIS latitude/longitude pair represents the ITU-R M.1371
+/// "not available" sentinel values (lat == 91.0, lon == 181.0).
+/// Positions with these sentinel values must be rejected.
+fn ais_position_available(lat: f64, lon: f64) -> bool {
+    // ITU-R M.1371: 91.0 degrees latitude = not available
+    //               181.0 degrees longitude = not available
+    (lat - 91.0).abs() > 0.01 && (lon - 181.0).abs() > 0.01
+}
+
 fn decode_ais(payload: &str, fill_bits: u8, own_vessel: bool) -> Option<NmeaData> {
     let bytes = ais_decoder::decode_payload(payload, fill_bits)?;
     let total_bits = payload.len() * 6 - fill_bits as usize;
@@ -757,6 +766,10 @@ fn decode_ais(payload: &str, fill_bits: u8, own_vessel: bool) -> Option<NmeaData
     match msg_type {
         1..=3 => {
             let d = ais_decoder::decode_type_1_2_3(&buf)?;
+            // Reject AIS sentinel positions (ITU-R M.1371: lat 91.0 / lon 181.0 = not available)
+            if !ais_position_available(d.lat, d.lon) {
+                return None;
+            }
             Some(NmeaData::AisPosition {
                 mmsi: d.mmsi,
                 lat: d.lat,
@@ -783,6 +796,10 @@ fn decode_ais(payload: &str, fill_bits: u8, own_vessel: bool) -> Option<NmeaData
         }
         18 | 19 => {
             let d = ais_decoder::decode_type_18_19(&buf)?;
+            // Reject AIS sentinel positions (ITU-R M.1371: lat 91.0 / lon 181.0 = not available)
+            if !ais_position_available(d.lat, d.lon) {
+                return None;
+            }
             Some(NmeaData::AisClassB {
                 mmsi: d.mmsi,
                 lat: d.lat,
@@ -795,6 +812,10 @@ fn decode_ais(payload: &str, fill_bits: u8, own_vessel: bool) -> Option<NmeaData
         }
         21 => {
             let d = ais_decoder::decode_type_21(&buf)?;
+            // Reject AIS sentinel positions (ITU-R M.1371: lat 91.0 / lon 181.0 = not available)
+            if !ais_position_available(d.lat, d.lon) {
+                return None;
+            }
             Some(NmeaData::AisAton {
                 mmsi: d.mmsi,
                 aid_type: d.aid_type,

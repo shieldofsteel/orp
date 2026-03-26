@@ -810,7 +810,8 @@ impl GenericApiConnector {
                 let mut m = HashMap::new();
                 m.insert(
                     "generic_api".to_string(),
-                    serde_json::to_value(&api_config).expect("serialise api config"),
+                    serde_json::to_value(&api_config)
+                        .map_err(|e| ConnectorError::ConfigError(format!("Failed to serialise api_config: {e}")))?,
                 );
                 m
             },

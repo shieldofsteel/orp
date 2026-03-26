@@ -475,7 +475,7 @@ impl ThreatEngine {
             .filter(|a| a.threat_level >= min_level)
             .cloned()
             .collect();
-        result.sort_by(|a, b| b.risk_score.partial_cmp(&a.risk_score).unwrap());
+        result.sort_by(|a, b| b.risk_score.total_cmp(&a.risk_score));
         result
     }
 
