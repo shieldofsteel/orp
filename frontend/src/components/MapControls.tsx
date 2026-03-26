@@ -324,7 +324,7 @@ export const MapControls: React.FC<MapControlsProps> = ({
 
       {/* ── Coordinates display ──────────────────────────────────────────── */}
       <div
-        className="mt-0.5 bg-gray-950/90 border border-gray-700/60 px-2 py-1.5 text-[9px] font-mono"
+        className="mt-0.5 bg-gray-950/90 border border-gray-700/60 px-2 py-1.5 text-[9px] font-mono w-[148px]"
         style={{ backdropFilter: 'blur(8px)' }}
         aria-live="polite"
         aria-atomic="true"
