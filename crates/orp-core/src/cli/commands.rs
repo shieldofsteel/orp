@@ -2,6 +2,7 @@ use anyhow::Result;
 use colored::Colorize;
 use orp_config::{get_maritime_template, Config};
 use orp_connector::adapters::ais::AisConnector;
+use orp_connector::AisStreamConnector;
 use orp_connector::traits::ConnectorConfig;
 use orp_connector::Connector;
 use orp_proto::{EventPayload, OrpEvent};
@@ -371,25 +372,34 @@ pub async fn run_start(
         monitor_engine.get_rules().await.len()
     );
 
-    // Start AIS connector (demo data)
-    tracing::info!("Starting AIS connector (demo mode)...");
+    // Start AIS connector — real data if API key available, demo otherwise
     let (tx, mut rx) = mpsc::channel(10000);
 
-    let ais_config = ConnectorConfig {
-        connector_id: "ais-demo".to_string(),
-        connector_type: "ais".to_string(),
-        url: None,
-        entity_type: "ship".to_string(),
-        enabled: true,
-        trust_score: 0.95,
-        properties: HashMap::new(),
-    };
-
-    let ais_connector = AisConnector::new(ais_config);
-    ais_connector
-        .start(tx)
-        .await
-        .map_err(|e| anyhow::anyhow!("AIS connector failed: {}", e))?;
+    if let Ok(api_key) = std::env::var("AISSTREAM_API_KEY") {
+        tracing::info!("🌍 Connecting to AISStream.io — live global AIS data");
+        let ais_live = AisStreamConnector::new(api_key);
+        tokio::spawn(async move {
+            if let Err(e) = ais_live.start(tx).await {
+                tracing::error!("AISStream connector failed: {}", e);
+            }
+        });
+    } else {
+        tracing::info!("Starting AIS connector (demo mode)...");
+        let ais_config = ConnectorConfig {
+            connector_id: "ais-demo".to_string(),
+            connector_type: "ais".to_string(),
+            url: None,
+            entity_type: "ship".to_string(),
+            enabled: true,
+            trust_score: 0.95,
+            properties: HashMap::new(),
+        };
+        let ais_connector = AisConnector::new(ais_config);
+        ais_connector
+            .start(tx)
+            .await
+            .map_err(|e| anyhow::anyhow!("AIS connector failed: {}", e))?;
+    }
 
     let _ = storage
         .register_data_source(&orp_proto::DataSource {
@@ -407,7 +417,9 @@ pub async fn run_start(
     let monitor_bg = monitor_engine.clone();
     let storage_bg = storage.clone();
     tokio::spawn(async move {
+        tracing::info!("Event processor task started, waiting for events...");
         while let Some(source_event) = rx.recv().await {
+            tracing::debug!("Received event: {} ({})", source_event.entity_id, source_event.entity_type);
             let event = OrpEvent::new(
                 source_event.entity_id.clone(),
                 source_event.entity_type.clone(),
