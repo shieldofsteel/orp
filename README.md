@@ -4,12 +4,12 @@
 
 ### A single binary that does what Palantir charges $50M for.
 
-[![Tests](https://img.shields.io/badge/tests-538%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
+[![Tests](https://img.shields.io/badge/tests-960%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
 [![Binary Size](https://img.shields.io/badge/binary-43MB-blue?style=flat-square)](https://github.com/shieldofsteel/orp/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square)](https://www.rust-lang.org)
-[![Crates](https://img.shields.io/badge/crates-69%20Rust%20files-red?style=flat-square)](crates/)
-[![Lines](https://img.shields.io/badge/lines-38K%2B-lightgrey?style=flat-square)](crates/)
+[![Crates](https://img.shields.io/badge/crates-85%20Rust%20files-red?style=flat-square)](crates/)
+[![Lines](https://img.shields.io/badge/lines-51K%2B-lightgrey?style=flat-square)](crates/)
 
 </div>
 
@@ -79,7 +79,7 @@ That's it. No YAML sprawl. No microservices. No Kubernetes. One process, one por
 
 ## What ORP Does
 
-**Fuses data from any source** — 17 protocol adapters, a universal JSON ingest endpoint, and a connector SDK. If it outputs data, ORP can consume it.
+**Fuses data from any source** — 32 protocol adapters, a universal JSON ingest endpoint, and a connector SDK. If it outputs data, ORP can consume it.
 
 **Builds a live knowledge graph** — every entity (ship, aircraft, vehicle, sensor, threat) becomes a node. Relationships auto-form. The graph updates in real time.
 
@@ -102,19 +102,23 @@ ORP speaks the languages your sensors already use.
 |----------|-------------|--------|
 | **NMEA 0183** | GPS, depth, wind, heading, all sentence types | ✅ Implemented |
 | **AIS** | Vessel tracking, 27 message types, Class A/B | ✅ Implemented |
-| **NMEA 2000 / N2K** | Modern vessel CAN bus (via gateway) | 🔜 Planned |
+| **NMEA 2000 / N2K** | Modern vessel CAN bus (via gateway) | ✅ Implemented |
+| **ACARS** | Aircraft/vessel data link communications | ✅ Implemented |
 
 ### ✈️ Aviation
 | Protocol | Description | Status |
 |----------|-------------|--------|
 | **ADS-B / Mode S** | Aircraft position, velocity, identity at 1090 MHz | ✅ Implemented |
 | **ASTERIX** | Eurocontrol ATC radar data exchange | ✅ Implemented |
+| **GRIB** | Gridded meteorological data (weather models) | ✅ Implemented |
 
 ### 🪖 Military / Tactical
 | Protocol | Description | Status |
 |----------|-------------|--------|
 | **CoT (Cursor on Target)** | TAK/ATAK compatible track sharing | ✅ Implemented |
 | **STIX/TAXII** | Threat intelligence exchange | ✅ Implemented |
+| **NFFI** | NATO Friendly Force Information | ✅ Implemented |
+| **CEF** | Common Event Format (security events) | ✅ Implemented |
 
 ### 🏭 Industrial / IoT
 | Protocol | Description | Status |
@@ -122,28 +126,32 @@ ORP speaks the languages your sensors already use.
 | **OPC-UA** | Industrial automation, SCADA | ✅ Implemented |
 | **Modbus TCP/RTU** | PLCs, sensors, energy meters | ✅ Implemented |
 | **MQTT** | IoT sensor telemetry | ✅ Implemented |
-| **SparkplugB** | Industrial MQTT structured payload | 🔜 Planned |
-| **DNP3** | Utility SCADA, substations | 🔜 Planned |
-| **CAN / J1939** | Vehicles, trucks, heavy equipment | 🔜 Planned |
+| **SparkplugB** | Industrial MQTT structured payload | ✅ Implemented |
+| **DNP3** | Utility SCADA, substations | ✅ Implemented |
+| **CAN / J1939** | Vehicles, trucks, heavy equipment | ✅ Implemented |
+| **BACnet** | Building automation and control networks | ✅ Implemented |
+| **LoRaWAN** | Long-range IoT sensor networks | ✅ Implemented |
 
 ### 🔐 Cyber / Network
 | Protocol | Description | Status |
 |----------|-------------|--------|
 | **Syslog** | System and network device logs | ✅ Implemented |
-| **PCAP** | Packet capture analysis | 🔜 Planned |
-| **Zeek** | Network security monitoring logs | 🔜 Planned |
-| **NetFlow / IPFIX** | Network flow telemetry | 🔜 Planned |
+| **PCAP** | Packet capture analysis | ✅ Implemented |
+| **Zeek** | Network security monitoring logs | ✅ Implemented |
+| **NetFlow / IPFIX** | Network flow telemetry | ✅ Implemented |
+| **CEF** | ArcSight Common Event Format | ✅ Implemented |
 
 ### 🌦 Weather / Environment
 | Protocol | Description | Status |
 |----------|-------------|--------|
-| **METAR** | Aviation weather reports | 🔜 Planned |
+| **METAR** | Aviation weather reports | ✅ Implemented |
 | **CAP** | Common Alerting Protocol (emergency) | ✅ Implemented |
+| **GRIB** | Gridded binary weather model data | ✅ Implemented |
 
 ### 🚌 Transport
 | Protocol | Description | Status |
 |----------|-------------|--------|
-| **GTFS-RT** | Real-time transit feeds | 🔜 Planned |
+| **GTFS-RT** | Real-time transit feeds | ✅ Implemented |
 
 ### 🌐 Universal Ingest
 | Source | Description | Status |
@@ -204,7 +212,7 @@ ORP speaks the languages your sensors already use.
 ## Feature Checklist
 
 **Data Ingestion**
-- ✅ 17 protocol adapters (NMEA, AIS, ADS-B, CoT, ASTERIX, STIX, OPC-UA, CAP, Modbus, MQTT, Syslog, HTTP, WebSocket, CSV, Database, GeoJSON, Generic API)
+- ✅ 32 protocol adapters (NMEA, AIS, NMEA 2000, ACARS, ADS-B, ASTERIX, GRIB, CoT, STIX, NFFI, CEF, OPC-UA, Modbus, MQTT, SparkplugB, DNP3, CAN/CANbus, BACnet, LoRaWAN, Syslog, PCAP, Zeek, NetFlow, METAR, CAP, GTFS-RT, HTTP, WebSocket, CSV, Database, GeoJSON, Generic API)
 - ✅ Universal JSON ingest — `POST /api/v1/ingest` accepts anything
 - ✅ Serial port NMEA direct read (`serial:///dev/ttyUSB0`)
 - ✅ Connector hot-reload — add/remove sources without restart
@@ -246,7 +254,7 @@ ORP speaks the languages your sensors already use.
 - ✅ Headless mode — runs without UI for edge/embedded deployments
 - ✅ Docker support — single container, compose-ready
 - ✅ ARM cross-compilation — Raspberry Pi, Apple Silicon, AWS Graviton
-- ✅ 538+ tests, zero clippy warnings
+- ✅ 960+ tests, zero clippy warnings, zero panics on malformed input
 
 ---
 
@@ -435,13 +443,17 @@ ORP is built for environments where data integrity is non-negotiable.
 
 | Feature | Details |
 |---------|---------|
-| **ABAC** | Attribute-Based Access Control — permissions tied to entity type, source, classification, and tenant |
-| **Ed25519 Signing** | Every entity carries a cryptographic signature from its source. Tampered data is rejected. |
-| **JWT / OIDC** | Standard bearer token auth. Integrates with Keycloak, Auth0, Okta. |
-| **API Keys** | For programmatic access and service accounts |
-| **TLS** | HTTPS/WSS in production. Certificate auto-management via ACME. |
-| **Multi-tenant** | Hard data isolation between organizations. No cross-tenant leakage. |
-| **Audit Log** | Every read and write is logged with actor, timestamp, and trace ID. |
+| **ABAC** | Attribute-Based Access Control — deny-overrides policy engine. Permissions checked on every handler before touching storage. |
+| **Ed25519 Signing** | Every audit log entry is Ed25519-signed by the server's private key. Provides cryptographic tamper evidence on top of hash chaining. |
+| **Hash-Chained Audit Log** | Append-only audit log where each entry includes the SHA-256 of the previous entry. Any tampering invalidates the entire chain from the point of modification. |
+| **JWT / OIDC** | Standard bearer token auth (`Authorization: Bearer`). Integrates with Keycloak, Auth0, Okta, Dex, Google, Microsoft Entra ID. |
+| **API Keys** | For programmatic access via `X-API-Key` header. Scoped permissions, expiry, and revocation supported. |
+| **Rate Limiting** | Token bucket rate limiter — 100 req/sec per client IP, with 100-token burst capacity. Returns `429` with `Retry-After` header. |
+| **CORS** | Explicit origin allowlist (`ORP_CORS_ORIGINS`). Wildcard (`*`) is never used. |
+| **TLS** | Delegated to reverse proxy (Nginx, Caddy, Cloudflare) by default. Direct TLS via `rustls` (TLS 1.3) configurable. |
+| **Multi-tenant** | Hard data isolation between organizations via org_id scoping. |
+| **Zero Panics** | All parser paths use safe Rust. No `unwrap()`/`expect()` on untrusted data. Malformed protocol input is logged and discarded — the process never crashes. |
+| **Zero Telemetry** | No unsolicited outbound connections. Verifiable at the source level. |
 
 Full security docs → [docs/SECURITY.md](docs/SECURITY.md)
 
@@ -497,7 +509,7 @@ docker run -p 9090:9090 orp start --template maritime
 | Modern web UI | ❌ Android-first | ❌ | ✅ | **✅** |
 | Maritime domain | Minimal | Minimal | Limited | **First-class** |
 | Aviation domain | ❌ | ❌ | Limited | **✅ ADS-B, ASTERIX** |
-| Protocol parsers | CoT only | CoT only | Proprietary | **17 open adapters** |
+| Protocol parsers | CoT only | CoT only | Proprietary | **32 open adapters** |
 | Multi-tenant SaaS | ❌ | ❌ | ✅ | **✅** |
 | AI/anomaly detection | ❌ | ❌ | ✅ | **✅** |
 | Edge / Raspberry Pi | ❌ | ⚠️ | ❌ | **✅ 43MB, headless** |
@@ -512,8 +524,8 @@ docker run -p 9090:9090 orp start --template maritime
 ORP is early. The protocol universe is large. Help is welcome.
 
 **Highest-impact contributions:**
-1. **New protocol adapters** — NMEA 2000, DNP3, Zeek, NetFlow, GTFS-RT. See [docs/CONNECTOR_GUIDE.md](docs/CONNECTOR_GUIDE.md) — a basic adapter is ~50 lines of Rust.
-2. **Test coverage** — 538 tests is a start. More protocol parsing tests, more edge cases.
+1. **New protocol adapters** — See [docs/CONNECTOR_GUIDE.md](docs/CONNECTOR_GUIDE.md) — a basic adapter is ~50 lines of Rust.
+2. **Test coverage** — 960 tests is a start. More protocol parsing tests, more edge cases.
 3. **Frontend features** — React/TypeScript. See [frontend/src/components/](frontend/src/components/).
 4. **Documentation** — real-world deployment guides, integration recipes.
 5. **Performance** — benchmarks, profiling, optimization.

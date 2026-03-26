@@ -1,23 +1,24 @@
-# ORP — Military-Grade Integration Build
+# ORP — Fix All Audit Findings (Parser Safety + Correctness)
 
-5 teams wrote ~12,600 lines. Make it compile and work.
+Read .factory/FIX_UNWRAPS.md and specs/PARSER_AUDIT_V2.md for details.
 
-## 1. Fix Compilation
-Run `cargo check`. New files: analytics.rs, threat.rs, layers.rs, generic_api.rs, syslog.rs, database.rs. Resolve all import/type conflicts. Update lib.rs exports for orp-stream and orp-connector. Update mod.rs for adapters.
+## Fixes Required
 
-## 2. Fix Frontend
-New components: MapControls.tsx, SearchPanel.tsx, QueryConsole.tsx, Dashboard.tsx, EntityCard.tsx. Updated: MapView.tsx, EntityInspector.tsx, App.tsx. Run `cd frontend && npm run build` — fix any TS errors.
+### HIGH (panics on real data)
+1. `duckdb_engine.rs` — Replace 4 `entity_type.unwrap()` with `.unwrap_or_default()` or proper Option handling
+2. `analytics.rs:659` — Replace `partial_cmp().unwrap()` with `partial_cmp().unwrap_or(Ordering::Equal)` (NaN-safe sort)
+3. `threat.rs:478` — Same NaN-safe sort fix
+4. `ais.rs` — Either delete the file or redirect to nmea.rs AIS decoder. Currently a stub returning None.
+5. `nmea.rs` — Filter AIS sentinel positions: reject lat==91.0 or lon==181.0 (means "not available" per ITU-R M.1371)
 
-## 3. Wire Layers API
-Add layer endpoints (GET/POST/PUT/DELETE /api/v1/layers) to http.rs router and handlers.rs.
+### MEDIUM
+6. `abac.rs` — Replace 4 `.expect()` with `.unwrap_or_else(|e| { tracing::error!(...); })` 
+7. `generic_api.rs:813` — Replace `.expect()` with `?` or `.ok()`
+8. `pcap.rs` — Convert 10 array index unwrap() to checked access with .get()
+9. `database.rs` — Replace `.lock().unwrap()` with `.lock().unwrap_or_else(|e| e.into_inner())`
+10. `stix.rs` — Add `spec_version: String` as required field, make `created`/`modified` required not optional
 
-## 4. Wire Analytics
-Connect analytics engine (CPA, anomaly detection, threat scoring) to the stream processor pipeline. When entities update, run analytics checks.
+### CLEANUP
+11. Remove `ais.rs` if it's just a stub (real AIS decoder is in nmea.rs)
 
-## 5. Verify
-- cargo test — all must pass
-- cargo clippy — zero warnings
-- frontend builds clean
-- Server starts without errors
-
-Commit + push. Message: "feat: military-grade COP — analytics, threat, layers, universal connectors, map controls, dashboard"
+cargo test + cargo clippy after all fixes. Commit + push.

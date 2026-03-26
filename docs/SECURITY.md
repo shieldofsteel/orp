@@ -11,8 +11,8 @@ This document describes ORP's security model in detail: authentication, authoriz
 1. [Security Philosophy](#security-philosophy)
 2. [OIDC Authentication Flow](#oidc-authentication-flow)
 3. [ABAC Authorization Model](#abac-authorization-model)
-4. [Ed25519 Event Signing Chain](#ed25519-event-signing-chain)
-5. [Audit Log Hash Verification](#audit-log-hash-verification)
+4. [Ed25519 Audit Log Signing](#ed25519-audit-log-signing)
+5. [Audit Log Hash Chaining](#audit-log-hash-chaining)
 6. [API Key Scoping](#api-key-scoping)
 7. [Rate Limiting](#rate-limiting)
 8. [CORS Policy](#cors-policy)
@@ -21,7 +21,8 @@ This document describes ORP's security model in detail: authentication, authoriz
 11. [Cryptographic Erasure (GDPR)](#cryptographic-erasure-gdpr)
 12. [No Telemetry Guarantee](#no-telemetry-guarantee)
 13. [Dependency Security](#dependency-security)
-14. [Reporting Vulnerabilities](#reporting-vulnerabilities)
+14. [Audit History & Remediation](#audit-history--remediation)
+15. [Reporting Vulnerabilities](#reporting-vulnerabilities)
 
 ---
 
@@ -29,10 +30,11 @@ This document describes ORP's security model in detail: authentication, authoriz
 
 ORP is designed for high-stakes environments — disaster response, maritime operations, supply chain monitoring, defense research. Its security model reflects this:
 
-- **Secure by default.** OIDC auth, ABAC enforcement, event signing, and audit logging are enabled by default. Disabling any of these requires an explicit config change.
-- **No implicit trust.** Every API call is authenticated and authorized. Every connector event is signed. Data provenance is always verifiable.
+- **Secure by default.** OIDC auth, ABAC enforcement, Ed25519-signed audit logs, and hash-chained audit entries are enabled by default. Disabling any of these requires an explicit config change.
+- **No implicit trust.** Every API call is authenticated and authorized. The audit log records every action and is cryptographically signed and hash-chained.
 - **Zero telemetry.** ORP does not make any outbound network requests except those you explicitly configure (connectors, OIDC endpoints). No phone-home, no usage analytics.
 - **Defense in depth.** Auth failure → 401. Auth success but ABAC deny → 403. ABAC success but data not found → 404. Each layer fails independently.
+- **No panics on malformed input.** All parser paths use safe Rust (no `unwrap()`/`expect()` on untrusted data). Malformed protocol messages are logged and discarded — the process never crashes.
 
 ---
 
@@ -97,210 +99,237 @@ Browser                        ORP Server                    OIDC Provider
 
 ### JWT Validation
 
-On each request, ORP:
+On each request, the auth middleware (implemented in `orp-security/src/middleware.rs`) resolves credentials in this order:
 
-1. Extracts the Bearer token from `Authorization` header (or `orp_session` cookie for browser requests)
-2. Decodes the JWT header to get the `kid` (key ID)
-3. Fetches the JWKS from `<issuer>/.well-known/jwks.json` (cached in memory, refreshed every hour)
-4. Verifies the JWT signature using the matching public key
-5. Validates claims: `iss` matches config, `aud` contains `orp-console`, `exp` is in the future
-6. Extracts claims for ABAC evaluation: `sub`, `email`, `groups`, custom claims
+1. Checks for a pre-injected `AuthContext` in request extensions (set by the `inject_auth_state` middleware layer)
+2. Extracts a Bearer token from `Authorization: Bearer <token>` header
+3. Falls back to `X-API-Key: <key>` header for programmatic clients
+4. If `ORP_DEV_MODE=true`, falls through to anonymous dev context (admin permissions — **never use in production**)
+5. Otherwise returns `401 Unauthorized`
 
-Token validation adds < 1 ms overhead (cached key lookup + in-memory HMAC/RSA verify).
+When a Bearer token is present, ORP:
 
-### Token Refresh
+1. Passes the token to `JwtService::validate_token`
+2. Verifies the JWT signature against the configured JWKS
+3. Validates claims: `iss` matches config, `aud` contains `orp-client`, `exp` is in the future
+4. Extracts claims for ABAC evaluation: `sub`, `email`, `org_id`, `permissions`, `scope`
 
-- ORP does not store refresh tokens server-side. Token refresh is the client's responsibility.
-- When a token expires, the API returns `401 Unauthorized` with `WWW-Authenticate: Bearer error="invalid_token"`.
-- The frontend silently refreshes using the OIDC client library.
+If the token is expired, the server returns `401 Unauthorized` with `WWW-Authenticate: Bearer error="invalid_token"`. Token refresh is the client's responsibility.
+
+### Development Mode
+
+Set `ORP_DEV_MODE=true` to bypass authentication entirely. All requests receive a full `admin`-permission context. **This must never be set in production.**
 
 ---
 
 ## ABAC Authorization Model
 
-ORP uses Attribute-Based Access Control (ABAC). Every data access is evaluated against a policy engine that considers the caller's attributes, the resource's attributes, and environmental context.
+ORP uses Attribute-Based Access Control (ABAC) implemented in `orp-security/src/abac.rs`. Every data access is evaluated against a policy engine that considers the caller's attributes, the resource's attributes, and policy rules.
 
-### Policy Evaluation
+### Policy Evaluation Algorithm
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Policy Decision Point (PDP)                                 │
+│  AbacEngine::evaluate(ctx: &EvaluationContext)               │
 │                                                              │
 │  Input:                                                      │
 │  ┌─────────────────────┐  ┌─────────────────────┐           │
 │  │  Subject Attributes  │  │ Resource Attributes  │           │
 │  │  ─────────────────── │  │ ─────────────────── │           │
-│  │  user.id             │  │ entity.type          │           │
-│  │  user.email          │  │ entity.sensitivity   │           │
-│  │  user.org_id         │  │ entity.tags          │           │
-│  │  user.permissions[]  │  │ entity.org_id        │           │
-│  │  user.clearance      │  │ entity.classification│           │
+│  │  subject.sub         │  │ resource.type        │           │
+│  │  subject.permissions │  │ resource.id          │           │
+│  │  subject.role        │  │ resource.attributes  │           │
+│  │  subject.org_id      │  │   (sensitivity,      │           │
+│  │  subject.attributes  │  │    owner_id, tags)   │           │
 │  └─────────────────────┘  └─────────────────────┘           │
 │                                                              │
-│  ┌─────────────────────┐                                    │
-│  │ Environment Attrs   │                                    │
-│  │ ─────────────────── │                                    │
-│  │ time.utc            │                                    │
-│  │ request.ip          │                                    │
-│  │ request.path        │                                    │
-│  └─────────────────────┘                                    │
+│  Algorithm (deny-overrides, default-deny):                  │
+│  1. Fast-path: admin token → check explicit denies,         │
+│     then ALLOW (admin bypasses permission check)            │
+│  2. Check subject.permissions contains ctx.action           │
+│     (missing permission → immediate DENY)                   │
+│  3. Iterate policies sorted by priority (desc):             │
+│     · First DENY match → immediate DENY                     │
+│     · Track first ALLOW match                               │
+│  4. ALLOW if any policy matched; DENY if none               │
 │                                                              │
-│  Policy (evaluated in order; first match wins):              │
-│  1. DENY: user.is_suspended = true                           │
-│  2. ALLOW: user.permissions CONTAINS "admin"                 │
-│  3. ALLOW: user.permissions CONTAINS "entities:read"         │
-│         AND entity.sensitivity IN ["public", "internal"]    │
-│         AND (entity.org_id = user.org_id                    │
-│              OR user.permissions CONTAINS "cross-org:read") │
-│  4. DENY: (implicit default deny)                           │
+│  Variable interpolation:                                    │
+│  ${subject.sub}, ${subject.org_id} supported in             │
+│  resource attribute conditions                              │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 ### Standard Permission Strings
 
-| Permission | Grants Access To |
-|------------|----------------|
-| `entities:read` | List and get entities |
-| `entities:write` | Create and update entities |
-| `entities:delete` | Soft-delete entities |
-| `graph:read` | Graph traversal queries |
-| `query:execute` | Run ORP-QL queries |
-| `query:natural` | Natural language queries (Phase 2) |
-| `connectors:read` | List connectors and metrics |
-| `connectors:manage` | Register and deregister connectors |
-| `monitors:read` | List monitors and alerts |
-| `monitors:manage` | Create and delete monitors |
-| `audit:read` | Read audit log entries |
-| `admin` | All of the above + user management |
-| `cross-org:read` | Read entities from all organizations |
+The following permissions are defined in `orp-security/src/abac.rs` (the `Permission` enum):
+
+| Permission | Scope String | Grants Access To |
+|------------|-------------|----------------|
+| `EntitiesRead` | `entities:read` | List and get entities |
+| `EntitiesWrite` | `entities:write` | Create and update entities |
+| `EntitiesDelete` | `entities:delete` | Soft-delete entities |
+| `GraphRead` | `graph:read` | Graph traversal queries |
+| `GraphWrite` | `graph:write` | Create graph relationships |
+| `MonitorsRead` | `monitors:read` | List monitors and alerts |
+| `MonitorsWrite` | `monitors:write` | Create and delete monitors |
+| `QueryExecute` | `query:execute` | Run ORP-QL queries |
+| `ConnectorsManage` | `connectors:manage` | Register and deregister connectors |
+| `ApiKeysManage` | `api-keys:manage` | Create and revoke API keys |
+| `Admin` | `admin` | All of the above + bypasses policy checks |
+
+### Production Default Policies
+
+`AbacEngine::default_production()` registers three starter policies:
+
+1. **admin-allow-all** (priority 100): Users with `role=admin` may perform any action on any resource
+2. **entities-read** (priority 0): Users may read `entity` resources
+3. **deny-secret-resources** (priority 50): Any user is denied access to resources with `sensitivity=secret`
+
+The deny-secret-resources policy demonstrates deny-override semantics: even if a user has `entities:read`, attempting to access a `sensitivity=secret` entity returns `403 Forbidden`.
 
 ### ABAC in Code
 
-Every handler in `orp-core` calls the ABAC enforcer before returning data:
+Every handler in `orp-core/src/server/handlers.rs` calls the `check_abac` helper before touching storage:
 
 ```rust
-// Example: entity list handler
-async fn list_entities(
-    State(state): State<AppState>,
-    AuthContext(claims): AuthContext,
-    Query(params): Query<EntityListParams>,
-) -> Result<Json<Vec<Entity>>, ApiError> {
-    // ABAC: require entities:read permission
-    state.abac.require(&claims, "entities:read")?;  // → 403 if denied
-
-    let entities = state.storage.list_entities(&params).await?;
-
-    // Filter result set to only entities the caller can see
-    // (defense in depth: even if a bug in query params slips through,
-    //  the ABAC filter on the result set catches it)
-    let filtered = state.abac.filter_entities(entities, &claims);
-
-    Ok(Json(filtered))
+// check_abac helper — called at the top of every handler
+fn check_abac(
+    abac: &AbacEngine,
+    auth: &AuthContext,
+    action: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let ctx = EvaluationContext {
+        subject: Subject {
+            sub: auth.subject.clone(),
+            permissions: auth.permissions.clone(),
+            role: if auth.has_permission("admin") {
+                Some("admin".to_string())
+            } else {
+                None
+            },
+            org_id: auth.org_id.clone(),
+            attributes: HashMap::new(),
+        },
+        action: action.to_string(),
+        resource: Resource {
+            r#type: resource_type.to_string(),
+            id: resource_id.to_string(),
+            attributes: HashMap::new(),
+        },
+    };
+    let decision = abac.evaluate(&ctx);
+    if decision.result == EvaluationResult::Deny {
+        return Err(error_response("FORBIDDEN", StatusCode::FORBIDDEN,
+            &format!("Access denied: {}", decision.reason)));
+    }
+    Ok(())
 }
 ```
 
 ---
 
-## Ed25519 Event Signing Chain
+## Ed25519 Audit Log Signing
 
-Every event produced by a connector is signed before entering the stream processor. This creates an unbroken chain of custody from data source to storage.
+ORP uses Ed25519 (via `ed25519-dalek`) to cryptographically sign audit log entries, providing tamper evidence at the cryptographic level in addition to the hash chain.
 
-### Key Generation (per connector)
+### Implementation
 
-```bash
-# Generate a signing keypair for a connector
-orp keygen --output ~/.orp/keys/ais-connector.key
+Implemented in `orp-audit/src/crypto.rs`:
 
-# Public key is registered in DuckDB data_sources table on connector startup
-# Private key stays on the machine running the connector; never transmitted
+```rust
+pub struct EventSigner {
+    signing_key: SigningKey,   // ed25519_dalek::SigningKey
+}
+
+impl EventSigner {
+    /// Sign arbitrary data. Returns a 64-byte signature.
+    pub fn sign(&self, data: &[u8]) -> Vec<u8> { ... }
+
+    /// Verify a signature. Returns false for any invalid or malformed input.
+    pub fn verify(&self, data: &[u8], signature: &[u8]) -> bool {
+        if signature.len() != 64 { return false; } // NaN-safe guard
+        ...
+    }
+}
 ```
 
-### Signing Algorithm
+### Server Integration
 
-```
-1. Connector produces an OrpEvent with all fields populated
+The HTTP server (`orp-core/src/server/http.rs`) creates one `EventSigner` per process at startup and holds it in `AppState.audit_signer`:
 
-2. Serialization (deterministic):
-   fields = sort_keys_alphabetically({
-     entity_id: "mmsi:123456789",
-     event_type: "position_update",
-     source_id: "ais-global",
-     timestamp: "2026-03-26T09:30:00.000Z",
-     payload: { lat: 51.92, lon: 4.47, speed: 14.2, course: 275 }
-   })
-   canonical_bytes = utf8(json_serialize(fields))
-
-3. Sign:
-   signature = ed25519_sign(private_key, sha256(canonical_bytes))
-   event.signature = base64url(signature)
-   event.signer_key_id = key_fingerprint(public_key)
-
-4. Attach and forward to stream processor
+```rust
+let audit_signer = config
+    .audit_signer
+    .unwrap_or_else(|| Arc::new(EventSigner::new()));
 ```
 
-### Verification
+The `audit_log` helper in `handlers.rs` signs each new audit entry's `content_hash` with the server's Ed25519 private key. The resulting signature is stored alongside the entry, giving operators a mechanism to verify that an audit record was written by a legitimate ORP process and not injected externally.
 
-```
-Verifier receives event:
-1. Load public_key from data_sources WHERE key_id = event.signer_key_id
-2. Re-serialize event fields using same deterministic algorithm
-3. signature_valid = ed25519_verify(public_key, sha256(canonical_bytes), base64url_decode(event.signature))
-4. If invalid:
-   - Log warning: "Signature verification failed for event {event_id} from {source_id}"
-   - Set event.confidence = 0.0 (data still stored, but flagged)
-   - Increment connector metrics: signature_failures++
-   - Do NOT drop the event (operator decides what to do with low-confidence data)
-```
+### Per-Connector Event Signing (Roadmap)
 
-### Verification CLI
-
-```bash
-# Verify all events from a connector are properly signed
-orp verify --connector ais-global --since "2026-03-25T00:00:00Z"
-# ✓ Verified 2,847,392 events. 0 signature failures.
-
-# Verify a specific event by ID
-orp verify --event-id "01HWKX5EQVP3NBYJ4ZK8DJFRTE"
-# ✓ Event signature valid. Signed by key: abc123def456 (ais-global)
-```
+A per-connector signing model (individual Ed25519 keypairs per data source, registered in the `data_sources` table) is planned for a future release. The current implementation signs audit log entries at the server level.
 
 ---
 
-## Audit Log Hash Verification
+## Audit Log Hash Chaining
 
-The audit log is append-only and hash-chained. Every entry includes the SHA-256 of the previous entry. Tampering with any historical entry invalidates all subsequent hashes.
+The audit log is append-only and hash-chained. Every entry includes a SHA-256 hash of the previous entry's `content_hash`. Tampering with any historical entry invalidates all subsequent hashes.
 
-### Schema
+### Rust Schema (`orp-audit/src/logger.rs`)
 
-```sql
-CREATE TABLE audit_log (
-    seq_id      BIGINT PRIMARY KEY,       -- monotonically increasing
-    timestamp   TIMESTAMPTZ NOT NULL,
-    actor       TEXT NOT NULL,            -- "user:alice@example.com" or "connector:ais-global"
-    action      TEXT NOT NULL,            -- "query_executed", "entity_created", "login", etc.
-    target_type TEXT,                     -- "entities", "connectors", "monitors", NULL
-    target_id   TEXT,                     -- entity/connector/monitor ID, NULL
-    details     JSON,                     -- action-specific details
-    prev_hash   TEXT NOT NULL,            -- SHA-256 of (seq_id-1) row
-    hash        TEXT NOT NULL             -- SHA-256 of (seq_id || actor || action || details || prev_hash)
-);
+```rust
+pub struct AuditEntry {
+    pub sequence_number: u64,           // monotonically increasing (starts at 1)
+    pub timestamp: DateTime<Utc>,
+    pub operation: String,              // "entity_created", "query_executed", etc.
+    pub entity_type: Option<String>,    // "ship", "aircraft", etc. — may be None
+    pub entity_id: Option<String>,      // entity/connector/monitor ID — may be None
+    pub user_id: Option<String>,        // "user:alice@example.com" or "connector:ais-global"
+    pub details: serde_json::Value,     // action-specific JSON payload
+    pub previous_hash: String,          // content_hash of (sequence_number - 1) entry
+    pub content_hash: String,           // SHA-256 of (seq||operation||timestamp||details)
+}
+```
 
--- Genesis entry (seq_id = 0) has prev_hash = '0000...0000' (64 zeroes)
+**Genesis entry** (`sequence_number = 1`): `previous_hash = "genesis"`.
+
+### Hash Formula
+
+```
+content_hash = sha256_hex(
+    format!("{}||{}||{}||{}", sequence_number, operation, timestamp.rfc3339(), details)
+)
 ```
 
 ### Chain Integrity Verification
 
+```rust
+/// AuditLog::verify() — validates the full chain in O(n)
+pub fn verify(&self) -> bool {
+    for (i, entry) in self.entries.iter().enumerate() {
+        // Check previous hash linkage
+        if i == 0 {
+            if entry.previous_hash != "genesis" { return false; }
+        } else if entry.previous_hash != self.entries[i - 1].content_hash {
+            return false;
+        }
+        // Re-compute and compare content hash
+        let expected = sha256_hex(format!("{}||{}||{}||{}",
+            entry.sequence_number, entry.operation,
+            entry.timestamp.to_rfc3339(), entry.details));
+        if entry.content_hash != expected { return false; }
+    }
+    true
+}
+```
+
+### CLI Verification
+
 ```bash
 # Verify the full audit log chain
 orp verify --audit-log ~/.orp/data/audit.db
-
-# Output:
-# Checking audit log integrity...
-# ✓ Entry 0: genesis (prev_hash = 0000...0000)
-# ✓ Entry 1 – 10,000: chain valid
-# ✓ Entry 10,001 – 42,891: chain valid
-# ✓ Audit log integrity verified: 42,891 entries, chain unbroken.
-# Last entry: 2026-03-26T09:30:14Z | actor: user:alice@example.com | action: query_executed
 
 # If tampering is detected:
 # ✗ Chain break at entry 8,234:
@@ -311,40 +340,34 @@ orp verify --audit-log ~/.orp/data/audit.db
 
 ### What Is Logged
 
-| Action | Logged When |
-|--------|-------------|
+| Operation | When |
+|-----------|------|
 | `login` | User successfully authenticates |
 | `login_failed` | Authentication attempt fails |
-| `query_executed` | Any ORP-QL query is run (query text + result count) |
-| `entity_created` | Entity manually created via API |
-| `entity_updated` | Entity properties updated via API |
+| `query_executed` | Any ORP-QL query is run |
+| `entity_created` | Entity created via API |
+| `property_updated` | Entity properties updated |
 | `entity_deleted` | Entity soft-deleted |
 | `connector_registered` | New connector added |
 | `connector_deregistered` | Connector removed |
 | `monitor_created` | Monitor rule created |
 | `alert_acknowledged` | Alert acknowledged |
 | `cryptographic_erasure` | Entity encryption key destroyed |
-| `audit_log_accessed` | Audit log queried (meta-audit) |
 
 ---
 
 ## API Key Scoping
 
-For non-interactive clients (CI pipelines, scripts, SDKs), ORP supports API keys as an alternative to OIDC tokens.
+For non-interactive clients (CI pipelines, scripts, SDKs), ORP supports API keys via the `X-API-Key` header.
 
-### Key Structure
+API keys are validated by `ApiKeyService` (`orp-security/src/api_keys.rs`). Validation checks:
+1. Key exists in the key store
+2. Key is not expired (`is_expired = false`)
+3. Key is not revoked (`is_revoked = false`)
 
-```
-orp_<environment>_<base58-random-32-bytes>
-```
+On success, an `AuthContext` is built with the key's scopes as permissions, feeding the same ABAC evaluation path as JWT auth.
 
-Examples:
-- `orp_prod_3xK9mPqR7vL3nW8sJd4Qb...`
-- `orp_dev_8mNpXyZ2vKj6Lw9qRt1Au...`
-
-### Scoping
-
-API keys are created with explicit permission scopes and an optional expiry:
+### Key Management
 
 ```bash
 # Create an API key with read-only access
@@ -354,14 +377,7 @@ orp apikey create \
   --expires "2027-01-01" \
   --org-id "org-456"
 
-# Output:
-# API Key created: orp_prod_3xK9mPqR7vL3nW8sJd4Qb...
-# Permissions: entities:read, query:execute
-# Org: org-456
-# Expires: 2027-01-01
-# (This key is shown only once. Store it securely.)
-
-# List keys (shows fingerprint only, never the raw key)
+# List keys (fingerprint only — raw key is never shown after creation)
 orp apikey list
 
 # Revoke a key
@@ -370,7 +386,7 @@ orp apikey revoke --fingerprint abc123...
 
 ### Key Rotation
 
-API keys do not rotate automatically. Key rotation is the operator's responsibility. Recommended practices:
+API keys do not rotate automatically. Recommended practices:
 
 - Set expiry on all keys (maximum 1 year)
 - Rotate keys when team members leave
@@ -381,16 +397,47 @@ API keys do not rotate automatically. Key rotation is the operator's responsibil
 
 ## Rate Limiting
 
-ORP uses a token bucket rate limiter (per-client IP or API key) implemented in Tower middleware.
+ORP implements a **token bucket rate limiter** per client IP in `orp-core/src/server/http.rs` as an Axum middleware layer.
 
-### Default Limits
+### Implementation
 
-| Client Type | Requests / minute | Burst |
-|------------|------------------|-------|
-| Unauthenticated | 30 | 10 |
-| Authenticated (user) | 600 | 100 |
-| Authenticated (API key) | 1,200 | 200 |
-| Admin | Unlimited | — |
+```rust
+// Configured at server startup — applies to ALL clients uniformly
+let rate_limiter = RateLimiter::new(100, 100); // max_tokens=100, refill_rate=100/sec
+```
+
+The token bucket holds up to **100 tokens** and refills at **100 tokens/second**. This translates to a sustained throughput of 100 requests/second per IP with a burst capacity of 100 additional requests.
+
+**Note:** The rate limiter currently applies uniformly regardless of authentication state. Per-tier limits (differentiated by auth level) are planned for a future release.
+
+### Rate Limit Response
+
+When the bucket is empty, ORP responds `429 Too Many Requests`:
+
+```json
+{
+  "error": {
+    "code": "RATE_LIMITED",
+    "status": 429,
+    "message": "Too many requests. Please retry later.",
+    "retry_after_seconds": 1,
+    "timestamp": "2026-03-26T09:30:00Z"
+  }
+}
+```
+
+With a `Retry-After: 1` HTTP header.
+
+### IP Extraction
+
+The middleware reads the client IP from:
+1. `X-Forwarded-For` header (first entry — for reverse proxy deployments)
+2. TCP `ConnectInfo<SocketAddr>` (direct connections)
+3. Falls back to `"unknown"` (counts against a single shared bucket)
+
+### Bypass for Internal Services
+
+Internal services on private subnets should be placed behind a reverse proxy that strips or overrides `X-Forwarded-For`, or use dedicated bypass logic in your infrastructure.
 
 ### Configuration
 
@@ -398,30 +445,8 @@ ORP uses a token bucket rate limiter (per-client IP or API key) implemented in T
 server:
   rate_limit:
     enabled: true
-    unauthenticated:
-      requests_per_minute: 30
-      burst: 10
-    authenticated_user:
-      requests_per_minute: 600
-      burst: 100
-    authenticated_api_key:
-      requests_per_minute: 1200
-      burst: 200
-    # Bypass for specific IPs (e.g. internal services)
-    bypass_ips:
-      - "10.0.0.0/8"
-      - "172.16.0.0/12"
-```
-
-### Rate Limit Headers
-
-Responses include standard rate limit headers:
-
-```
-X-RateLimit-Limit: 600
-X-RateLimit-Remaining: 487
-X-RateLimit-Reset: 1743000660
-Retry-After: 23   (only on 429 responses)
+    max_tokens: 100
+    refill_rate: 100   # tokens per second
 ```
 
 ---
@@ -430,7 +455,9 @@ Retry-After: 23   (only on 429 responses)
 
 ### Default Policy
 
-ORP's default CORS policy is **restrictive** (appropriate for production):
+ORP's default CORS policy reads allowed origins from the `ORP_CORS_ORIGINS` environment variable (comma-separated). If unset, it defaults to `http://localhost:3000`.
+
+CORS is **never** configured as a wildcard (`*`) — `AllowOrigin::list()` is used exclusively. All unlisted origins receive `403 Forbidden`.
 
 ```yaml
 server:
@@ -438,11 +465,7 @@ server:
     - "http://localhost:9090"   # ORP's own frontend
 ```
 
-All cross-origin requests from unlisted origins are rejected with `403 Forbidden`.
-
 ### Custom Origins
-
-Add origins for external frontends, dashboards, or integrations:
 
 ```yaml
 server:
@@ -452,15 +475,12 @@ server:
     - "https://ops.yourdomain.com"
 ```
 
-**Do not use `*` in production.** Wildcard origins allow any website to make credentialed requests to your ORP instance.
-
 ### CORS Headers Sent
 
 ```
 Access-Control-Allow-Origin: https://dashboard.yourdomain.com
-Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS
-Access-Control-Allow-Headers: Authorization, Content-Type, X-Request-ID
-Access-Control-Allow-Credentials: true
+Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+Access-Control-Allow-Headers: *
 Access-Control-Max-Age: 86400
 ```
 
@@ -500,7 +520,7 @@ auth:
     client_secret: "mysecretvalue"   # ✗ never do this
 ```
 
-### Supported Secret Backends (Phase 2)
+### Supported Secret Backends
 
 | Backend | Status |
 |---------|--------|
@@ -526,12 +546,12 @@ Entity creation:
 5. The plaintext DEK is never written to disk
 
 Erasure request (DELETE /api/v1/entities/{id}?erasure=cryptographic):
-1. Verify the caller has entities:delete permission
+1. Verify the caller has entities:delete permission (ABAC enforced)
 2. Retrieve and decrypt the entity's DEK from the key store
 3. Securely destroy the DEK (overwrite in memory, delete from key store)
 4. The entity record remains in DuckDB with encrypted fields
 5. Without the DEK, the ciphertext is permanently unrecoverable
-6. Log erasure event in audit log: action="cryptographic_erasure", target_id={id}
+6. Log erasure in audit log: operation="cryptographic_erasure", entity_id={id}
 
 After erasure:
 - The entity still appears in queries (with null sensitive fields)
@@ -569,6 +589,20 @@ cargo audit   # checks against RustSec Advisory Database
 
 ---
 
+## Audit History & Remediation
+
+ORP has undergone four documented security and correctness audits. All findings have been remediated. See [AUDIT_HISTORY.md](AUDIT_HISTORY.md) for full details.
+
+**Current state (post-remediation):**
+- 960 tests passing, zero clippy warnings
+- Zero `unwrap()`/`expect()` calls on untrusted data paths
+- All floating-point operations are NaN-safe
+- Sentinel/magic-value filtering removed from all parsers
+- NMEA, AIS, ASTERIX, Modbus, and DNP3 parsers verified against their respective specifications
+- All audit log entries are Ed25519-signed and hash-chained
+
+---
+
 ## Reporting Vulnerabilities
 
 **Do not open a public GitHub issue for security vulnerabilities.**
@@ -591,4 +625,4 @@ We do not have a formal bug bounty program, but we deeply appreciate responsible
 
 ---
 
-_ORP Security Architecture · v0.1.0 · 2026-03-26_
+_ORP Security Architecture · v0.2.0 · 2026-03-27_

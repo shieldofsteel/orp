@@ -53,7 +53,7 @@ tags:
   - name: api-keys
     description: API key lifecycle management
   - name: system
-    description: Health and metrics endpoints
+    description: Health, metrics, and federation peer management endpoints
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PATHS
@@ -1701,6 +1701,343 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  # ── INGEST ──────────────────────────────────────────────────────────────────
+
+  /ingest:
+    post:
+      operationId: ingestEntity
+      summary: Universal ingest — POST any JSON
+      description: |
+        The simplest possible integration. POST any JSON object and ORP will:
+        1. Auto-detect the entity type from field heuristics (mmsi → ship, icao → aircraft, cve → threat, etc.)
+        2. Generate or resolve a stable entity ID
+        3. Store it in the knowledge graph
+        4. Push it to WebSocket subscribers
+
+        No pre-configuration required. Idempotent — re-ingesting the same physical entity updates rather than duplicates it.
+      tags: [entities]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: Any JSON object. At minimum, include identifying fields.
+            examples:
+              ship:
+                summary: Maritime vessel (AIS)
+                value:
+                  mmsi: "123456789"
+                  name: "MV Ever Given"
+                  lat: 30.6936
+                  lon: 32.3000
+                  speed: 9.2
+                  heading: 180
+              aircraft:
+                summary: Aircraft (ADS-B)
+                value:
+                  icao: "A1B2C3"
+                  callsign: "SQ321"
+                  altitude: 38000
+                  lat: 1.3521
+                  lon: 103.8198
+                  speed: 512
+              sensor:
+                summary: IoT sensor
+                value:
+                  device_id: "sensor-warehouse-01"
+                  temperature: 22.5
+                  humidity: 61.2
+                  lat: 51.9225
+                  lon: 4.4792
+              lorawan:
+                summary: LoRaWAN uplink
+                value:
+                  dev_eui: "0102030405060708"
+                  rssi: -85
+                  snr: 7.5
+                  temperature: 28.3
+                  lat: 1.2935
+                  lon: 103.8565
+                  entity_type: sensor
+              cef_event:
+                summary: CEF security event
+                value:
+                  cef_version: 0
+                  device_vendor: "Palo Alto Networks"
+                  name: "Brute Force Login Attempt"
+                  severity: 7
+                  src_ip: "203.0.113.42"
+                  entity_type: threat
+      responses:
+        '201':
+          description: Entity ingested successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    description: Assigned entity ID
+                  type:
+                    type: string
+                    description: Detected or assigned entity type
+                  action:
+                    type: string
+                    enum: [created, updated]
+                    description: Whether the entity was newly created or an existing one was updated
+                  confidence:
+                    type: number
+                    format: float
+                    description: Confidence score (0.0–1.0)
+              example:
+                id: "ship-mmsi-123456789"
+                type: "ship"
+                action: "created"
+                confidence: 0.9
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /ingest/batch:
+    post:
+      operationId: ingestBatch
+      summary: Batch ingest — up to 1,000 entities in one request
+      description: |
+        Ingest an array of JSON objects in a single request. Partial failures
+        are reported per-item without aborting the rest of the batch.
+      tags: [entities]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              maxItems: 1000
+              items:
+                type: object
+                additionalProperties: true
+            example:
+              - mmsi: "123456789"
+                lat: 51.92
+                lon: 4.47
+              - icao: "A12345"
+                altitude: 35000
+              - temperature: 22.5
+                humidity: 61.2
+                device_id: "sensor-001"
+      responses:
+        '200':
+          description: Batch processed (may include partial failures)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  summary:
+                    type: object
+                    properties:
+                      total:
+                        type: integer
+                      succeeded:
+                        type: integer
+                      failed:
+                        type: integer
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        index:
+                          type: integer
+                        id:
+                          type: string
+                        type:
+                          type: string
+                        action:
+                          type: string
+                          enum: [created, updated, failed]
+                        error:
+                          type: string
+              example:
+                summary:
+                  total: 3
+                  succeeded: 3
+                  failed: 0
+                results:
+                  - index: 0
+                    id: "ship-mmsi-123456789"
+                    type: "ship"
+                    action: "updated"
+                  - index: 1
+                    id: "aircraft-icao-a12345"
+                    type: "aircraft"
+                    action: "created"
+                  - index: 2
+                    id: "sensor-sensor-001"
+                    type: "sensor"
+                    action: "created"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── FEDERATION PEERS ────────────────────────────────────────────────────────
+
+  /peers:
+    get:
+      operationId: listPeers
+      summary: List federation peers
+      description: Returns all registered ORP peer instances and their connection status.
+      tags: [system]
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: List of peers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  peers:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Peer'
+                  total:
+                    type: integer
+              example:
+                peers:
+                  - id: "node-b"
+                    host: "orp-node-b.example.com"
+                    port: 9090
+                    status: "connected"
+                    last_sync_at: "2026-03-27T10:00:00Z"
+                    entities_synced: 1247
+                    trust_score: 0.7
+                total: 1
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      operationId: registerPeer
+      summary: Register a federation peer
+      description: |
+        Register another ORP instance as a peer. ORP will periodically pull
+        entities from the peer and merge them into the local knowledge graph.
+        Conflict resolution: highest `confidence` value wins.
+      tags: [system]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PeerRegistration'
+            example:
+              id: "node-b"
+              host: "orp-node-b.example.com"
+              port: 9090
+              shared_entity_types: ["ship", "aircraft", "threat"]
+              sync_enabled: true
+              trust_score: 0.7
+      responses:
+        '201':
+          description: Peer registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Peer'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Peer already registered
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /peers/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Peer ID
+        schema:
+          type: string
+
+    delete:
+      operationId: removePeer
+      summary: Remove a federation peer
+      description: Disconnect and remove a peer. Entities already synced from this peer are retained.
+      tags: [system]
+      responses:
+        '204':
+          description: Peer removed
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /peers/{id}/sync:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Peer ID
+        schema:
+          type: string
+
+    post:
+      operationId: syncPeer
+      summary: Trigger immediate sync with a peer
+      description: Bypasses the 30-second automatic sync interval and immediately pulls latest entities from the peer.
+      tags: [system]
+      responses:
+        '200':
+          description: Sync completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  peer_id:
+                    type: string
+                  entities_synced:
+                    type: integer
+                  synced_at:
+                    type: string
+                    format: date-time
+              example:
+                status: ok
+                peer_id: "node-b"
+                entities_synced: 42
+                synced_at: "2026-03-27T10:05:00Z"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   # ── SYSTEM ──────────────────────────────────────────────────────────────────
 
   /health:
@@ -1952,6 +2289,70 @@ components:
         default: desc
 
   schemas:
+
+    # ── Federation ─────────────────────────────────────────────────────────────
+
+    Peer:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Peer identifier
+        host:
+          type: string
+          description: Peer hostname or IP
+        port:
+          type: integer
+          description: Peer port (default 9090)
+        status:
+          type: string
+          enum: [connected, disconnected, syncing, error]
+        last_sync_at:
+          type: string
+          format: date-time
+          nullable: true
+        entities_synced:
+          type: integer
+          description: Total entities synced from this peer (lifetime)
+        trust_score:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: Trust weight for data from this peer
+      required: [id, host, port, status]
+
+    PeerRegistration:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Unique identifier for this peer
+        host:
+          type: string
+          description: Peer hostname or IP address
+        port:
+          type: integer
+          description: Peer API port (default 9090)
+          default: 9090
+        shared_entity_types:
+          type: array
+          items:
+            type: string
+          description: Entity types to sync from this peer
+          example: [ship, aircraft, threat]
+        sync_enabled:
+          type: boolean
+          default: true
+          description: Whether automatic periodic sync is enabled
+        trust_score:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          default: 0.7
+          description: Trust weight assigned to data received from this peer
+      required: [id, host]
 
     # ── Pagination ─────────────────────────────────────────────────────────────
 

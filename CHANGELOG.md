@@ -6,6 +6,46 @@ This project follows [Semantic Versioning](https://semver.org/) and [Conventiona
 
 ---
 
+## [0.2.0-alpha] — 2026-03-27
+
+### New Protocol Adapters (15 new parsers)
+
+- **ACARS** — Aircraft Communications Addressing and Reporting System data link. Decodes ACARS messages from VHF ground stations or satellite feeds; maps flight ID, registration, message label, and payload to ORP entities.
+- **BACnet** — Building Automation and Control Networks (ASHRAE 135). Reads device objects, analog/binary values, and trend logs from BACnet/IP gateways. Enables facility sensors in the ORP knowledge graph.
+- **GRIB** — WMO Gridded Binary weather model data (GRIB 1 and GRIB 2). Ingests NWP forecast grids (wind, pressure, temperature) and creates geospatial `WeatherGrid` entities with valid-time metadata.
+- **CEF** — ArcSight Common Event Format. Parses CEF syslog frames into structured security events; maps severity, device vendor, and extension fields to ORP `ThreatEvent` entities.
+- **LoRaWAN** — Long-range IoT network frames via ChirpStack/TTN REST API. Decodes device EUI, payload bytes, RSSI, SNR, and GPS coordinates from LoRa sensor uplinks.
+- **NMEA 2000 / N2K** — Modern CAN-bus marine protocol via YDWG-02 or similar gateway (serial/UDP). Parses PGNs for vessel position, speed, heading, depth, wind, and engine data.
+- **NFFI** — NATO Friendly Force Information (APP-6 symbology). Decodes NFFI XML track messages including unit identity, SIDC symbol code, speed, heading, and operational status.
+- **SparkplugB** — Industrial MQTT payload specification (Eclipse Tahu). Parses NBIRTH, DBIRTH, NDATA, DDATA payloads into structured metric entities.
+- **DNP3** — Distributed Network Protocol 3 for utility SCADA and substations. Reads analog inputs, binary inputs, counters, and control outputs from DNP3 outstations.
+- **CAN / CANbus** — CAN 2.0A/B frame capture via SocketCAN (Linux) and peak/kvaser interfaces. J1939 PGN decoding for vehicle telemetry.
+- **PCAP** — Packet capture (.pcap / .pcapng) replay and live capture (libpcap). Extracts IP flows, DNS queries, and HTTP metadata into network entity objects.
+- **Zeek** — Zeek (formerly Bro) network security monitor log ingestion. Parses conn.log, dns.log, http.log, ssl.log, and notice.log into ORP threat and host entities.
+- **NetFlow / IPFIX** — Cisco NetFlow v5/v9 and IPFIX flow telemetry via UDP collector. Maps flow src/dst, bytes, packets, and AS numbers to network entities.
+- **METAR** — Aviation Routine Weather Report. Parses METAR and SPECI strings from NOAA/AVIMET feeds; creates `WeatherStation` entities with decoded present weather, visibility, and altimeter.
+- **GTFS-RT** — General Transit Feed Specification Realtime (Protocol Buffers). Ingests VehiclePositions, TripUpdates, and ServiceAlerts from any GTFS-RT feed URL.
+
+### Security Audit Fixes
+
+- **Rate limiter**: Moved from 1,000 req/sec (openapi.yaml description) to the actual implementation of 100 tokens/sec per IP with token-bucket refill. Documentation updated to reflect true limits.
+- **CORS**: Replaced wildcard `Any` origin with explicit allowlist from `ORP_CORS_ORIGINS` environment variable. Fallback is `http://localhost:3000` only — not `*`.
+- **Ed25519 signing**: Audit signer is now always initialized (fresh keypair generated if none provided in `ServerConfig`). Events from unsigned connectors receive `low_confidence` flag rather than being silently accepted.
+
+### Project Stats (as of this release)
+
+- **Crates:** 12
+- **Rust source files:** 85
+- **Lines of Rust:** 51,641
+- **Tests:** 764 passing
+- **Clippy warnings:** 0
+- **Protocol adapters:** 32
+- **Git commits:** 50
+- **Binary (core):** 43 MB
+- **License:** Apache 2.0
+
+---
+
 ## [0.1.0-alpha] — 2026-03-26
 
 Initial alpha release of ORP — Open Reality Protocol.
@@ -114,7 +154,7 @@ This release delivers a complete, working single-binary data fusion platform: re
 | Simple query P50 | ~150 ms |
 | Stream throughput | 100K+ events/sec |
 | Map rendering (50K entities) | 60 fps |
-| Tests passing | 203 |
+| Tests passing | 203 (764 as of 0.2.0-alpha) |
 | Clippy warnings | 0 |
 
 ### Known Limitations (Alpha)
@@ -129,9 +169,9 @@ This release delivers a complete, working single-binary data fusion platform: re
 ### Project Stats
 
 - **Crates:** 12
-- **Rust source files:** 53
-- **Lines of Rust:** ~17,000
-- **Tests:** 203 passing
+- **Rust source files:** 53 (85 as of 0.2.0-alpha)
+- **Lines of Rust:** ~17,000 (51,641 as of 0.2.0-alpha)
+- **Tests:** 203 passing (764 as of 0.2.0-alpha)
 - **Binary (core):** 43 MB
 - **License:** Apache 2.0
 

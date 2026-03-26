@@ -539,6 +539,154 @@ docker run -d -p 8080:8080 orp:local
 
 ---
 
+## 10. New Protocol Examples
+
+### ACARS (Aircraft Data Link)
+
+```bash
+# ACARS messages ingested from VHF ground station or Aero satellite feed
+curl -X POST https://orp.example.com/api/v1/ingest \
+  -H "Authorization: Bearer $ORP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "acars_label": "H1",
+    "registration": "9V-SMF",
+    "flight": "SQ321",
+    "message_text": "/POSREP .SQ321 1432 0133N 10353E 390 503 0139 0143N 10400E",
+    "freq_mhz": 129.125,
+    "entity_type": "aircraft"
+  }'
+```
+
+### BACnet (Building Automation)
+
+```bash
+# BACnet/IP device readings via ORP's BACnet adapter
+curl -X POST https://orp.example.com/api/v1/ingest \
+  -H "Authorization: Bearer $ORP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "bacnet_device_id": 102,
+    "bacnet_object": "analog-input:1",
+    "description": "Zone Temperature",
+    "value": 22.4,
+    "units": "degrees-celsius",
+    "building": "HQ-Block-A",
+    "floor": 3,
+    "lat": 1.3521,
+    "lon": 103.8198,
+    "entity_type": "sensor"
+  }'
+```
+
+### GRIB (Weather Model Data)
+
+```bash
+# GRIB-derived weather grid entity (parsed by ORP GRIB adapter)
+curl -X POST https://orp.example.com/api/v1/ingest \
+  -H "Authorization: Bearer $ORP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "grib_model": "GFS",
+    "grib_valid_time": "2026-03-27T06:00:00Z",
+    "grib_parameter": "wind_speed_10m",
+    "value": 18.5,
+    "units": "knots",
+    "lat": 1.35,
+    "lon": 103.82,
+    "entity_type": "weather_grid"
+  }'
+```
+
+### CEF (Security Events)
+
+```bash
+# Common Event Format security event
+curl -X POST https://orp.example.com/api/v1/ingest \
+  -H "Authorization: Bearer $ORP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cef_version": 0,
+    "device_vendor": "Palo Alto Networks",
+    "device_product": "PAN-OS",
+    "device_version": "11.0",
+    "signature_id": "9999",
+    "name": "Brute Force Login Attempt",
+    "severity": 7,
+    "src_ip": "203.0.113.42",
+    "dst_ip": "10.0.1.5",
+    "dst_port": 22,
+    "entity_type": "threat"
+  }'
+```
+
+### LoRaWAN (IoT Sensors)
+
+```bash
+# LoRaWAN uplink from ChirpStack integration
+curl -X POST https://orp.example.com/api/v1/ingest \
+  -H "Authorization: Bearer $ORP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dev_eui": "0102030405060708",
+    "app_eui": "0807060504030201",
+    "rssi": -85,
+    "snr": 7.5,
+    "frequency": 868.1,
+    "sf": 7,
+    "temperature": 28.3,
+    "humidity": 72.1,
+    "battery_mv": 3300,
+    "lat": 1.2935,
+    "lon": 103.8565,
+    "entity_type": "sensor"
+  }'
+```
+
+### NMEA 2000 / N2K (Marine CAN Bus)
+
+```bash
+# NMEA 2000 PGN decoded entity (from YDWG-02 or similar gateway)
+curl -X POST https://orp.example.com/api/v1/ingest \
+  -H "Authorization: Bearer $ORP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "n2k_pgn": 129025,
+    "n2k_src": 3,
+    "name": "MV Sentinel",
+    "lat": 1.2678,
+    "lon": 103.8527,
+    "sog_knots": 8.4,
+    "cog_deg": 225.0,
+    "hdg_deg": 223.5,
+    "depth_m": 18.2,
+    "entity_type": "ship"
+  }'
+```
+
+### NFFI (NATO Friendly Force Information)
+
+```bash
+# NATO NFFI track message
+curl -X POST https://orp.example.com/api/v1/ingest \
+  -H "Authorization: Bearer $ORP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "nffi_unit_id": "BRAVO-2-3",
+    "sidc": "SFGPUCII-------",
+    "affiliation": "friendly",
+    "echelon": "squad",
+    "lat": 48.8566,
+    "lon": 2.3522,
+    "speed_kmh": 12,
+    "heading_deg": 090,
+    "operational_status": "fully_capable",
+    "entity_type": "military_unit"
+  }'
+```
+
+---
+
 ## Quick Reference
 
 | Endpoint                         | Method | Purpose                              |
