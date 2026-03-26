@@ -3,6 +3,7 @@ pub mod traits;
 
 pub use adapters::adsb::AdsbConnector;
 pub use adapters::ais::AisConnector;
+pub use adapters::cot::CotConnector;
 pub use adapters::csv_watcher::CsvWatcherConnector;
 pub use adapters::database::DatabaseConnector;
 pub use adapters::generic_api::GenericApiConnector;

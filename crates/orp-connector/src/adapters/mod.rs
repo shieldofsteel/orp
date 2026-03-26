@@ -1,6 +1,7 @@
 pub mod adsb;
 pub mod ais;
 pub mod nmea;
+pub mod cot;
 pub mod csv_watcher;
 pub mod database;
 pub mod generic_api;
