@@ -55,6 +55,7 @@ const TILE_CONFIGS: Record<TileLayerType, TileConfig> = {
   satellite: {
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     attribution: '© Esri, Maxar, Earthstar Geographics',
+    subdomains: '',
     opacity: 1,
     darkFilter: false,
     maxZoom: 19,
@@ -70,6 +71,7 @@ const TILE_CONFIGS: Record<TileLayerType, TileConfig> = {
   topo: {
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',
     attribution: '© Esri, HERE, Garmin, OpenStreetMap',
+    subdomains: '',
     opacity: 1,
     darkFilter: true,
     maxZoom: 19,
