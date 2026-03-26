@@ -3,6 +3,7 @@
 //! Uses `RocksDbDedupWindow` for crash-safe deduplication and exposes
 //! the `StreamProcessor` trait for testability / mock injection.
 
+use crate::analytics::AnalyticsEngine;
 use crate::dedup::{DedupError, RocksDbDedupWindow};
 use crate::dlq::DeadLetterQueue;
 use async_trait::async_trait;
@@ -86,6 +87,8 @@ pub struct DefaultStreamProcessor {
     /// Latency accumulator for rolling average.
     latency_sum_ms: Mutex<f64>,
     latency_count: Mutex<u64>,
+    /// Optional analytics engine — fed on every position update for CPA / anomaly / threat scoring.
+    analytics: Option<Arc<AnalyticsEngine>>,
 }
 
 impl DefaultStreamProcessor {
@@ -121,7 +124,21 @@ impl DefaultStreamProcessor {
             stats: Mutex::new(ProcessorStats::default()),
             latency_sum_ms: Mutex::new(0.0),
             latency_count: Mutex::new(0),
+            analytics: None,
         }
+    }
+
+    /// Attach an analytics engine to the processor. When entities update,
+    /// the processor feeds position data into the analytics pipeline for
+    /// CPA, anomaly detection, and threat scoring.
+    pub fn with_analytics(mut self, engine: Arc<AnalyticsEngine>) -> Self {
+        self.analytics = Some(engine);
+        self
+    }
+
+    /// Get a reference to the analytics engine, if attached.
+    pub fn analytics(&self) -> Option<&Arc<AnalyticsEngine>> {
+        self.analytics.as_ref()
     }
 
     /// Expose the signer's public key so callers can register it for verification.
@@ -201,6 +218,20 @@ impl DefaultStreamProcessor {
         entity.last_updated = event.timestamp;
         entity.confidence = event.confidence;
         self.storage.insert_entity(&entity).await?;
+
+        // Feed position updates into the analytics engine (non-blocking).
+        if let (Some(analytics), EventPayload::PositionUpdate { latitude, longitude, speed_knots, course_degrees, .. }) =
+            (&self.analytics, &event.payload)
+        {
+            let speed = speed_knots.unwrap_or(0.0);
+            let course = course_degrees.unwrap_or(0.0);
+            let position = orp_proto::GeoPoint { lat: *latitude, lon: *longitude, alt: None };
+            // Fire and forget — analytics are best-effort and must not block the pipeline.
+            let _ = analytics
+                .ingest(&event.entity_id, position, speed, course, event.timestamp, &[])
+                .await;
+        }
+
         Ok(())
     }
 

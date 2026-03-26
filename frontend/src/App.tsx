@@ -8,6 +8,11 @@ import { EntityInspector } from './components/EntityInspector';
 import { TimelineScrubber } from './components/TimelineScrubber';
 import { Sidebar } from './components/Sidebar';
 import { LoginPage } from './components/LoginPage';
+import { Dashboard } from './components/Dashboard';
+import { SearchPanel } from './components/SearchPanel';
+import { QueryConsole } from './components/QueryConsole';
+
+type AppTab = 'map' | 'dashboard' | 'search' | 'query';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -20,7 +25,15 @@ const queryClient = new QueryClient({
 });
 
 // ── Header ─────────────────────────────────────────────────────────────────
-function Header({ onLogout }: { onLogout: () => void }) {
+function Header({
+  onLogout,
+  activeTab,
+  onTabChange,
+}: {
+  onLogout: () => void;
+  activeTab: AppTab;
+  onTabChange: (tab: AppTab) => void;
+}) {
   const wsConnected = useAppStore((s) => s.wsConnected);
   const sidebarOpen = useAppStore((s) => s.sidebarOpen);
   const setSidebarOpen = useAppStore((s) => s.setSidebarOpen);
@@ -30,6 +43,13 @@ function Header({ onLogout }: { onLogout: () => void }) {
     setDarkMode((v) => !v);
     document.documentElement.classList.toggle('dark');
   };
+
+  const TABS: { id: AppTab; label: string }[] = [
+    { id: 'map', label: 'Map' },
+    { id: 'dashboard', label: 'Dashboard' },
+    { id: 'search', label: 'Search' },
+    { id: 'query', label: 'Query' },
+  ];
 
   return (
     <header
@@ -68,19 +88,26 @@ function Header({ onLogout }: { onLogout: () => void }) {
 
       <div className="h-5 w-px bg-gray-800 mx-1" aria-hidden="true" />
 
-      {/* Breadcrumb navigation */}
-      <nav aria-label="Current location breadcrumb">
-        <ol className="flex items-center gap-1.5 text-[10px] text-gray-500 list-none m-0 p-0">
-          <li>
-            <span>Data Fusion</span>
-          </li>
-          <li aria-hidden="true">
-            <span className="text-gray-700">/</span>
-          </li>
-          <li aria-current="page">
-            <span className="text-gray-400">Map View</span>
-          </li>
-        </ol>
+      {/* Tab navigation */}
+      <nav aria-label="Application sections" className="flex items-center h-full">
+        <span className="text-[10px] text-gray-600 mr-2 hidden sm:inline">Data Fusion /</span>
+        <div className="flex items-center h-full" role="tablist">
+          {TABS.map((tab) => (
+            <button
+              key={tab.id}
+              role="tab"
+              aria-selected={activeTab === tab.id}
+              onClick={() => onTabChange(tab.id)}
+              className={`h-full px-4 text-[11px] font-medium tracking-wide border-b-2 transition-colors focus:outline-none ${
+                activeTab === tab.id
+                  ? 'text-blue-400 border-blue-500 bg-blue-950/20'
+                  : 'text-gray-500 border-transparent hover:text-gray-300 hover:border-gray-700'
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
       </nav>
 
       <div className="flex-1" />
@@ -223,6 +250,7 @@ function Header({ onLogout }: { onLogout: () => void }) {
 
 // ── App Content ─────────────────────────────────────────────────────────────
 function AppContent({ onLogout }: { onLogout: () => void }) {
+  const [activeTab, setActiveTab] = useState<AppTab>('map');
   const setEntities = useAppStore((s) => s.setEntities);
   const inspectorOpen = useAppStore((s) => s.inspectorOpen);
   const setInspectorOpen = useAppStore((s) => s.setInspectorOpen);
@@ -266,7 +294,7 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
         Skip to main content
       </a>
 
-      <Header onLogout={onLogout} />
+      <Header onLogout={onLogout} activeTab={activeTab} onTabChange={setActiveTab} />
 
       <div className="flex flex-1 overflow-hidden">
         {/* Sidebar navigation */}
@@ -283,20 +311,41 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
         <main
           id="main-content"
           role="main"
-          aria-label="Operations map and entity inspector"
+          aria-label="Operations main content"
           className="flex-1 flex overflow-hidden relative"
           tabIndex={-1}
         >
-          <MapView />
+          {/* Map tab */}
+          {activeTab === 'map' && (
+            <>
+              <MapView />
+              {inspectorOpen && (
+                <aside role="complementary" aria-label="Entity details inspector">
+                  <EntityInspector />
+                </aside>
+              )}
+            </>
+          )}
 
-          {/* Entity inspector — complementary panel */}
-          {inspectorOpen && (
-            <aside
-              role="complementary"
-              aria-label="Entity details inspector"
-            >
-              <EntityInspector />
-            </aside>
+          {/* Dashboard tab */}
+          {activeTab === 'dashboard' && (
+            <div className="flex-1 overflow-hidden">
+              <Dashboard onNavigate={(tab) => setActiveTab(tab as AppTab)} />
+            </div>
+          )}
+
+          {/* Search tab */}
+          {activeTab === 'search' && (
+            <div className="flex-1 overflow-hidden relative">
+              <SearchPanel />
+            </div>
+          )}
+
+          {/* Query tab */}
+          {activeTab === 'query' && (
+            <div className="flex-1 overflow-hidden relative">
+              <QueryConsole />
+            </div>
           )}
         </main>
       </div>

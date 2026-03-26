@@ -322,8 +322,12 @@ pub async fn run_start(
         RocksDbDedupWindow::open(&dedup_path, 3600)
             .map_err(|e| anyhow::anyhow!("Dedup init failed: {}", e))?,
     );
-    let processor: Arc<dyn StreamProcessor> =
-        Arc::new(DefaultStreamProcessor::new(storage.clone(), dedup, None, 50));
+    // Initialize analytics engine for CPA, anomaly detection, and threat scoring
+    let analytics_engine = Arc::new(orp_stream::AnalyticsEngine::new());
+    let processor: Arc<dyn StreamProcessor> = Arc::new(
+        DefaultStreamProcessor::new(storage.clone(), dedup, None, 50)
+            .with_analytics(analytics_engine),
+    );
 
     // Initialize query executor
     let query_executor = Arc::new(QueryExecutor::new(storage.clone()));
@@ -521,6 +525,22 @@ pub async fn run_start(
 
     let api_key_service = Arc::new(ApiKeyService::new());
 
+    // Initialize layer registry (separate in-memory DuckDB for overlays)
+    let layer_registry = {
+        let layer_conn = duckdb::Connection::open_in_memory()
+            .map_err(|e| anyhow::anyhow!("Layer DB init failed: {}", e))?;
+        let layer_conn = Arc::new(std::sync::Mutex::new(layer_conn));
+        let registry = server::layers::LayerRegistry::new(layer_conn)
+            .map_err(|e| anyhow::anyhow!("Layer registry init failed: {}", e))?;
+        // Seed built-in layers (shipping lanes, ICAO airspace, etc.)
+        if let Ok(seeded) = registry.seed_builtin_layers() {
+            if !seeded.is_empty() {
+                tracing::info!("Seeded {} built-in layers", seeded.len());
+            }
+        }
+        Arc::new(registry)
+    };
+
     server::http::start_server(server::http::ServerConfig {
         storage,
         query_executor,
@@ -530,6 +550,7 @@ pub async fn run_start(
         abac_engine,
         api_key_service,
         audit_signer: None,
+        layer_registry: Some(layer_registry),
         port,
     })
     .await?;

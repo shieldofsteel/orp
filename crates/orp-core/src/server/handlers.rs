@@ -1890,6 +1890,7 @@ mod tests {
             audit_signer,
             broadcast_tx,
             started_at: std::time::Instant::now(),
+            layer_registry: None,
         })
     }
 

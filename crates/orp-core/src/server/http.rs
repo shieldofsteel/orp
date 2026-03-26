@@ -1,4 +1,5 @@
 use crate::server::handlers;
+use crate::server::layers;
 use crate::server::websocket;
 use anyhow::Result;
 use axum::{
@@ -34,6 +35,8 @@ pub struct AppState {
     pub audit_signer: Arc<EventSigner>,
     pub broadcast_tx: broadcast::Sender<websocket::BroadcastEvent>,
     pub started_at: std::time::Instant,
+    /// Layer registry for intelligence overlays (optional — None if DB unavailable).
+    pub layer_registry: Option<Arc<layers::LayerRegistry>>,
 }
 
 /// Per-IP rate limiter state — token bucket with 100 req/sec.
@@ -183,6 +186,8 @@ pub struct ServerConfig {
     pub api_key_service: Arc<ApiKeyService>,
     /// Optional Ed25519 signer; a fresh one is generated if None.
     pub audit_signer: Option<Arc<EventSigner>>,
+    /// Optional layer registry for intelligence overlays.
+    pub layer_registry: Option<Arc<layers::LayerRegistry>>,
     pub port: u16,
 }
 
@@ -204,12 +209,18 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         audit_signer,
         broadcast_tx,
         started_at: std::time::Instant::now(),
+        layer_registry: config.layer_registry,
     });
 
     let cors = build_cors_layer();
     let rate_limiter = RateLimiter::new(100, 100); // 100 tokens, refill 100/sec
 
-    let app = Router::new()
+    // Build the optional layers sub-router
+    let layers_subrouter = state.layer_registry.as_ref().map(|registry| {
+        layers::layers_router(Arc::clone(registry))
+    });
+
+    let mut app = Router::new()
         // Health (no auth required)
         .route("/api/v1/health", get(handlers::health_check))
         // Metrics (auth required — handler extracts AuthContext)
@@ -288,6 +299,11 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
+
+    // Nest the layers sub-router if registry is available
+    if let Some(subrouter) = layers_subrouter {
+        app = app.nest("/api/v1", subrouter);
+    }
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
     tracing::info!("ORP server listening on port {}", config.port);

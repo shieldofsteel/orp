@@ -67,10 +67,12 @@ export function useWebSocket(
   }, []);
 
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    const WS = globalThis.WebSocket;
+    if (wsRef.current?.readyState === WS?.OPEN) return;
 
     try {
-      const ws = new WebSocket(getWsUrl());
+      const url = getWsUrl();
+      const ws = new WS(url);
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -218,7 +220,7 @@ export function useWebSocket(
     subscriptionsRef.current = subs;
 
     // If already connected, send immediately
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
+    if (wsRef.current?.readyState === globalThis.WebSocket?.OPEN) {
       sendSubscriptions(wsRef.current);
     }
   }, [opts.entityType, opts.entityId, opts.region, sendSubscriptions]);
@@ -234,7 +236,7 @@ export function useWebSocket(
   }, []);
 
   const send = useCallback((message: Record<string, unknown>) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
+    if (wsRef.current?.readyState === globalThis.WebSocket?.OPEN) {
       wsRef.current.send(JSON.stringify(message));
     }
   }, []);
@@ -242,7 +244,7 @@ export function useWebSocket(
   const subscribe = useCallback(
     (id: string, config: SubscriptionConfig) => {
       subscriptionsRef.current = [...subscriptionsRef.current, { id, config }];
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
+      if (wsRef.current?.readyState === globalThis.WebSocket?.OPEN) {
         wsRef.current.send(JSON.stringify({ type: 'subscribe', id, data: config }));
       }
     },
@@ -251,7 +253,7 @@ export function useWebSocket(
 
   const unsubscribe = useCallback((subscriptionId: string) => {
     subscriptionsRef.current = subscriptionsRef.current.filter((s) => s.id !== subscriptionId);
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
+    if (wsRef.current?.readyState === globalThis.WebSocket?.OPEN) {
       wsRef.current.send(
         JSON.stringify({ type: 'unsubscribe', id: `unsub-${Date.now()}`, data: { subscription_id: subscriptionId } })
       );

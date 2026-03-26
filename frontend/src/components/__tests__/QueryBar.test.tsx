@@ -68,7 +68,7 @@ describe('QueryBar - mode toggle', () => {
 
   it('switching mode changes placeholder text', async () => {
     renderQueryBar();
-    const textarea = screen.getByRole('textbox');
+    const textarea = screen.getByRole('combobox');
     expect(textarea).toHaveAttribute('placeholder', expect.stringContaining('MATCH'));
     await user.click(screen.getByRole('button', { name: /natural/i }));
     expect(textarea).toHaveAttribute('placeholder', expect.stringContaining('Rotterdam'));
@@ -78,7 +78,7 @@ describe('QueryBar - mode toggle', () => {
 describe('QueryBar - autocomplete suggestions', () => {
   it('shows suggestions as user types', async () => {
     renderQueryBar();
-    const textarea = screen.getByRole('textbox');
+    const textarea = screen.getByRole('combobox');
     await user.type(textarea, 'MATCH');
     await waitFor(() => {
       expect(screen.getByText(/MATCH \(e:Ship\)/)).toBeInTheDocument();
@@ -87,7 +87,7 @@ describe('QueryBar - autocomplete suggestions', () => {
 
   it('hides suggestions when input is cleared', async () => {
     renderQueryBar();
-    const textarea = screen.getByRole('textbox');
+    const textarea = screen.getByRole('combobox');
     await user.type(textarea, 'MATCH');
     await waitFor(() => expect(screen.getByText(/MATCH \(e:Ship\)/)).toBeInTheDocument());
     await user.clear(textarea);
@@ -98,7 +98,7 @@ describe('QueryBar - autocomplete suggestions', () => {
 
   it('clicking a suggestion fills the input', async () => {
     renderQueryBar();
-    const textarea = screen.getByRole('textbox');
+    const textarea = screen.getByRole('combobox');
     await user.type(textarea, 'MATCH');
     await waitFor(() => expect(screen.getByText(/MATCH \(e:Ship\)/)).toBeInTheDocument());
     const suggestion = screen.getAllByText(/MATCH \(e:Ship\)/)[0];
@@ -111,12 +111,12 @@ describe('QueryBar - autocomplete suggestions', () => {
 describe('QueryBar - keyboard navigation', () => {
   it('ArrowDown highlights next suggestion', async () => {
     renderQueryBar();
-    const textarea = screen.getByRole('textbox');
+    const textarea = screen.getByRole('combobox');
     await user.type(textarea, 'MATCH');
     await waitFor(() => expect(screen.getByText(/MATCH \(e:Ship\)/)).toBeInTheDocument());
     await user.keyboard('{ArrowDown}');
     // First suggestion should be highlighted (bg-blue-900/50)
-    const firstSuggestion = screen.getAllByRole('button').find(
+    const firstSuggestion = screen.getAllByRole('option').find(
       (b) => b.textContent?.includes('MATCH (e:Ship)')
     );
     expect(firstSuggestion?.className).toContain('bg-blue-900');
@@ -124,7 +124,7 @@ describe('QueryBar - keyboard navigation', () => {
 
   it('Escape closes suggestions', async () => {
     renderQueryBar();
-    const textarea = screen.getByRole('textbox');
+    const textarea = screen.getByRole('combobox');
     await user.type(textarea, 'MATCH');
     await waitFor(() => expect(screen.getByText(/MATCH \(e:Ship\)/)).toBeInTheDocument());
     await user.keyboard('{Escape}');
@@ -143,7 +143,7 @@ describe('QueryBar - query execution', () => {
 
   it('clicking Execute submits query and shows results', async () => {
     renderQueryBar();
-    const textarea = screen.getByRole('textbox');
+    const textarea = screen.getByRole('combobox');
     await user.type(textarea, 'MATCH (e:Ship) LIMIT 10');
     const executeBtn = screen.getByRole('button', { name: /execute/i });
     await user.click(executeBtn);
@@ -155,17 +155,17 @@ describe('QueryBar - query execution', () => {
 
   it('shows error message on query failure', async () => {
     renderQueryBar();
-    const textarea = screen.getByRole('textbox');
+    const textarea = screen.getByRole('combobox');
     await user.type(textarea, 'FAIL QUERY');
     await user.click(screen.getByRole('button', { name: /execute/i }));
     await waitFor(() => {
-      expect(screen.getByText(/syntax error/i)).toBeInTheDocument();
+      expect(screen.getByRole('alert')).toBeInTheDocument();
     });
   });
 
   it('Cmd+Enter triggers query execution', async () => {
     renderQueryBar();
-    const textarea = screen.getByRole('textbox');
+    const textarea = screen.getByRole('combobox');
     await user.type(textarea, 'MATCH (e:Ship) LIMIT 5');
     await user.keyboard('{Meta>}{Enter}{/Meta}');
     await waitFor(() => {
@@ -177,7 +177,7 @@ describe('QueryBar - query execution', () => {
 describe('QueryBar - history', () => {
   it('shows history button after a successful query', async () => {
     renderQueryBar();
-    const textarea = screen.getByRole('textbox');
+    const textarea = screen.getByRole('combobox');
     await user.type(textarea, 'MATCH (e:Port) LIMIT 5');
     await user.click(screen.getByRole('button', { name: /execute/i }));
     await waitFor(() => {

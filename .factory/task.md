@@ -1,31 +1,23 @@
-# ORP — Fix Live UI Bugs
+# ORP — Military-Grade Integration Build
 
-3 real bugs found from browser testing. Fix all.
+5 teams wrote ~12,600 lines. Make it compile and work.
 
-## Bug 1: Frontend hardcodes localhost:9090
-`frontend/src/hooks/useEntities.ts` and `useWebSocket.ts` hardcode API URL to port 9090. Fix: use relative URLs (`/api/v1/...`) so the frontend uses same origin as the server. The Axum server serves both the frontend AND the API.
+## 1. Fix Compilation
+Run `cargo check`. New files: analytics.rs, threat.rs, layers.rs, generic_api.rs, syslog.rs, database.rs. Resolve all import/type conflicts. Update lib.rs exports for orp-stream and orp-connector. Update mod.rs for adapters.
 
-## Bug 2: Sidebar has fake mock connectors
-`frontend/src/components/Sidebar.tsx` has MOCK_CONNECTORS with "degraded" and "error" statuses. Remove ALL mock data. Only show real connectors from the API. If API returns empty, show "No connectors configured".
+## 2. Fix Frontend
+New components: MapControls.tsx, SearchPanel.tsx, QueryConsole.tsx, Dashboard.tsx, EntityCard.tsx. Updated: MapView.tsx, EntityInspector.tsx, App.tsx. Run `cd frontend && npm run build` — fix any TS errors.
 
-## Bug 3: Deck.gl crash "Cannot read properties of null (reading 'luma')"
-MapView.tsx has a rendering error. The issue is likely entity data format mismatch — coordinates might be null or the layer config has wrong accessors. Fix:
-- Add null guards on ALL getPosition/getColor accessors
-- Filter entities with valid coordinates before passing to layers
-- Ensure MapLibre map renders even with no entities (show the base map)
-- Test: the map MUST show a visible map with tiles, even if no entities are visible
+## 3. Wire Layers API
+Add layer endpoints (GET/POST/PUT/DELETE /api/v1/layers) to http.rs router and handlers.rs.
 
-## Bug 4: ORP is NOT maritime-only
-The frontend says "Maritime Operations" or similar. Fix:
-- Header should say "ORP Console — Data Fusion Platform"
-- Remove any maritime-specific hardcoding in the UI
-- The sidebar, query bar, and entity inspector should be domain-agnostic
+## 4. Wire Analytics
+Connect analytics engine (CPA, anomaly detection, threat scoring) to the stream processor pipeline. When entities update, run analytics checks.
 
-## After fixing
-- `cd frontend && npm run build`
-- Copy dist to where Axum serves it
-- Rebuild: `cargo build --release`
-- Start: `ORP_DEV_MODE=true ./target/release/orp start --dev`
-- Verify: no console errors, map renders, entities visible
+## 5. Verify
+- cargo test — all must pass
+- cargo clippy — zero warnings
+- frontend builds clean
+- Server starts without errors
 
-cargo test + clippy must pass. Commit + push.
+Commit + push. Message: "feat: military-grade COP — analytics, threat, layers, universal connectors, map controls, dashboard"
