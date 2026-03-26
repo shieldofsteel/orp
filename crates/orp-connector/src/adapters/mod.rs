@@ -30,3 +30,4 @@ pub mod stix;
 pub mod syslog;
 pub mod websocket_client;
 pub mod zeek;
+pub mod aisstream;

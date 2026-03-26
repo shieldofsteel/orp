@@ -34,3 +34,4 @@ pub use adapters::syslog::SyslogConnector;
 pub use adapters::websocket_client::WebSocketClientConnector;
 pub use adapters::zeek::ZeekConnector;
 pub use traits::{Connector, ConnectorConfig, ConnectorError, ConnectorStats, SourceEvent};
+pub use adapters::aisstream::AisStreamConnector;

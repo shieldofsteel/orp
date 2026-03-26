@@ -19,3 +19,5 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 # The serial feature falls back to raw file IO on platforms without tokio-serial.
 # Uncomment to enable proper baud-rate control via tokio-serial:
 # tokio-serial = { version = "5", optional = true }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
