@@ -109,7 +109,7 @@ export const useAppStore = create<AppState>((set) => ({
   inspectorTab: 'properties',
 
   mapCenter: [4.27, 51.92],
-  mapZoom: 8,
+  mapZoom: 10,
   mapMode: '2d',
   showWeatherLayer: true,
   showShipTracksLayer: true,
