@@ -15,21 +15,40 @@ use orp_stream::{
     ThresholdOp,
 };
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::sync::Arc;
+use tabled::builder::Builder;
+use tabled::settings::{object::Rows, Color, Style};
 use tokio::sync::mpsc;
 
-use super::args::OutputFormat;
+use super::args::{ConnectorType, OutputFormat, Severity};
 use crate::server;
 use orp_stream::RocksDbDedupWindow;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Terminal detection ────────────────────────────────────────────────────────
 
-/// Check NO_COLOR env var to respect the convention.
-fn colors_enabled() -> bool {
-    std::env::var("NO_COLOR").is_err()
+/// Returns true if we should emit ANSI colors.
+///
+/// Priority:
+///   1. `NO_COLOR` env var set → no color
+///   2. `CLICOLOR_FORCE=1`    → force color
+///   3. stdout is a TTY       → color; otherwise no color (piped)
+pub fn colors_enabled() -> bool {
+    if std::env::var("NO_COLOR").is_ok() {
+        return false;
+    }
+    if std::env::var("CLICOLOR_FORCE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    std::io::stdout().is_terminal()
 }
 
-fn print_header(msg: &str) {
+// ── Print helpers ─────────────────────────────────────────────────────────────
+
+pub fn print_header(msg: &str) {
     if colors_enabled() {
         println!("{}", msg.bold().cyan());
     } else {
@@ -37,7 +56,7 @@ fn print_header(msg: &str) {
     }
 }
 
-fn print_success(msg: &str) {
+pub fn print_success(msg: &str) {
     if colors_enabled() {
         println!("{} {}", "✓".green().bold(), msg.green());
     } else {
@@ -45,7 +64,7 @@ fn print_success(msg: &str) {
     }
 }
 
-fn print_error(msg: &str) {
+pub fn print_error(msg: &str) {
     if colors_enabled() {
         eprintln!("{} {}", "✗".red().bold(), msg.red());
     } else {
@@ -53,16 +72,103 @@ fn print_error(msg: &str) {
     }
 }
 
-fn format_csv(rows: &[HashMap<String, serde_json::Value>], columns: &[String]) -> String {
-    let mut wtr = csv::Writer::from_writer(vec![]);
-    // Header
-    let _ = wtr.write_record(columns);
-    // Rows
+pub fn print_warning(msg: &str) {
+    if colors_enabled() {
+        eprintln!("{} {}", "⚠".yellow().bold(), msg.yellow());
+    } else {
+        eprintln!("WARN: {}", msg);
+    }
+}
+
+/// Print an error and exit with code 1.
+pub fn fatal(msg: &str) -> ! {
+    print_error(msg);
+    std::process::exit(1);
+}
+
+// ── Confirmation prompt ───────────────────────────────────────────────────────
+
+/// Ask for y/N confirmation unless `skip` is true or we're non-interactive.
+/// Returns `false` (abort) if stdin is not a TTY and skip=false.
+pub fn confirm(prompt: &str, skip: bool) -> bool {
+    if skip {
+        return true;
+    }
+    if !std::io::stdin().is_terminal() {
+        print_error(&format!(
+            "{} — pass --yes to confirm non-interactively",
+            prompt
+        ));
+        return false;
+    }
+    eprint!("{} [y/N] ", prompt);
+    let mut input = String::new();
+    let _ = std::io::stdin().read_line(&mut input);
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+// ── Table rendering (using `tabled`) ─────────────────────────────────────────
+
+/// Build a pretty table from a slice of row maps + explicit column order.
+pub fn render_table(rows: &[HashMap<String, serde_json::Value>], columns: &[&str]) -> String {
+    if rows.is_empty() {
+        return "  (no results)".to_string();
+    }
+
+    let mut builder = Builder::default();
+    builder.push_record(columns.iter().map(|s| s.to_string()));
+
     for row in rows {
         let record: Vec<String> = columns
             .iter()
             .map(|col| {
-                row.get(col)
+                row.get(*col)
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Null => String::new(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        builder.push_record(record);
+    }
+
+    let mut table = builder.build();
+    table.with(Style::rounded());
+
+    if colors_enabled() {
+        table.modify(Rows::first(), Color::BOLD);
+    }
+
+    table.to_string()
+}
+
+/// Build a table from key/value pairs (for single-entity display).
+pub fn render_kv_table(pairs: &[(&str, String)]) -> String {
+    let mut builder = Builder::default();
+    builder.push_record(["FIELD".to_string(), "VALUE".to_string()]);
+    for (k, v) in pairs {
+        builder.push_record([k, v.as_str()]);
+    }
+    let mut table = builder.build();
+    table.with(Style::rounded());
+    if colors_enabled() {
+        table.modify(Rows::first(), Color::BOLD);
+    }
+    table.to_string()
+}
+
+// ── CSV helper ────────────────────────────────────────────────────────────────
+
+pub fn format_csv(rows: &[HashMap<String, serde_json::Value>], columns: &[&str]) -> String {
+    let mut wtr = csv::Writer::from_writer(vec![]);
+    let _ = wtr.write_record(columns);
+    for row in rows {
+        let record: Vec<String> = columns
+            .iter()
+            .map(|col| {
+                row.get(*col)
                     .map(|v| match v {
                         serde_json::Value::String(s) => s.clone(),
                         serde_json::Value::Null => String::new(),
@@ -77,85 +183,9 @@ fn format_csv(rows: &[HashMap<String, serde_json::Value>], columns: &[String]) -
     String::from_utf8(wtr.into_inner().unwrap_or_default()).unwrap_or_default()
 }
 
-fn format_query_table(rows: &[HashMap<String, serde_json::Value>], columns: &[String]) -> String {
-    if rows.is_empty() {
-        return "No results.".to_string();
-    }
+// ── Parse simple condition ────────────────────────────────────────────────────
 
-    // Build a simple table with columns as headers
-    let mut lines = Vec::new();
-
-    // Determine column widths
-    let col_widths: Vec<usize> = columns
-        .iter()
-        .map(|col| {
-            let header_w = col.len();
-            let max_val = rows
-                .iter()
-                .map(|row| {
-                    row.get(col)
-                        .map(|v| match v {
-                            serde_json::Value::String(s) => s.len(),
-                            serde_json::Value::Null => 4,
-                            other => other.to_string().len(),
-                        })
-                        .unwrap_or(0)
-                })
-                .max()
-                .unwrap_or(0);
-            header_w.max(max_val).min(40)
-        })
-        .collect();
-
-    // Header
-    let header: String = columns
-        .iter()
-        .zip(&col_widths)
-        .map(|(col, w)| format!("{:<width$}", col, width = w))
-        .collect::<Vec<_>>()
-        .join(" │ ");
-    lines.push(header);
-
-    // Separator
-    let sep: String = col_widths
-        .iter()
-        .map(|w| "─".repeat(*w))
-        .collect::<Vec<_>>()
-        .join("─┼─");
-    lines.push(sep);
-
-    // Rows
-    for row in rows {
-        let row_str: String = columns
-            .iter()
-            .zip(&col_widths)
-            .map(|(col, w)| {
-                let val = row
-                    .get(col)
-                    .map(|v| match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Null => "null".to_string(),
-                        other => other.to_string(),
-                    })
-                    .unwrap_or_default();
-                let truncated = if val.len() > *w {
-                    format!("{}…", &val[..*w - 1])
-                } else {
-                    val
-                };
-                format!("{:<width$}", truncated, width = w)
-            })
-            .collect::<Vec<_>>()
-            .join(" │ ");
-        lines.push(row_str);
-    }
-
-    lines.join("\n")
-}
-
-// ── Parse simple condition ──────────────────────────────────────────────────
-
-/// Parse simple condition strings like "speed > 25" into MonitorCondition
+/// Parse simple condition strings like "speed > 25" into MonitorCondition.
 fn parse_simple_condition(condition: &str) -> Option<MonitorCondition> {
     let parts: Vec<&str> = condition.split_whitespace().collect();
     if parts.len() != 3 {
@@ -182,7 +212,43 @@ fn parse_simple_condition(condition: &str) -> Option<MonitorCondition> {
     })
 }
 
-// ── Commands ────────────────────────────────────────────────────────────────
+// ── Parse relative time ───────────────────────────────────────────────────────
+
+fn parse_relative_time(s: &str) -> Option<String> {
+    let s = s.trim();
+    let (num_str, unit) = if let Some(stripped) = s.strip_suffix('h') {
+        (stripped, "hours")
+    } else if let Some(stripped) = s.strip_suffix('m') {
+        (stripped, "minutes")
+    } else if let Some(stripped) = s.strip_suffix('d') {
+        (stripped, "days")
+    } else {
+        return None;
+    };
+
+    let num: i64 = num_str.parse().ok()?;
+    let duration = match unit {
+        "hours" => chrono::Duration::hours(num),
+        "minutes" => chrono::Duration::minutes(num),
+        "days" => chrono::Duration::days(num),
+        _ => return None,
+    };
+
+    Some((chrono::Utc::now() - duration).to_rfc3339())
+}
+
+// ── HTTP client helper ────────────────────────────────────────────────────────
+
+fn base_url(host: &str) -> String {
+    let h = host.trim_end_matches('/');
+    if h.starts_with("http://") || h.starts_with("https://") {
+        h.to_string()
+    } else {
+        format!("http://{}", h)
+    }
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
 
 /// Start the ORP server
 pub async fn run_start(
@@ -205,8 +271,9 @@ pub async fn run_start(
 
     let port = port_override.unwrap_or(config.server.port);
 
-    println!(
-        r#"
+    if colors_enabled() {
+        println!(
+            r#"
   ╔═══════════════════════════════════════════════════════════╗
   ║                                                           ║
   ║   ██████╗ ██████╗ ██████╗                                 ║
@@ -216,12 +283,14 @@ pub async fn run_start(
   ║  ╚██████╔╝██║  ██║██║                                     ║
   ║   ╚═════╝ ╚═╝  ╚═╝╚═╝                                    ║
   ║                                                           ║
-  ║  Open Reality Protocol v0.1.0                             ║
+  ║  Open Reality Protocol v{}                             ║
   ║  Palantir-grade data fusion in a single binary            ║
   ║                                                           ║
   ╚═══════════════════════════════════════════════════════════╝
-"#
-    );
+"#,
+            env!("CARGO_PKG_VERSION")
+        );
+    }
 
     tracing::info!("Initializing ORP...");
 
@@ -311,7 +380,6 @@ pub async fn run_start(
         .await
         .map_err(|e| anyhow::anyhow!("AIS connector failed: {}", e))?;
 
-    // Register connector data source
     let _ = storage
         .register_data_source(&orp_proto::DataSource {
             source_id: "ais-demo".to_string(),
@@ -363,7 +431,6 @@ pub async fn run_start(
                 tracing::warn!("Failed to process event: {}", e);
             }
 
-            // Run monitor evaluation on updated entity
             if let Ok(Some(entity)) = storage_bg.get_entity(&source_event.entity_id).await {
                 let alerts = monitor_bg.evaluate(&entity).await;
                 for alert in &alerts {
@@ -371,7 +438,6 @@ pub async fn run_start(
                 }
             }
 
-            // Update name/ship_type properties directly
             if source_event.properties.contains_key("name") {
                 let _ = processor_bg.flush().await;
             }
@@ -390,7 +456,6 @@ pub async fn run_start(
         }
     });
 
-    // ── Initialize auth + ABAC ──────────────────────────────────────────────
     let is_dev_mode = dev
         || std::env::var("ORP_DEV_MODE")
             .map(|v| v == "true" || v == "1")
@@ -407,8 +472,8 @@ pub async fn run_start(
             }
             Err(_) => {
                 tracing::warn!(
-                    "JWT_SECRET not set and ORP_DEV_MODE not enabled — auth will reject all requests. \
-                     Set JWT_SECRET or ORP_DEV_MODE=true"
+                    "JWT_SECRET not set and ORP_DEV_MODE not enabled — auth will reject all \
+                     requests. Set JWT_SECRET or pass --dev"
                 );
                 Arc::new(AuthState::default())
             }
@@ -445,19 +510,30 @@ pub async fn run_start(
 }
 
 /// Execute an ORP-QL query
-pub async fn run_query(query: &str, format: OutputFormat) -> Result<()> {
+pub async fn run_query(host: &str, query: &str, format: OutputFormat) -> Result<()> {
     let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/query", base_url(host));
     let response = client
-        .post("http://localhost:9090/api/v1/query")
+        .post(&url)
         .json(&serde_json::json!({ "query": query }))
         .send()
         .await;
 
     match response {
         Ok(resp) => {
+            let status = resp.status();
             let body = resp.text().await?;
             let parsed: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!(body));
+
+            if !status.is_success() {
+                let msg = parsed
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or(&body);
+                print_error(&format!("Query failed (HTTP {}): {}", status, msg));
+                std::process::exit(1);
+            }
 
             match format {
                 OutputFormat::Json => {
@@ -477,18 +553,16 @@ pub async fn run_query(query: &str, format: OutputFormat) -> Result<()> {
 
                         let rows: Vec<HashMap<String, serde_json::Value>> = results
                             .iter()
-                            .filter_map(|r| {
-                                serde_json::from_value(r.clone()).ok()
-                            })
+                            .filter_map(|r| serde_json::from_value(r.clone()).ok())
                             .collect();
 
-                        let cols = if columns.is_empty() && !rows.is_empty() {
+                        let cols: Vec<String> = if columns.is_empty() && !rows.is_empty() {
                             rows[0].keys().cloned().collect()
                         } else {
                             columns
                         };
-
-                        println!("{}", format_query_table(&rows, &cols));
+                        let col_refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+                        println!("{}", render_table(&rows, &col_refs));
 
                         if let Some(meta) = parsed.get("metadata") {
                             let time = meta
@@ -498,11 +572,12 @@ pub async fn run_query(query: &str, format: OutputFormat) -> Result<()> {
                             let count = meta
                                 .get("rows_returned")
                                 .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            println!(
-                                "\n{} rows in {:.1}ms",
-                                count, time
-                            );
+                                .unwrap_or(rows.len() as u64);
+                            if colors_enabled() {
+                                eprintln!("\n{} rows in {:.1}ms", count, time);
+                            } else {
+                                eprintln!("\n{} rows in {:.1}ms", count, time);
+                            }
                         }
                     } else {
                         println!("{}", serde_json::to_string_pretty(&parsed)?);
@@ -527,13 +602,20 @@ pub async fn run_query(query: &str, format: OutputFormat) -> Result<()> {
                                     .map(|r| r.keys().cloned().collect())
                                     .unwrap_or_default()
                             });
-                        print!("{}", format_csv(&rows, &columns));
+                        let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                        print!("{}", format_csv(&rows, &col_refs));
                     }
                 }
             }
         }
-        Err(_) => {
-            print_error("ORP server is not running. Start it with `orp start`");
+        Err(e) => {
+            print_error(&format!(
+                "Cannot reach ORP server at {}: {}",
+                host, e
+            ));
+            eprintln!("  → Start the server with: orp start --template maritime");
+            eprintln!("  → Or point to a different host: orp --host <host:port> …");
+            std::process::exit(1);
         }
     }
 
@@ -541,18 +623,32 @@ pub async fn run_query(query: &str, format: OutputFormat) -> Result<()> {
 }
 
 /// Show system status
-pub async fn run_status() -> Result<()> {
+pub async fn run_status(host: &str, format: OutputFormat) -> Result<()> {
     let client = reqwest::Client::new();
-    let response = client
-        .get("http://localhost:9090/api/v1/health")
-        .send()
-        .await;
+    let url = format!("{}/api/v1/health", base_url(host));
+    let response = client.get(&url).send().await;
 
     match response {
         Ok(resp) => {
             let body = resp.text().await?;
             let parsed: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!(body));
+
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&parsed)?);
+                    return Ok(());
+                }
+                OutputFormat::Csv => {
+                    // status as simple csv
+                    let status = parsed.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+                    let version = parsed.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("status,version");
+                    println!("{},{}", status, version);
+                    return Ok(());
+                }
+                OutputFormat::Table => {}
+            }
 
             print_header("ORP Status");
             println!();
@@ -564,12 +660,10 @@ pub async fn run_status() -> Result<()> {
                     } else {
                         "healthy".to_string()
                     }
+                } else if colors_enabled() {
+                    format!("{}", format!("● {}", status).red())
                 } else {
-                    if colors_enabled() {
-                        format!("{}", format!("● {}", status).red())
-                    } else {
-                        status.to_string()
-                    }
+                    status.to_string()
                 };
                 println!("  Status:  {}", status_display);
             }
@@ -582,6 +676,7 @@ pub async fn run_status() -> Result<()> {
                 let secs = uptime % 60;
                 println!("  Uptime:  {}h {}m {}s", hours, mins, secs);
             }
+            println!("  Host:    {}", host);
 
             if let Some(components) = parsed.get("components").and_then(|c| c.as_object()) {
                 println!();
@@ -600,7 +695,7 @@ pub async fn run_status() -> Result<()> {
                         if colors_enabled() {
                             format!("{}", "●".green())
                         } else {
-                            "OK".to_string()
+                            "OK ".to_string()
                         }
                     } else {
                         if colors_enabled() {
@@ -613,9 +708,11 @@ pub async fn run_status() -> Result<()> {
                 }
             }
         }
-        Err(_) => {
-            print_error("ORP server is not running.");
-            println!("Start with: orp start --template maritime");
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            eprintln!("  → Start the server with: orp start --template maritime");
+            eprintln!("  → Or set ORP_HOST env var to point to the correct server");
+            std::process::exit(1);
         }
     }
 
@@ -623,12 +720,10 @@ pub async fn run_status() -> Result<()> {
 }
 
 /// List connectors
-pub async fn run_connectors_list() -> Result<()> {
+pub async fn run_connectors_list(host: &str, format: OutputFormat) -> Result<()> {
     let client = reqwest::Client::new();
-    let response = client
-        .get("http://localhost:9090/api/v1/connectors")
-        .send()
-        .await;
+    let url = format!("{}/api/v1/connectors", base_url(host));
+    let response = client.get(&url).send().await;
 
     match response {
         Ok(resp) => {
@@ -636,31 +731,40 @@ pub async fn run_connectors_list() -> Result<()> {
             let parsed: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!(body));
 
-            if let Some(data) = parsed.get("data").and_then(|d| d.as_array()) {
-                print_header("Connectors");
-                println!();
-                if data.is_empty() {
-                    println!("  No connectors registered.");
-                } else {
-                    for item in data {
-                        let id = item.get("source_id").and_then(|v| v.as_str()).unwrap_or("?");
-                        let name = item.get("source_name").and_then(|v| v.as_str()).unwrap_or("?");
-                        let ctype = item.get("source_type").and_then(|v| v.as_str()).unwrap_or("?");
-                        let enabled = item.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let indicator = if enabled {
-                            if colors_enabled() { format!("{}", "●".green()) } else { "ON".to_string() }
-                        } else {
-                            if colors_enabled() { format!("{}", "●".red()) } else { "OFF".to_string() }
-                        };
-                        println!("  {} {} [{}] — {}", indicator, name, ctype, id);
+            let data = parsed
+                .get("data")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&parsed)?);
+                }
+                OutputFormat::Csv => {
+                    let rows: Vec<HashMap<String, serde_json::Value>> = data
+                        .iter()
+                        .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                        .collect();
+                    print!("{}", format_csv(&rows, &["source_id", "source_name", "source_type", "trust_score", "enabled"]));
+                }
+                OutputFormat::Table => {
+                    if data.is_empty() {
+                        println!("  No connectors registered.");
+                        println!("  → Add one with: orp connectors add --name <name> --connector-type ais --entity-type ship");
+                    } else {
+                        let rows: Vec<HashMap<String, serde_json::Value>> = data
+                            .iter()
+                            .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                            .collect();
+                        println!("{}", render_table(&rows, &["source_id", "source_name", "source_type", "trust_score", "enabled"]));
                     }
                 }
-            } else {
-                println!("{}", serde_json::to_string_pretty(&parsed)?);
             }
         }
-        Err(_) => {
-            print_error("ORP server is not running.");
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
         }
     }
 
@@ -669,17 +773,19 @@ pub async fn run_connectors_list() -> Result<()> {
 
 /// Add a connector
 pub async fn run_connectors_add(
+    host: &str,
     name: &str,
-    connector_type: &str,
+    connector_type: ConnectorType,
     entity_type: &str,
     trust_score: f64,
 ) -> Result<()> {
     let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/connectors", base_url(host));
     let response = client
-        .post("http://localhost:9090/api/v1/connectors")
+        .post(&url)
         .json(&serde_json::json!({
             "name": name,
-            "connector_type": connector_type,
+            "connector_type": connector_type.as_str(),
             "entity_type": entity_type,
             "trust_score": trust_score,
         }))
@@ -691,11 +797,14 @@ pub async fn run_connectors_add(
             print_success(&format!("Connector '{}' registered.", name));
         }
         Ok(resp) => {
+            let status = resp.status();
             let body = resp.text().await?;
-            print_error(&format!("Failed to add connector: {}", body));
+            print_error(&format!("Failed to add connector (HTTP {}): {}", status, body));
+            std::process::exit(1);
         }
-        Err(_) => {
-            print_error("ORP server is not running.");
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
         }
     }
 
@@ -703,23 +812,29 @@ pub async fn run_connectors_add(
 }
 
 /// Remove a connector
-pub async fn run_connectors_remove(id: &str) -> Result<()> {
+pub async fn run_connectors_remove(host: &str, id: &str, yes: bool) -> Result<()> {
+    if !confirm(&format!("Remove connector '{}'?", id), yes) {
+        println!("Aborted.");
+        return Ok(());
+    }
+
     let client = reqwest::Client::new();
-    let response = client
-        .delete(format!("http://localhost:9090/api/v1/connectors/{}", id))
-        .send()
-        .await;
+    let url = format!("{}/api/v1/connectors/{}", base_url(host), id);
+    let response = client.delete(&url).send().await;
 
     match response {
         Ok(resp) if resp.status().is_success() => {
             print_success(&format!("Connector '{}' removed.", id));
         }
         Ok(resp) => {
+            let status = resp.status();
             let body = resp.text().await?;
-            print_error(&format!("Failed to remove connector: {}", body));
+            print_error(&format!("Failed to remove connector (HTTP {}): {}", status, body));
+            std::process::exit(1);
         }
-        Err(_) => {
-            print_error("ORP server is not running.");
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
         }
     }
 
@@ -728,6 +843,7 @@ pub async fn run_connectors_remove(id: &str) -> Result<()> {
 
 /// Search entities
 pub async fn run_entities_search(
+    host: &str,
     near: Option<&str>,
     radius: f64,
     entity_type: Option<&str>,
@@ -735,7 +851,6 @@ pub async fn run_entities_search(
     format: OutputFormat,
 ) -> Result<()> {
     let client = reqwest::Client::new();
-    let mut url = "http://localhost:9090/api/v1/entities/search".to_string();
     let mut params = vec![format!("limit={}", limit)];
 
     if let Some(near_str) = near {
@@ -744,54 +859,57 @@ pub async fn run_entities_search(
     if let Some(etype) = entity_type {
         params.push(format!("type={}", etype));
     }
-    if !params.is_empty() {
-        url = format!("{}?{}", url, params.join("&"));
-    }
+    let url = format!(
+        "{}/api/v1/entities/search?{}",
+        base_url(host),
+        params.join("&")
+    );
 
     let response = client.get(&url).send().await;
 
     match response {
         Ok(resp) => {
+            let status = resp.status();
             let body = resp.text().await?;
-            let parsed: serde_json::Value = serde_json::from_str(&body)?;
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| {
+                serde_json::json!({ "error": body })
+            });
+
+            if !status.is_success() {
+                let msg = parsed.get("error").and_then(|e| e.as_str()).unwrap_or(&body);
+                print_error(&format!("Search failed (HTTP {}): {}", status, msg));
+                std::process::exit(1);
+            }
+
+            let data = parsed
+                .get("data")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let count = parsed.get("count").and_then(|c| c.as_u64()).unwrap_or(data.len() as u64);
 
             match format {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&parsed)?),
                 OutputFormat::Table => {
-                    if let Some(data) = parsed.get("data").and_then(|d| d.as_array()) {
-                        let rows: Vec<HashMap<String, serde_json::Value>> = data
-                            .iter()
-                            .filter_map(|r| serde_json::from_value(r.clone()).ok())
-                            .collect();
-                        let cols = vec![
-                            "id".to_string(),
-                            "type".to_string(),
-                            "name".to_string(),
-                            "confidence".to_string(),
-                        ];
-                        println!("{}", format_query_table(&rows, &cols));
-                        let count = parsed.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
-                        println!("\n{} entities found", count);
-                    }
+                    let rows: Vec<HashMap<String, serde_json::Value>> = data
+                        .iter()
+                        .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                        .collect();
+                    println!("{}", render_table(&rows, &["id", "type", "name", "confidence"]));
+                    eprintln!("\n{} entities found", count);
                 }
                 OutputFormat::Csv => {
-                    if let Some(data) = parsed.get("data").and_then(|d| d.as_array()) {
-                        let rows: Vec<HashMap<String, serde_json::Value>> = data
-                            .iter()
-                            .filter_map(|r| serde_json::from_value(r.clone()).ok())
-                            .collect();
-                        let cols = vec![
-                            "id".to_string(),
-                            "type".to_string(),
-                            "name".to_string(),
-                        ];
-                        print!("{}", format_csv(&rows, &cols));
-                    }
+                    let rows: Vec<HashMap<String, serde_json::Value>> = data
+                        .iter()
+                        .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                        .collect();
+                    print!("{}", format_csv(&rows, &["id", "type", "name", "confidence"]));
                 }
             }
         }
-        Err(_) => {
-            print_error("ORP server is not running.");
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
         }
     }
 
@@ -799,12 +917,10 @@ pub async fn run_entities_search(
 }
 
 /// Get entity by ID
-pub async fn run_entities_get(id: &str, format: OutputFormat) -> Result<()> {
+pub async fn run_entities_get(host: &str, id: &str, format: OutputFormat) -> Result<()> {
     let client = reqwest::Client::new();
-    let response = client
-        .get(format!("http://localhost:9090/api/v1/entities/{}", id))
-        .send()
-        .await;
+    let url = format!("{}/api/v1/entities/{}", base_url(host), id);
+    let response = client.get(&url).send().await;
 
     match response {
         Ok(resp) if resp.status().is_success() => {
@@ -813,17 +929,62 @@ pub async fn run_entities_get(id: &str, format: OutputFormat) -> Result<()> {
 
             match format {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&parsed)?),
-                OutputFormat::Table | OutputFormat::Csv => {
-                    println!("{}", serde_json::to_string_pretty(&parsed)?);
+                OutputFormat::Table => {
+                    // Render the entity as a key-value table
+                    if let Some(obj) = parsed.as_object() {
+                        let pairs: Vec<(&str, String)> = obj
+                            .iter()
+                            .map(|(k, v)| {
+                                let val = match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    serde_json::Value::Null => String::new(),
+                                    other => other.to_string(),
+                                };
+                                (k.as_str(), val)
+                            })
+                            .collect();
+                        println!("{}", render_kv_table(&pairs));
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&parsed)?);
+                    }
+                }
+                OutputFormat::Csv => {
+                    // Single entity as one CSV row
+                    if let Some(obj) = parsed.as_object() {
+                        let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+                        let mut wtr = csv::Writer::from_writer(vec![]);
+                        let _ = wtr.write_record(&keys);
+                        let vals: Vec<String> = obj
+                            .values()
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::Null => String::new(),
+                                other => other.to_string(),
+                            })
+                            .collect();
+                        let _ = wtr.write_record(&vals);
+                        let _ = wtr.flush();
+                        if let Ok(inner) = wtr.into_inner() {
+                            print!("{}", String::from_utf8_lossy(&inner));
+                        }
+                    }
                 }
             }
         }
         Ok(resp) => {
-            let body = resp.text().await?;
-            print_error(&format!("Entity not found: {}", body));
+            let status = resp.status();
+            if status.as_u16() == 404 {
+                print_error(&format!("Entity '{}' not found.", id));
+                eprintln!("  → Use `orp entities search` to find valid entity IDs");
+            } else {
+                let body = resp.text().await?;
+                print_error(&format!("Failed to get entity (HTTP {}): {}", status, body));
+            }
+            std::process::exit(1);
         }
-        Err(_) => {
-            print_error("ORP server is not running.");
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
         }
     }
 
@@ -832,6 +993,7 @@ pub async fn run_entities_get(id: &str, format: OutputFormat) -> Result<()> {
 
 /// View events
 pub async fn run_events(
+    host: &str,
     entity: Option<&str>,
     since: Option<&str>,
     limit: usize,
@@ -843,12 +1005,12 @@ pub async fn run_events(
         params.push(format!("entity_id={}", eid));
     }
     if let Some(s) = since {
-        // Support relative time like "1h", "30m"
         let since_val = parse_relative_time(s).unwrap_or_else(|| s.to_string());
         params.push(format!("since={}", since_val));
     }
     let url = format!(
-        "http://localhost:9090/api/v1/events?{}",
+        "{}/api/v1/events?{}",
+        base_url(host),
         params.join("&")
     );
 
@@ -857,44 +1019,41 @@ pub async fn run_events(
     match response {
         Ok(resp) => {
             let body = resp.text().await?;
-            let parsed: serde_json::Value = serde_json::from_str(&body)?;
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| {
+                serde_json::json!({ "error": body })
+            });
+
+            let data = parsed
+                .get("data")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
 
             match format {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&parsed)?),
                 OutputFormat::Table => {
-                    if let Some(data) = parsed.get("data").and_then(|d| d.as_array()) {
-                        let rows: Vec<HashMap<String, serde_json::Value>> = data
-                            .iter()
-                            .filter_map(|r| serde_json::from_value(r.clone()).ok())
-                            .collect();
-                        let cols = vec![
-                            "id".to_string(),
-                            "entity_id".to_string(),
-                            "event_type".to_string(),
-                            "timestamp".to_string(),
-                        ];
-                        println!("{}", format_query_table(&rows, &cols));
+                    let rows: Vec<HashMap<String, serde_json::Value>> = data
+                        .iter()
+                        .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                        .collect();
+                    if rows.is_empty() {
+                        println!("  No events found.");
+                    } else {
+                        println!("{}", render_table(&rows, &["id", "entity_id", "event_type", "timestamp"]));
                     }
                 }
                 OutputFormat::Csv => {
-                    if let Some(data) = parsed.get("data").and_then(|d| d.as_array()) {
-                        let rows: Vec<HashMap<String, serde_json::Value>> = data
-                            .iter()
-                            .filter_map(|r| serde_json::from_value(r.clone()).ok())
-                            .collect();
-                        let cols = vec![
-                            "id".to_string(),
-                            "entity_id".to_string(),
-                            "event_type".to_string(),
-                            "timestamp".to_string(),
-                        ];
-                        print!("{}", format_csv(&rows, &cols));
-                    }
+                    let rows: Vec<HashMap<String, serde_json::Value>> = data
+                        .iter()
+                        .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                        .collect();
+                    print!("{}", format_csv(&rows, &["id", "entity_id", "event_type", "timestamp"]));
                 }
             }
         }
-        Err(_) => {
-            print_error("ORP server is not running.");
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
         }
     }
 
@@ -902,21 +1061,50 @@ pub async fn run_events(
 }
 
 /// Monitors list
-pub async fn run_monitors_list() -> Result<()> {
+pub async fn run_monitors_list(host: &str, format: OutputFormat) -> Result<()> {
     let client = reqwest::Client::new();
-    let response = client
-        .get("http://localhost:9090/api/v1/monitors")
-        .send()
-        .await;
+    let url = format!("{}/api/v1/monitors", base_url(host));
+    let response = client.get(&url).send().await;
 
     match response {
         Ok(resp) => {
             let body = resp.text().await?;
-            let parsed: serde_json::Value = serde_json::from_str(&body)?;
-            println!("{}", serde_json::to_string_pretty(&parsed)?);
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| {
+                serde_json::json!({ "error": body })
+            });
+
+            let data = parsed
+                .get("data")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            match format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&parsed)?),
+                OutputFormat::Csv => {
+                    let rows: Vec<HashMap<String, serde_json::Value>> = data
+                        .iter()
+                        .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                        .collect();
+                    print!("{}", format_csv(&rows, &["rule_id", "name", "entity_type", "severity", "enabled"]));
+                }
+                OutputFormat::Table => {
+                    if data.is_empty() {
+                        println!("  No monitor rules defined.");
+                        println!("  → Add one with: orp monitors add --name \"Fast Ship\" --entity-type ship --condition \"speed > 25\"");
+                    } else {
+                        let rows: Vec<HashMap<String, serde_json::Value>> = data
+                            .iter()
+                            .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                            .collect();
+                        println!("{}", render_table(&rows, &["rule_id", "name", "entity_type", "severity", "enabled"]));
+                    }
+                }
+            }
         }
-        Err(_) => {
-            print_error("ORP server is not running.");
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
         }
     }
 
@@ -925,27 +1113,33 @@ pub async fn run_monitors_list() -> Result<()> {
 
 /// Monitors add
 pub async fn run_monitors_add(
+    host: &str,
     name: &str,
     entity_type: &str,
     condition: &str,
-    severity: &str,
+    severity: Severity,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    // Validate condition before sending
+    if parse_simple_condition(condition).is_none() {
+        print_error(&format!(
+            "Invalid condition '{}'. Expected format: \"<property> <op> <value>\" (e.g., \"speed > 25\")",
+            condition
+        ));
+        eprintln!("  Supported operators: >, <, >=, <=, =, !=");
+        std::process::exit(1);
+    }
 
-    // Parse condition into parts
     let parts: Vec<&str> = condition.split_whitespace().collect();
-    let (property, operator, value) = if parts.len() == 3 {
-        (
-            parts[0].to_string(),
-            parts[1].to_string(),
-            parts[2].parse::<f64>().unwrap_or(0.0),
-        )
-    } else {
-        ("speed".to_string(), ">".to_string(), 25.0)
-    };
+    let (property, operator, value) = (
+        parts[0].to_string(),
+        parts[1].to_string(),
+        parts[2].parse::<f64>().unwrap_or(0.0),
+    );
 
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/monitors", base_url(host));
     let response = client
-        .post("http://localhost:9090/api/v1/monitors")
+        .post(&url)
         .json(&serde_json::json!({
             "name": name,
             "entity_type": entity_type,
@@ -955,21 +1149,24 @@ pub async fn run_monitors_add(
                 "operator": operator,
                 "value": value,
             },
-            "severity": severity,
+            "severity": severity.as_str(),
         }))
         .send()
         .await;
 
     match response {
         Ok(resp) if resp.status().is_success() => {
-            print_success(&format!("Monitor '{}' created.", name));
+            print_success(&format!("Monitor rule '{}' created.", name));
         }
         Ok(resp) => {
+            let status = resp.status();
             let body = resp.text().await?;
-            print_error(&format!("Failed to create monitor: {}", body));
+            print_error(&format!("Failed to create monitor (HTTP {}): {}", status, body));
+            std::process::exit(1);
         }
-        Err(_) => {
-            print_error("ORP server is not running.");
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
         }
     }
 
@@ -977,23 +1174,29 @@ pub async fn run_monitors_add(
 }
 
 /// Monitors remove
-pub async fn run_monitors_remove(id: &str) -> Result<()> {
+pub async fn run_monitors_remove(host: &str, id: &str, yes: bool) -> Result<()> {
+    if !confirm(&format!("Remove monitor rule '{}'?", id), yes) {
+        println!("Aborted.");
+        return Ok(());
+    }
+
     let client = reqwest::Client::new();
-    let response = client
-        .delete(format!("http://localhost:9090/api/v1/monitors/{}", id))
-        .send()
-        .await;
+    let url = format!("{}/api/v1/monitors/{}", base_url(host), id);
+    let response = client.delete(&url).send().await;
 
     match response {
         Ok(resp) if resp.status().is_success() => {
-            print_success(&format!("Monitor '{}' removed.", id));
+            print_success(&format!("Monitor rule '{}' removed.", id));
         }
         Ok(resp) => {
+            let status = resp.status();
             let body = resp.text().await?;
-            print_error(&format!("Failed to remove monitor: {}", body));
+            print_error(&format!("Failed to remove monitor (HTTP {}): {}", status, body));
+            std::process::exit(1);
         }
-        Err(_) => {
-            print_error("ORP server is not running.");
+        Err(e) => {
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
+            std::process::exit(1);
         }
     }
 
@@ -1037,30 +1240,4 @@ pub fn run_completions(shell: clap_complete::Shell) {
         "orp",
         &mut std::io::stdout(),
     );
-}
-
-// ── Parse relative time ─────────────────────────────────────────────────────
-
-fn parse_relative_time(s: &str) -> Option<String> {
-    let s = s.trim();
-    let (num_str, unit) = if let Some(stripped) = s.strip_suffix('h') {
-        (stripped, "hours")
-    } else if let Some(stripped) = s.strip_suffix('m') {
-        (stripped, "minutes")
-    } else if let Some(stripped) = s.strip_suffix('d') {
-        (stripped, "days")
-    } else {
-        return None;
-    };
-
-    let num: i64 = num_str.parse().ok()?;
-    let duration = match unit {
-        "hours" => chrono::Duration::hours(num),
-        "minutes" => chrono::Duration::minutes(num),
-        "days" => chrono::Duration::days(num),
-        _ => return None,
-    };
-
-    let since = chrono::Utc::now() - duration;
-    Some(since.to_rfc3339())
 }

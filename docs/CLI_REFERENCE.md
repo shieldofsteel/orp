@@ -14,6 +14,12 @@
   - [orp query](#orp-query)
   - [orp status](#orp-status)
   - [orp connectors](#orp-connectors)
+  - [orp entities](#orp-entities)
+  - [orp events](#orp-events)
+  - [orp monitors](#orp-monitors)
+  - [orp config](#orp-config)
+  - [orp version](#orp-version)
+  - [orp completions](#orp-completions)
 - [Output Formats](#output-formats)
 - [Environment Variables](#environment-variables)
 - [Exit Codes](#exit-codes)
@@ -21,7 +27,6 @@
 - [Shell Completion](#shell-completion)
 - [Piping & Scripting](#piping--scripting)
 - [AI Agent Integration](#ai-agent-integration)
-- [Comparison with Similar Tools](#comparison-with-similar-tools)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -99,7 +104,7 @@ These flags apply to every command:
 
 ### `orp start`
 
-Start the ORP server with all services: HTTP API, WebSocket hub, AIS/ADS-B connectors, DuckDB storage, monitor engine, and embedded React dashboard.
+Start the ORP server with all services: HTTP API, WebSocket hub, AIS connectors, DuckDB storage, monitor engine, and embedded React dashboard.
 
 **Synopsis**
 
@@ -114,6 +119,7 @@ orp start [OPTIONS]
 | `--config <PATH>` | `-c` | path | `config.yaml` | Path to a YAML config file |
 | `--template <NAME>` | `-t` | string | — | Use a pre-configured template (e.g. `maritime`) |
 | `--port <PORT>` | `-p` | u16 | `9090` | Override the server port |
+| `--dev` | — | bool | `false` | Enable dev mode (permissive auth, verbose logging) |
 
 **Examples**
 
@@ -131,6 +137,9 @@ orp start --template maritime
 orp start --config /etc/orp/production.yaml
 
 # Start in dev mode (auth is permissive — no JWT required)
+orp start --dev
+
+# Alternatively, enable dev mode via environment variable
 ORP_DEV_MODE=true orp start
 
 # Start with a JWT secret (production mode)
@@ -141,9 +150,17 @@ JWT_SECRET=supersecretkey orp start --config config.yaml
 
 ```
   ╔═══════════════════════════════════════════════════════════╗
+  ║                                                           ║
   ║   ██████╗ ██████╗ ██████╗                                 ║
+  ║  ██╔═══██╗██╔══██╗██╔══██╗                                ║
+  ║  ██║   ██║██████╔╝██████╔╝                                ║
+  ║  ██║   ██║██╔══██╗██╔═══╝                                 ║
+  ║  ╚██████╔╝██║  ██║██║                                     ║
+  ║   ╚═════╝ ╚═╝  ╚═╝╚═╝                                    ║
+  ║                                                           ║
   ║  Open Reality Protocol v0.1.0                             ║
   ║  Palantir-grade data fusion in a single binary            ║
+  ║                                                           ║
   ╚═══════════════════════════════════════════════════════════╝
 
 [INFO] Initializing DuckDB storage...
@@ -164,13 +181,12 @@ JWT_SECRET=supersecretkey orp start --config config.yaml
 | REST API | `http://localhost:9090/api/v1/` | OpenAPI 3.1 |
 | WebSocket | `ws://localhost:9090/ws/updates` | Real-time entity + alert events |
 | Health endpoint | `http://localhost:9090/api/v1/health` | No auth required |
-| Prometheus metrics | `http://localhost:9090/api/v1/metrics` | Auth required |
 
 **Auth Modes**
 
 | Mode | How to Enable | Behaviour |
 |------|--------------|-----------|
-| Dev mode | `ORP_DEV_MODE=true` | All requests accepted, no JWT needed |
+| Dev mode | `--dev` flag or `ORP_DEV_MODE=true` | All requests accepted, no JWT needed |
 | Production | `JWT_SECRET=<secret>` | Bearer token required on all endpoints except `/health` |
 | Locked | Neither set | Server starts but rejects all API requests (safe default) |
 
@@ -183,15 +199,18 @@ Execute an **ORP-QL** query against a running ORP instance at `http://localhost:
 **Synopsis**
 
 ```
-orp query --query <ORPQL>
-orp query -q <ORPQL>
+orp query [OPTIONS] [QUERY]
 ```
+
+The query can be provided as a positional argument (inline) or read from a file with `--file`.
 
 **Options**
 
-| Flag | Short | Type | Required | Description |
-|------|-------|------|----------|-------------|
-| `--query <STRING>` | `-q` | string | ✅ | The ORP-QL query to execute |
+| Flag | Short | Type | Default | Description |
+|------|-------|------|---------|-------------|
+| `[QUERY]` | — | string | — | The ORP-QL query string (positional, inline) |
+| `--file <PATH>` | `-f` | path | — | Read the query from a file |
+| `--output <FORMAT>` | `-o` | `table\|json\|csv` | `table` | Output format |
 
 **ORP-QL Syntax Quick Reference**
 
@@ -207,35 +226,40 @@ RETURN <alias>.<field>[, <alias>.<field>]*
 **Examples**
 
 ```bash
-# Find all ships currently tracked
-orp query -q "MATCH (s:ship) RETURN s.name, s.mmsi, s.position LIMIT 20"
+# Find all ships currently tracked (inline query, default table output)
+orp query "MATCH (s:ship) RETURN s.name, s.mmsi, s.position LIMIT 20"
 
 # Ships exceeding speed threshold
-orp query -q "MATCH (s:ship) WHERE s.speed > 20 RETURN s.name, s.speed ORDER BY s.speed DESC"
+orp query "MATCH (s:ship) WHERE s.speed > 20 RETURN s.name, s.speed ORDER BY s.speed DESC"
 
 # Ships near a location (within 50km of Rotterdam)
-orp query -q "MATCH (s:ship) NEAR 51.9, 4.5 WITHIN 50km RETURN s.name, s.speed"
+orp query "MATCH (s:ship) NEAR 51.9, 4.5 WITHIN 50km RETURN s.name, s.speed"
 
-# Find ships with a specific property
-orp query -q "MATCH (s:ship) WHERE s.ship_type = 'cargo' RETURN s.name, s.mmsi"
+# Output as JSON
+orp query --output json "MATCH (s:ship) RETURN s.name, s.speed"
 
-# Count ships by type
-orp query -q "MATCH (s:ship) RETURN s.ship_type, COUNT(s) AS total ORDER BY total DESC"
+# Output as CSV
+orp query --output csv "MATCH (s:ship) RETURN s.name, s.mmsi, s.speed"
 
-# Graph traversal — ships at a port
-orp query -q "MATCH (s:ship)-[r:DOCKED_AT]->(p:port) RETURN s.name, p.name, r.arrival_time"
+# Read query from a file
+orp query --file queries/fast_ships.ql
 
-# Pipe into jq for filtering
-orp query -q "MATCH (s:ship) RETURN s" | jq '.results[] | select(.speed > 25) | .name'
-
-# Store results as JSON
-orp query -q "MATCH (s:ship) RETURN s.name, s.speed" > ships.json
-
-# Count results
-orp query -q "MATCH (s:ship) RETURN s.mmsi" | jq '.results | length'
+# Pipe JSON output into jq
+orp query --output json "MATCH (s:ship) RETURN s" | jq '.results[] | select(.speed > 25) | .name'
 ```
 
-**Output (raw JSON)**
+**Output: `--output table` (default)**
+
+```
+name                     │ speed
+─────────────────────────┼──────
+MV Atlantic Pioneer      │ 24.3
+Vessel Horizon           │ 21.8
+
+2 rows in 12.0ms
+```
+
+**Output: `--output json`**
 
 ```json
 {
@@ -244,16 +268,29 @@ orp query -q "MATCH (s:ship) RETURN s.mmsi" | jq '.results | length'
     { "name": "MV Atlantic Pioneer", "speed": 24.3 },
     { "name": "Vessel Horizon", "speed": 21.8 }
   ],
-  "count": 2,
-  "elapsed_ms": 12
+  "columns": ["name", "speed"],
+  "metadata": {
+    "rows_returned": 2,
+    "execution_time_ms": 12.0
+  }
 }
+```
+
+**Output: `--output csv`**
+
+```
+name,speed
+MV Atlantic Pioneer,24.3
+Vessel Horizon,21.8
 ```
 
 **Error When Server is Down**
 
 ```
-Error: ORP server is not running. Start it with `orp start`
+✗ ORP server is not running. Start it with `orp start`
 ```
+
+(Without color/`NO_COLOR` set: `ERROR: ORP server is not running. Start it with 'orp start'`)
 
 ---
 
@@ -269,7 +306,7 @@ orp status
 
 **Options**
 
-None. Uses the endpoint `http://localhost:9090/api/v1/health`.
+None. Connects to `http://localhost:9090/api/v1/health`.
 
 **Examples**
 
@@ -280,40 +317,30 @@ orp status
 # Use in a script — check exit code
 orp status && echo "ORP is up" || echo "ORP is down"
 
-# Pretty-print and extract specific field
-orp status | jq '.uptime_seconds'
-
 # Monitor in a loop
 watch -n 5 orp status
 ```
 
 **Output (server running)**
 
-```json
-{
-  "status": "ok",
-  "version": "0.1.0",
-  "uptime_seconds": 3842,
-  "storage": {
-    "backend": "duckdb",
-    "entity_count": 427,
-    "event_count": 18203
-  },
-  "connectors": {
-    "total": 1,
-    "active": 1
-  },
-  "monitors": {
-    "rules": 1,
-    "alerts_fired": 3
-  }
-}
 ```
+ORP Status
+
+  Status:  ● healthy
+  Version: 0.1.0
+  Uptime:  1h 4m 2s
+
+Components
+  ● storage (2.1ms)
+  ● query_engine (0.8ms)
+```
+
+(Without color/`NO_COLOR` set: status indicator shows as `healthy` / `ERR`, components as `OK name` / `ERR name`)
 
 **Output (server not running)**
 
 ```
-ORP server is not running.
+✗ ORP server is not running.
 Start with: orp start --template maritime
 ```
 
@@ -321,7 +348,7 @@ Start with: orp start --template maritime
 
 ### `orp connectors`
 
-Manage data source connectors (AIS, ADS-B, MQTT, HTTP poller, CSV watcher, WebSocket client).
+Manage data source connectors (AIS, ADS-B, MQTT, HTTP, etc.).
 
 **Synopsis**
 
@@ -334,12 +361,14 @@ orp connectors <SUBCOMMAND>
 | Subcommand | Description |
 |-----------|-------------|
 | `list` | List all registered connectors with status |
+| `add` | Register a new connector |
+| `remove <ID>` | Remove a connector by ID |
 
 ---
 
 #### `orp connectors list`
 
-List all registered connectors with their type, status, and trust score.
+List all registered connectors with their type, enabled status, and ID.
 
 **Synopsis**
 
@@ -350,125 +379,610 @@ orp connectors list
 **Examples**
 
 ```bash
-# List all connectors
 orp connectors list
+```
 
-# Filter for active connectors only
-orp connectors list | jq '.connectors[] | select(.enabled == true)'
+**Output**
 
-# Get connector IDs
-orp connectors list | jq -r '.connectors[].connector_id'
+```
+Connectors
+
+  ● AIS Demo Feed [ais] — ais-demo
+```
+
+(Green `●` = enabled, red `●` = disabled. Without color: `ON` / `OFF`)
+
+---
+
+#### `orp connectors add`
+
+Register a new data source connector.
+
+**Synopsis**
+
+```
+orp connectors add --name <NAME> --connector-type <TYPE> --entity-type <TYPE> [--trust-score <SCORE>]
+```
+
+**Options**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--name <NAME>` | string | required | Connector name |
+| `--connector-type <TYPE>` | string | required | Connector type (`ais`, `adsb`, `http`, `mqtt`) |
+| `--entity-type <TYPE>` | string | required | Entity type this connector produces |
+| `--trust-score <SCORE>` | f64 | `0.8` | Trust score for data from this connector (0.0–1.0) |
+
+**Examples**
+
+```bash
+# Register an AIS connector
+orp connectors add \
+  --name "AIS Live" \
+  --connector-type ais \
+  --entity-type ship \
+  --trust-score 0.95
+
+# Register an HTTP polling connector
+orp connectors add \
+  --name "Weather API" \
+  --connector-type http \
+  --entity-type weather_cell
+```
+
+**Output**
+
+```
+✓ Connector 'AIS Live' registered.
+```
+
+---
+
+#### `orp connectors remove`
+
+Remove a registered connector by its ID.
+
+**Synopsis**
+
+```
+orp connectors remove <ID>
+```
+
+**Arguments**
+
+| Argument | Description |
+|----------|-------------|
+| `<ID>` | Connector ID to remove (positional) |
+
+**Examples**
+
+```bash
+orp connectors remove ais-demo
+```
+
+**Output**
+
+```
+✓ Connector 'ais-demo' removed.
+```
+
+---
+
+### `orp entities`
+
+Manage and query tracked entities.
+
+**Synopsis**
+
+```
+orp entities <SUBCOMMAND>
+```
+
+**Subcommands**
+
+| Subcommand | Description |
+|-----------|-------------|
+| `search` | Search entities with optional geo and type filters |
+| `get <ID>` | Get a specific entity by ID |
+
+---
+
+#### `orp entities search`
+
+Search tracked entities with optional geographic proximity, type, and limit filters.
+
+**Synopsis**
+
+```
+orp entities search [OPTIONS]
+```
+
+**Options**
+
+| Flag | Short | Type | Default | Description |
+|------|-------|------|---------|-------------|
+| `--near <LAT,LON>` | — | string | — | Search near a location, e.g. `51.9,4.5` |
+| `--radius <KM>` | — | f64 | `50.0` | Radius in km (used with `--near`) |
+| `--entity-type <TYPE>` | `-t` | string | — | Filter by entity type (e.g. `ship`, `aircraft`) |
+| `--limit <N>` | `-l` | usize | `100` | Maximum number of results |
+| `--output <FORMAT>` | `-o` | `table\|json\|csv` | `table` | Output format |
+
+**Examples**
+
+```bash
+# Search all entities (up to 100)
+orp entities search
+
+# Ships only
+orp entities search --entity-type ship
+
+# Ships near Rotterdam within 30km
+orp entities search --near 51.9,4.5 --radius 30 --entity-type ship
+
+# Get 10 results as JSON
+orp entities search --limit 10 --output json
+
+# CSV export
+orp entities search --entity-type ship --output csv > ships.csv
+```
+
+**Output (`--output table`)**
+
+```
+id                  │ type │ name                │ confidence
+────────────────────┼──────┼─────────────────────┼───────────
+ship-123456789      │ ship │ MV Atlantic Pioneer  │ 0.95
+ship-987654321      │ ship │ Vessel Horizon       │ 0.90
+
+2 entities found
+```
+
+---
+
+#### `orp entities get`
+
+Get a specific entity by its ID.
+
+**Synopsis**
+
+```
+orp entities get <ID> [OPTIONS]
+```
+
+**Arguments**
+
+| Argument | Description |
+|----------|-------------|
+| `<ID>` | Entity ID (positional) |
+
+**Options**
+
+| Flag | Short | Type | Default | Description |
+|------|-------|------|---------|-------------|
+| `--output <FORMAT>` | `-o` | `table\|json\|csv` | `json` | Output format |
+
+**Examples**
+
+```bash
+# Get entity as JSON (default)
+orp entities get ship-123456789
+
+# Explicit format
+orp entities get ship-123456789 --output json
 ```
 
 **Output**
 
 ```json
 {
-  "connectors": [
+  "id": "ship-123456789",
+  "entity_type": "ship",
+  "properties": {
+    "name": "MV Atlantic Pioneer",
+    "mmsi": "123456789",
+    "speed": 24.3,
+    "heading": 270.0
+  },
+  "confidence": 0.95,
+  "last_updated": "2024-01-15T10:30:00Z"
+}
+```
+
+---
+
+### `orp events`
+
+View entity events ingested by ORP.
+
+**Synopsis**
+
+```
+orp events [OPTIONS]
+```
+
+**Options**
+
+| Flag | Short | Type | Default | Description |
+|------|-------|------|---------|-------------|
+| `--entity <ID>` | — | string | — | Filter events by entity ID |
+| `--since <TIME>` | — | string | — | Only show events since (e.g. `1h`, `30m`, `2d`, or ISO 8601 date) |
+| `--limit <N>` | `-l` | usize | `50` | Maximum number of events returned |
+| `--output <FORMAT>` | `-o` | `table\|json\|csv` | `table` | Output format |
+
+**Relative time values for `--since`:** `<N>h` (hours), `<N>m` (minutes), `<N>d` (days).
+
+**Examples**
+
+```bash
+# View the last 50 events (default)
+orp events
+
+# Events for a specific entity
+orp events --entity ship-123456789
+
+# Events in the last hour
+orp events --since 1h
+
+# Events in the last 30 minutes for a specific ship, as JSON
+orp events --entity ship-123456789 --since 30m --output json
+
+# Last 200 events as CSV
+orp events --limit 200 --output csv > events.csv
+```
+
+**Output (`--output table`)**
+
+```
+id          │ entity_id        │ event_type      │ timestamp
+────────────┼──────────────────┼─────────────────┼─────────────────────
+evt-001     │ ship-123456789   │ position_update │ 2024-01-15T10:30:00Z
+evt-002     │ ship-987654321   │ position_update │ 2024-01-15T10:30:01Z
+```
+
+---
+
+### `orp monitors`
+
+Manage monitor rules that evaluate entity properties and fire alerts.
+
+**Synopsis**
+
+```
+orp monitors <SUBCOMMAND>
+```
+
+**Subcommands**
+
+| Subcommand | Description |
+|-----------|-------------|
+| `list` | List all monitor rules |
+| `add` | Add a new monitor rule |
+| `remove <ID>` | Remove a monitor rule by ID |
+
+---
+
+#### `orp monitors list`
+
+List all configured monitor rules.
+
+**Synopsis**
+
+```
+orp monitors list
+```
+
+**Examples**
+
+```bash
+orp monitors list
+```
+
+**Output** — raw JSON from the API:
+
+```json
+{
+  "data": [
     {
-      "connector_id": "ais-demo",
-      "source_name": "AIS Demo Feed",
-      "source_type": "ais",
-      "trust_score": 0.95,
-      "events_ingested": 4821,
+      "rule_id": "high_speed_ship",
+      "name": "Ship exceeding speed limit",
+      "entity_type": "ship",
+      "condition": { "type": "property_threshold", "property": "speed", "operator": ">", "value": 25 },
+      "severity": "warning",
       "enabled": true
     }
   ],
-  "total": 1
+  "count": 1
 }
+```
+
+---
+
+#### `orp monitors add`
+
+Add a new monitor rule.
+
+**Synopsis**
+
+```
+orp monitors add --name <NAME> --entity-type <TYPE> --condition <EXPR> [--severity <LEVEL>]
+```
+
+**Options**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--name <NAME>` | string | required | Human-readable monitor name |
+| `--entity-type <TYPE>` | string | required | Entity type to monitor (e.g. `ship`) |
+| `--condition <EXPR>` | string | required | Condition expression (e.g. `"speed > 25"`) |
+| `--severity <LEVEL>` | string | `warning` | Severity level: `info`, `warning`, `critical` |
+
+**Condition syntax:** `<property> <operator> <value>` where operators are `>`, `<`, `>=`, `<=`, `=`, `!=`.
+
+**Examples**
+
+```bash
+# Alert when a ship exceeds 25 knots
+orp monitors add \
+  --name "High Speed Ship" \
+  --entity-type ship \
+  --condition "speed > 25" \
+  --severity warning
+
+# Critical alert for extreme speed
+orp monitors add \
+  --name "Dangerously Fast Ship" \
+  --entity-type ship \
+  --condition "speed > 40" \
+  --severity critical
+```
+
+**Output**
+
+```
+✓ Monitor 'High Speed Ship' created.
+```
+
+---
+
+#### `orp monitors remove`
+
+Remove a monitor rule by its ID.
+
+**Synopsis**
+
+```
+orp monitors remove <ID>
+```
+
+**Arguments**
+
+| Argument | Description |
+|----------|-------------|
+| `<ID>` | Monitor rule ID (positional) |
+
+**Examples**
+
+```bash
+orp monitors remove high_speed_ship
+```
+
+**Output**
+
+```
+✓ Monitor 'high_speed_ship' removed.
+```
+
+---
+
+### `orp config`
+
+Manage and validate ORP configuration files.
+
+**Synopsis**
+
+```
+orp config <SUBCOMMAND>
+```
+
+**Subcommands**
+
+| Subcommand | Description |
+|-----------|-------------|
+| `validate <FILE>` | Validate a configuration file without starting the server |
+
+---
+
+#### `orp config validate`
+
+Validate a YAML configuration file and report any errors.
+
+**Synopsis**
+
+```
+orp config validate <FILE>
+```
+
+**Arguments**
+
+| Argument | Description |
+|----------|-------------|
+| `<FILE>` | Path to the config file to validate (positional) |
+
+**Examples**
+
+```bash
+# Validate before deploying
+orp config validate config.yaml
+
+# Validate a production config
+orp config validate /etc/orp/production.yaml
+```
+
+**Output (valid)**
+
+```
+Validating: config.yaml
+
+✓ Configuration is valid.
+```
+
+**Output (invalid)**
+
+```
+Validating: config.yaml
+
+✗ Configuration invalid: missing field `server.port` at line 3
+```
+
+Exits with code `1` if the configuration is invalid.
+
+---
+
+### `orp version`
+
+Show ORP version and build information.
+
+**Synopsis**
+
+```
+orp version
+```
+
+**Examples**
+
+```bash
+orp version
+```
+
+**Output**
+
+```
+ORP — Open Reality Protocol
+
+  Version:  0.1.0
+  Edition:  Rust 2021
+  Target:   aarch64
+  OS:       macos
+```
+
+> **Note:** `orp --version` (the global flag) prints only the short version string (`orp 0.1.0`). `orp version` (the subcommand) prints full build info.
+
+---
+
+### `orp completions`
+
+Generate shell completion scripts for ORP.
+
+**Synopsis**
+
+```
+orp completions <SHELL>
+```
+
+**Arguments**
+
+| Argument | Description |
+|----------|-------------|
+| `<SHELL>` | Shell to generate completions for: `bash`, `zsh`, `fish`, `powershell`, `elvish` |
+
+**Examples**
+
+```bash
+# Bash
+orp completions bash > /etc/bash_completion.d/orp
+source /etc/bash_completion.d/orp
+
+# Zsh
+orp completions zsh > "${fpath[1]}/_orp"
+
+# Fish
+orp completions fish > ~/.config/fish/completions/orp.fish
+
+# PowerShell
+orp completions powershell | Out-File -Encoding utf8 $PROFILE.CurrentUserAllHosts
+```
+
+**What completions provide:**
+
+```bash
+orp <TAB>
+# start  query  status  connectors  entities  events  monitors  config  version  completions  help
+
+orp start --<TAB>
+# --config  --template  --port  --dev  --help
+
+orp query --<TAB>
+# --file  --output  --help
+
+orp connectors <TAB>
+# list  add  remove
+
+orp entities <TAB>
+# search  get
+
+orp monitors <TAB>
+# list  add  remove
+
+orp config <TAB>
+# validate
 ```
 
 ---
 
 ## Output Formats
 
-ORP CLI outputs **raw JSON** from the API. Use standard UNIX tools to transform:
+Commands that support `--output` accept three formats: `table` (default), `json`, and `csv`.
 
-### Table (via `column`)
+| Format | Flag | Best For |
+|--------|------|----------|
+| `table` | `--output table` | Human reading in terminal |
+| `json` | `--output json` | Piping to `jq`, scripting, AI agents |
+| `csv` | `--output csv` | Spreadsheets, data pipelines |
 
-```bash
-orp query -q "MATCH (s:ship) RETURN s.name, s.mmsi, s.speed" \
-  | jq -r '["NAME","MMSI","SPEED"], (.results[] | [.name, .mmsi, (.speed|tostring)]) | @tsv' \
-  | column -t -s $'\t'
-```
+Commands with `--output` support: `query`, `entities search`, `entities get`, `events`.
 
-```
-NAME                    MMSI         SPEED
-MV Atlantic Pioneer     123456789    24.3
-Vessel Horizon          987654321    21.8
-Rotterdam Carrier       246813579    18.0
-```
-
-### CSV
+### Pipe JSON into jq
 
 ```bash
-orp query -q "MATCH (s:ship) RETURN s.name, s.mmsi, s.speed" \
-  | jq -r '["name","mmsi","speed"], (.results[] | [.name, .mmsi, .speed]) | @csv'
+orp query --output json "MATCH (s:ship) RETURN s.name, s.speed" \
+  | jq '.results[] | select(.speed > 25) | .name'
 ```
 
-```csv
-"name","mmsi","speed"
-"MV Atlantic Pioneer",123456789,24.3
-"Vessel Horizon",987654321,21.8
-```
-
-### Filtered JSON
+### CSV export
 
 ```bash
-orp query -q "MATCH (s:ship) RETURN s" \
-  | jq '.results[] | {name, speed, position}'
+orp entities search --entity-type ship --output csv > ships.csv
+
+orp events --limit 1000 --output csv > audit.csv
 ```
 
-```json
-{ "name": "MV Atlantic Pioneer", "speed": 24.3, "position": [51.9, 4.5] }
-{ "name": "Vessel Horizon", "speed": 21.8, "position": [52.1, 3.8] }
-```
+### Colored output
 
-### Pretty table (via `rich` / Python)
-
-```bash
-orp query -q "MATCH (s:ship) RETURN s.name, s.speed" | python3 -c "
-import json, sys
-from rich.table import Table
-from rich.console import Console
-data = json.load(sys.stdin)
-t = Table('Name', 'Speed (kn)')
-for r in data['results']:
-    t.add_row(r['name'], str(r.get('speed','-')))
-Console().print(t)
-"
-```
+ORP uses color in terminal output by default (success = green ✓, errors = red ✗, headers = cyan bold). Color is automatically disabled when:
+- `NO_COLOR` is set in the environment (any value)
+- Output is piped (the `colored` crate respects TTY detection)
 
 ---
 
 ## Environment Variables
 
-ORP reads these variables at startup and runtime. All can also be set in the config file using `${env.VAR}` syntax.
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `ORP_DEV_MODE` | No | `false` | Set to `true` or `1` to enable permissive auth (no JWT required). **Never use in production.** |
-| `JWT_SECRET` | Production | — | Secret key for HS256 JWT signing. Minimum 32 chars. Required unless `ORP_DEV_MODE=true`. |
-| `ORP_PORT` | No | `9090` | Override the server listen port (equivalent to `--port`). |
-| `ORP_CONFIG` | No | `config.yaml` | Path to the configuration YAML file. |
-| `ORP_CORS_ORIGINS` | No | `http://localhost:3000` | Comma-separated list of allowed CORS origins. |
-| `NO_COLOR` | No | — | When set (any value), disables ANSI colour in terminal output (CLIG compliant). |
-| `RUST_LOG` | No | `info` | Logging filter for `tracing` crate. Values: `error`, `warn`, `info`, `debug`, `trace`. |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ORP_DEV_MODE` | `false` | Set to `true` or `1` to enable permissive auth. Equivalent to `orp start --dev`. **Never use in production.** |
+| `JWT_SECRET` | — | Secret key for HS256 JWT signing. Minimum 32 chars. Required in production unless `ORP_DEV_MODE=true`. |
+| `NO_COLOR` | — | When set (any value), disables ANSI colour in all terminal output ([CLIG compliant](https://no-color.org)). |
+| `RUST_LOG` | `info` | Logging filter for the `tracing` crate. Values: `error`, `warn`, `info`, `debug`, `trace`. |
 
 **Usage Examples**
 
 ```bash
 # Development — no auth
+orp start --dev
+# or
 ORP_DEV_MODE=true orp start
 
 # Production — JWT required
 JWT_SECRET="$(openssl rand -hex 32)" orp start --config /etc/orp/prod.yaml
-
-# Custom port via env (useful in Docker)
-ORP_PORT=8080 orp start
-
-# Use a config path from env
-ORP_CONFIG=/etc/orp/config.yaml orp start
 
 # Disable all colour output (for CI/log files)
 NO_COLOR=1 orp status
@@ -477,18 +991,7 @@ NO_COLOR=1 orp status
 RUST_LOG=debug orp start
 ```
 
-**In config.yaml (env var substitution)**
-
-```yaml
-security:
-  oidc:
-    client_secret: "${env.ORP_OIDC_CLIENT_SECRET}"
-
-api:
-  jwt_secret: "${env.JWT_SECRET}"
-```
-
-ORP substitutes `${env.VAR}` at load time. If the variable is unset, it is replaced with an empty string and a warning is logged.
+> **Note:** Port and config path are configured via `--port` / `--config` flags or in the config file. There are no `ORP_PORT` or `ORP_CONFIG` environment variables read directly by the CLI binary.
 
 ---
 
@@ -507,21 +1010,23 @@ ORP follows standard UNIX conventions:
 
 ```bash
 # Check if server is alive before querying
-orp status > /dev/null 2>&1
-if [ $? -ne 0 ]; then
+if ! orp status > /dev/null 2>&1; then
   echo "ORP is not running — aborting pipeline" >&2
   exit 1
 fi
 
 # Run query only if server is up
-orp status > /dev/null && orp query -q "MATCH (s:ship) RETURN s.name"
+orp status > /dev/null && orp query --output json "MATCH (s:ship) RETURN s.name"
+
+# Validate config before starting
+orp config validate config.yaml && orp start --config config.yaml
 ```
 
 ---
 
 ## Configuration File
 
-The config file is YAML. ORP loads `config.yaml` in the current directory by default, or the path from `--config` / `ORP_CONFIG`.
+The config file is YAML. ORP loads `config.yaml` in the current directory by default, or the path passed via `--config`.
 
 ### Minimal Config
 
@@ -539,39 +1044,16 @@ server:
   port: 9090
   workers: 8
   log_level: "info"
-  telemetry_enabled: true
-  telemetry_endpoint: "http://otel-collector:4317"
 
 storage:
   duckdb:
     path: "/data/orp.duckdb"
     memory_limit_gb: 16
     max_connections: 20
-  rocksdb:
-    path: "/data/state.db"
-    cache_size_mb: 1024
-  kuzu:
-    path: "/data/graph.kuzu"
-    memory_limit_gb: 4
-    sync_interval_seconds: 30
-
-retention:
-  events_ttl_days: 90
-  snapshots_ttl_days: 30
-  audit_log_ttl_days: 365
-  delete_batch_size: 10000
 
 security:
-  oidc:
-    enabled: true
-    provider_url: "https://auth.yourcompany.com"
-    client_id: "orp-client"
-    client_secret: "${env.ORP_OIDC_CLIENT_SECRET}"
-    scopes: ["openid", "profile", "email"]
-    redirect_uri: "https://orp.yourcompany.com/auth/callback"
   abac:
     enabled: true
-    policy_file: "/etc/orp/policies.yaml"
   signing:
     algorithm: "Ed25519"
     private_key_path: "/etc/orp/signing.key"
@@ -591,16 +1073,6 @@ connectors:
     entity_type: "aircraft"
     trust_score: 0.90
 
-  - name: "weather_api"
-    type: "http_poll"
-    enabled: true
-    url: "https://api.weather.example.com/marine"
-    entity_type: "weather_cell"
-    trust_score: 0.80
-    schedule: "*/5 * * * *"
-    headers:
-      Authorization: "Bearer ${env.WEATHER_API_KEY}"
-
 monitors:
   - rule_id: "high_speed_ship"
     name: "Ship exceeding speed limit"
@@ -609,33 +1081,24 @@ monitors:
     action: "alert"
     enabled: true
 
-  - rule_id: "geofence_breach"
-    name: "Entity entered restricted zone"
-    entity_type: "ship"
-    condition: "zone = 'restricted'"
-    action: "alert"
-    enabled: true
-
 api:
   rate_limit_per_minute: 1000
   cors_enabled: true
   cors_allowed_origins:
     - "https://command.yourcompany.com"
-  api_key_header: "X-API-Key"
   jwt_secret: "${env.JWT_SECRET}"
 
 logging:
   level: "info"
   format: "json"
   output: "stdout"
-  audit_log_path: "/var/log/orp/audit.log"
 ```
 
 ### Available Templates
 
 | Template | Description |
 |----------|-------------|
-| `maritime` | AIS ship tracking with Rotterdam port, speed monitors, demo data |
+| `maritime` | AIS ship tracking with demo port data, speed monitor pre-configured |
 
 Use with: `orp start --template maritime`
 
@@ -643,123 +1106,62 @@ Use with: `orp start --template maritime`
 
 ## Shell Completion
 
-### Bash
+Shell completions are generated directly by the CLI (`orp completions <shell>`) — see [`orp completions`](#orp-completions) above.
+
+### Quick Install
 
 ```bash
-# Generate and install
-orp completions bash > /etc/bash_completion.d/orp
+# Bash (system-wide)
+orp completions bash | sudo tee /etc/bash_completion.d/orp
 
-# Or for current user only
-orp completions bash >> ~/.bash_completion
-
-# Apply immediately
-source /etc/bash_completion.d/orp
-```
-
-### Zsh
-
-```bash
-# Generate
+# Zsh
 orp completions zsh > "${fpath[1]}/_orp"
 
-# Or in your ~/.zshrc:
-eval "$(orp completions zsh)"
-
-# Apply
-exec zsh
-```
-
-### Fish
-
-```bash
+# Fish
 orp completions fish > ~/.config/fish/completions/orp.fish
-```
 
-### PowerShell
-
-```powershell
+# PowerShell
 orp completions powershell | Out-File -Encoding utf8 $PROFILE.CurrentUserAllHosts
-```
-
-> **Note:** The `completions` subcommand is planned for v0.2.0. Until then, install shell completions manually from the repository's `completions/` directory.
-
-**What completions provide:**
-
-```bash
-orp <TAB>
-# start    query    status    connectors    completions    help
-
-orp start --<TAB>
-# --config    --template    --port    --help
-
-orp query --<TAB>
-# --query    --help
-
-orp connectors <TAB>
-# list
-
-orp start --template <TAB>
-# maritime
 ```
 
 ---
 
 ## Piping & Scripting
 
-ORP is designed to compose cleanly with standard UNIX tools. All query output is valid JSON, all errors go to `stderr`, and exit codes are meaningful.
+ORP is designed to compose cleanly with standard UNIX tools. Use `--output json` for machine-readable output, `--output csv` for data pipelines.
 
 ### Pipeline Examples
 
 ```bash
 # Count active ships
-orp query -q "MATCH (s:ship) RETURN s.mmsi" | jq '.results | length'
+orp query --output json "MATCH (s:ship) RETURN s.mmsi" | jq '.results | length'
 
 # Extract just names as newline-separated list
-orp query -q "MATCH (s:ship) RETURN s.name" | jq -r '.results[].name'
+orp query --output json "MATCH (s:ship) RETURN s.name" | jq -r '.results[].name'
 
 # Find the fastest ship
-orp query -q "MATCH (s:ship) RETURN s.name, s.speed ORDER BY s.speed DESC LIMIT 1" \
+orp query --output json "MATCH (s:ship) RETURN s.name, s.speed ORDER BY s.speed DESC LIMIT 1" \
   | jq -r '.results[0].name'
 
-# Ships over speed threshold, formatted as CSV
-orp query -q "MATCH (s:ship) WHERE s.speed > 20 RETURN s.name, s.mmsi, s.speed" \
-  | jq -r '.results[] | [.name, (.mmsi | tostring), (.speed | tostring)] | @csv'
+# Ships over speed threshold, piped as CSV
+orp query --output csv "MATCH (s:ship) WHERE s.speed > 20 RETURN s.name, s.mmsi, s.speed"
 
-# Save a snapshot of all entities to disk
-orp query -q "MATCH (e:ship) RETURN e" \
-  | jq '.results' > snapshots/ships-$(date +%Y%m%d-%H%M%S).json
-
-# Alert when a specific ship appears
-while true; do
-  orp query -q "MATCH (s:ship) WHERE s.mmsi = '123456789' RETURN s.position" \
-    | jq -e '.results | length > 0' > /dev/null && \
-    notify-send "Ship MV Pioneer is online"
-  sleep 30
-done
+# Save entity snapshot
+orp entities search --entity-type ship --output json \
+  | jq '.data' > snapshots/ships-$(date +%Y%m%d-%H%M%S).json
 
 # Chain status check + query
 orp status > /dev/null 2>&1 \
-  && orp query -q "MATCH (s:ship) RETURN s.name, s.speed" \
+  && orp query --output json "MATCH (s:ship) RETURN s.name, s.speed" \
   | jq '.results[] | select(.speed > 20) | .name' \
   || echo "Server offline"
-
-# Export all monitors to a file
-curl -s -H "Authorization: Bearer $ORP_TOKEN" \
-  http://localhost:9090/api/v1/monitors \
-  | jq '.' > monitors-backup.json
-
-# Run a query and send results to a webhook
-orp query -q "MATCH (s:ship) WHERE s.speed > 25 RETURN s.name, s.speed" \
-  | curl -s -X POST https://hooks.example.com/alert \
-    -H "Content-Type: application/json" \
-    -d @-
 ```
 
 ### In CI/CD Pipelines
 
 ```bash
 #!/bin/bash
-# deploy-check.sh — verify ORP is healthy after deploy
+# health-check.sh — verify ORP is healthy after deploy
 
 set -euo pipefail
 
@@ -782,60 +1184,35 @@ exit 1
 ### In Makefiles
 
 ```makefile
-# Makefile
-
 .PHONY: dev prod status query-ships
 
 dev:
-	ORP_DEV_MODE=true orp start --template maritime
+	orp start --dev --template maritime
 
 prod:
 	JWT_SECRET=$(shell cat .jwt-secret) orp start --config config.prod.yaml
 
 status:
-	@orp status | jq -r '"Status: \(.status) | Entities: \(.storage.entity_count) | Uptime: \(.uptime_seconds)s"'
+	@orp status
 
 query-ships:
-	@orp query -q "MATCH (s:ship) RETURN s.name, s.speed ORDER BY s.speed DESC LIMIT 5" \
-	  | jq -r '.results[] | "\(.name): \(.speed) kn"'
+	@orp query "MATCH (s:ship) RETURN s.name, s.speed ORDER BY s.speed DESC LIMIT 5"
 ```
 
 ---
 
 ## AI Agent Integration
 
-ORP is designed to be used by AI agents (LLMs, Claude, GPT, Gemini) as a data fusion backend. The CLI is the primary interface for autonomous agents.
+ORP is designed to be used by AI agents (LLMs, Claude, GPT, Gemini) as a data fusion backend.
 
 ### Agent Principles
 
-When an AI agent uses the ORP CLI:
-
 1. **Check server health first** — always run `orp status` before any query.
-2. **Use JSON output** — all output is structured JSON, parseable without screen-scraping.
-3. **Handle errors gracefully** — check exit codes, parse error messages from JSON.
-4. **Compose with tools** — pipe into `jq`, `awk`, `python3` for transformations.
-5. **Prefer specific queries** — use WHERE clauses and LIMITs to minimise data transferred.
+2. **Use `--output json`** — structured output, parseable without screen-scraping.
+3. **Handle errors gracefully** — check exit codes, parse error messages.
+4. **Prefer specific queries** — use WHERE clauses and LIMITs to minimize data transferred.
 
-### Example: Claude/GPT Tool Definition
-
-```json
-{
-  "name": "orp_query",
-  "description": "Execute an ORP-QL query against the Open Reality Protocol data fusion engine. Returns JSON with tracked entities (ships, aircraft, vehicles) and their properties.",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "query": {
-        "type": "string",
-        "description": "ORP-QL query. Syntax: MATCH (alias:EntityType) [WHERE condition] RETURN fields [ORDER BY field] [LIMIT n]"
-      }
-    },
-    "required": ["query"]
-  }
-}
-```
-
-**Agent Tool Implementation (Python)**
+### Agent Tool Implementation (Python)
 
 ```python
 import subprocess
@@ -844,7 +1221,7 @@ import json
 def orp_query(query: str) -> dict:
     """Execute an ORP-QL query and return parsed JSON results."""
     result = subprocess.run(
-        ["orp", "query", "--query", query],
+        ["orp", "query", "--output", "json", query],
         capture_output=True,
         text=True,
         timeout=30
@@ -868,125 +1245,33 @@ if orp_status():
         print(f"Fast ship: {ship['name']} at {ship['speed']} knots")
 ```
 
-**Agent Tool Implementation (TypeScript/Node.js)**
+### Agent Tool Implementation (TypeScript)
 
 ```typescript
 import { execSync } from 'child_process';
 
 interface OrpResult {
   results: Record<string, unknown>[];
-  count: number;
-  elapsed_ms: number;
+  columns: string[];
+  metadata: { rows_returned: number; execution_time_ms: number };
   error?: string;
 }
 
 function orpQuery(query: string): OrpResult {
   try {
-    const output = execSync(`orp query --query "${query.replace(/"/g, '\\"')}"`, {
+    const output = execSync(`orp query --output json "${query.replace(/"/g, '\\"')}"`, {
       encoding: 'utf-8',
       timeout: 30000,
+      env: { ...process.env, NO_COLOR: '1' },
     });
     return JSON.parse(output);
   } catch (err: any) {
-    return { results: [], count: 0, elapsed_ms: 0, error: err.message };
+    return { results: [], columns: [], metadata: { rows_returned: 0, execution_time_ms: 0 }, error: err.message };
   }
 }
-
-// Usage in an AI tool handler
-const result = orpQuery('MATCH (s:ship) WHERE s.speed > 15 RETURN s.name, s.mmsi LIMIT 10');
-console.log(`Found ${result.count} fast ships`);
 ```
 
-### MCP (Model Context Protocol) Server
-
-ORP exposes an MCP-compatible WebSocket endpoint for direct agent integration without shell spawning:
-
-```bash
-# Connect via MCP transport
-ORP_DEV_MODE=true orp start
-
-# Then connect your MCP client to:
-# ws://localhost:9090/ws/updates
-
-# Or use the HTTP REST API directly:
-curl -s http://localhost:9090/api/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "MATCH (s:ship) RETURN s.name, s.speed LIMIT 5"}'
-```
-
-### Agent Workflow Example
-
-```bash
-# A typical AI agent session with ORP:
-
-# Step 1: Check environment
-orp status | jq '{status, entities: .storage.entity_count}'
-
-# Step 2: Discover what entity types exist
-orp query -q "MATCH (e:ship) RETURN COUNT(e) AS ships" | jq '.results[0].ships'
-orp query -q "MATCH (e:port) RETURN COUNT(e) AS ports" | jq '.results[0].ports'
-
-# Step 3: Investigate an anomaly
-orp query -q "MATCH (s:ship) WHERE s.speed > 25 RETURN s.name, s.mmsi, s.speed, s.position" \
-  | jq '.results'
-
-# Step 4: Check monitor alerts
-curl -s http://localhost:9090/api/v1/alerts \
-  | jq '.alerts[] | {rule: .rule_name, entity: .entity_id, fired_at}'
-
-# Step 5: Query relationships
-orp query -q "MATCH (s:ship)-[r:NEAR]->(p:port) RETURN s.name, p.name, r.distance_km" \
-  | jq '.results'
-```
-
----
-
-## Comparison with Similar Tools
-
-ORP's CLI design takes inspiration from the best in the industry:
-
-### Command Structure
-
-| Tool | Pattern | ORP |
-|------|---------|-----|
-| `kubectl get pods` | verb-noun | `orp query "MATCH (s:ship)"` |
-| `docker ps --format json` | noun-verb + format flag | `orp query ... \| jq` |
-| `gh pr list --json` | noun-verb + `--json` | `orp query ... \| jq` |
-| `git log --oneline` | verb + display flag | `orp status \| jq` |
-
-ORP uses a **query-first** model (like `psql` / `clickhouse-client`) since the primary operation is data retrieval via ORP-QL.
-
-### Feature Comparison
-
-| Feature | kubectl | docker | gh CLI | **ORP** |
-|---------|---------|--------|--------|---------|
-| Structured JSON output | ✅ `--output json` | ✅ `--format json` | ✅ `--json` | ✅ default |
-| Shell completions | ✅ | ✅ | ✅ | 🚧 v0.2 |
-| Config file | ✅ kubeconfig | ✅ daemon.json | ✅ hosts.yml | ✅ config.yaml |
-| Env var config | ✅ `KUBECONFIG` | ✅ `DOCKER_HOST` | ✅ `GH_TOKEN` | ✅ `ORP_*` |
-| Templates / contexts | ✅ contexts | ✅ contexts | ✅ hosts | ✅ templates |
-| Exit codes | ✅ | ✅ | ✅ | ✅ |
-| Piping friendly | ✅ | ✅ | ✅ | ✅ |
-| Streaming output | ✅ `--watch` | ✅ | ❌ | 🚧 v0.2 |
-| Real-time WebSocket | ❌ | ❌ | ❌ | ✅ `/ws/updates` |
-| Embedded dashboard | ❌ | ❌ | ❌ | ✅ Deck.gl |
-| Single binary | ✅ | ❌ | ✅ | ✅ |
-| Query language | ❌ | ❌ | ❌ | ✅ ORP-QL |
-
-### Philosophical Alignment with CLIG
-
-ORP follows the [Command Line Interface Guidelines](https://clig.dev):
-
-| Principle | Implementation |
-|-----------|---------------|
-| **Human-first design** | Friendly startup banner, clear error messages, suggests next steps |
-| **Composability** | All output is JSON, nothing requires screen-scraping |
-| **Consistency** | Same flags as similar tools (`--config`, `--port`, `--help`) |
-| **Discoverability** | `--help` on every command, subcommand listing |
-| **Robustness** | Server-down errors include fix instructions; no stack traces shown to users |
-| **Exit codes** | Standard 0/1/2/130 — scriptable |
-| `NO_COLOR` support | ✅ ANSI disabled when `NO_COLOR` is set |
-| **stderr for errors** | ✅ All errors to `stderr`, data to `stdout` |
+> **Tip:** Set `NO_COLOR=1` when calling ORP from scripts to avoid ANSI codes in captured output.
 
 ---
 
@@ -1001,56 +1286,51 @@ lsof -i :9090
 # Use a different port
 orp start --port 8080
 
-# Check config file syntax
-orp start --config config.yaml
-# Look for: Error: config parse error...
+# Validate config before starting
+orp config validate config.yaml
 ```
 
 ### Auth errors (401 Unauthorized)
 
 ```bash
-# Quick fix: enable dev mode
+# Quick fix: enable dev mode via flag
+orp start --dev
+
+# Or via env var
 ORP_DEV_MODE=true orp start
 
 # Production fix: set JWT_SECRET
 export JWT_SECRET="$(openssl rand -hex 32)"
 orp start
-
-# Then use the token in API calls:
-curl -H "Authorization: Bearer $TOKEN" http://localhost:9090/api/v1/entities
 ```
 
 ### Query returns empty results
 
 ```bash
-# Check entity count
-orp status | jq '.storage.entity_count'
+# Check if the server is seeded with data
+orp entities search --limit 5
 
-# If 0, the demo data may not have loaded — try maritime template
+# If empty, try the maritime template
 orp start --template maritime
 
-# Check what entity types exist
-orp query -q "MATCH (s:ship) RETURN COUNT(s)"
+# Run a broad query to see what types exist
+orp query "MATCH (s:ship) RETURN s.name LIMIT 5"
+orp query "MATCH (p:port) RETURN p.name LIMIT 5"
 ```
 
-### Rate limited (429)
+### Config validation fails
 
-```
-{"error": {"code": "RATE_LIMITED", "status": 429, "retry_after_seconds": 1}}
-```
+```bash
+# Validate before starting
+orp config validate config.yaml
 
-ORP uses a token bucket: 100 req/sec per IP. To increase:
-
-```yaml
-# config.yaml
-api:
-  rate_limit_per_minute: 10000
+# Outputs specific error with file and line number
 ```
 
 ### Verbose logging
 
 ```bash
-RUST_LOG=debug orp start 2>&1 | grep -v "tower_http"
+RUST_LOG=debug orp start
 ```
 
 ---
@@ -1060,10 +1340,7 @@ RUST_LOG=debug orp start 2>&1 | grep -v "tower_http"
 The full REST API is documented in the OpenAPI spec:
 
 ```bash
-# View the OpenAPI spec
-cat /Users/deepred/orp/openapi.yaml
-
-# Or browse interactively (requires server running)
+# Browse interactively (requires server running)
 open http://localhost:9090/api/v1/docs
 ```
 
@@ -1072,32 +1349,17 @@ open http://localhost:9090/api/v1/docs
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/v1/health` | Health check (no auth) |
-| `GET` | `/api/v1/metrics` | Prometheus metrics |
 | `GET` | `/api/v1/entities` | List entities |
-| `POST` | `/api/v1/entities` | Create entity |
 | `GET` | `/api/v1/entities/{id}` | Get entity |
-| `PUT` | `/api/v1/entities/{id}` | Update entity |
-| `DELETE` | `/api/v1/entities/{id}` | Delete entity |
 | `GET` | `/api/v1/entities/search` | Search entities |
-| `GET` | `/api/v1/entities/{id}/events` | Get entity events |
-| `GET` | `/api/v1/entities/{id}/relationships` | Get relationships |
-| `POST` | `/api/v1/relationships` | Create relationship |
 | `POST` | `/api/v1/query` | Execute ORP-QL |
-| `POST` | `/api/v1/graph` | Graph (Cypher passthrough) |
+| `GET` | `/api/v1/events` | List events |
 | `GET` | `/api/v1/connectors` | List connectors |
 | `POST` | `/api/v1/connectors` | Create connector |
-| `PUT` | `/api/v1/connectors/{id}` | Update connector |
 | `DELETE` | `/api/v1/connectors/{id}` | Delete connector |
 | `GET` | `/api/v1/monitors` | List monitor rules |
 | `POST` | `/api/v1/monitors` | Create monitor rule |
-| `GET` | `/api/v1/monitors/{id}` | Get monitor rule |
-| `PUT` | `/api/v1/monitors/{id}` | Update monitor rule |
 | `DELETE` | `/api/v1/monitors/{id}` | Delete monitor rule |
-| `GET` | `/api/v1/alerts` | List alerts |
-| `POST` | `/api/v1/alerts/{id}/acknowledge` | Acknowledge alert |
-| `POST` | `/api/v1/api-keys` | Create API key |
-| `GET` | `/api/v1/api-keys` | List API keys |
-| `DELETE` | `/api/v1/api-keys/{id}` | Revoke API key |
 | `GET` | `/ws/updates` | WebSocket — real-time events |
 
 ---
@@ -1105,17 +1367,12 @@ open http://localhost:9090/api/v1/docs
 ## Roadmap
 
 **v0.2.0 (planned)**
-- `orp completions <shell>` — generate shell completions
 - `orp query --watch` — streaming/live query output
-- `orp connectors add/remove` — connector CRUD from CLI
-- `orp monitors list/add/remove` — monitor rule management
-- `orp config validate` — validate config file without starting
 - `orp config init` — interactive config generator
 - `orp logs` — tail server logs
-- `--output table|json|csv` flag on query command
+- `orp context` — manage multiple ORP instances (like `kubectl config use-context`)
 
 **v0.3.0 (planned)**
-- `orp context` — manage multiple ORP instances (like `kubectl config use-context`)
 - `orp export` — bulk export entities/events to CSV/Parquet
 - `orp import` — bulk import from CSV/JSON
 - Plugin system for custom connectors
