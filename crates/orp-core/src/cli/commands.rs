@@ -5,6 +5,8 @@ use orp_connector::traits::ConnectorConfig;
 use orp_connector::Connector;
 use orp_proto::{EventPayload, OrpEvent};
 use orp_query::QueryExecutor;
+use orp_security::{AbacEngine, AuthState, JwtService};
+use orp_security::api_keys::ApiKeyService;
 use orp_storage::DuckDbStorage;
 use orp_storage::traits::Storage;
 use orp_stream::{
@@ -224,13 +226,53 @@ pub async fn run_start(
         }
     });
 
+    // ── Initialize auth + ABAC ──────────────────────────────────────────────
+    let is_dev_mode = std::env::var("ORP_DEV_MODE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let auth_state: Arc<AuthState> = if is_dev_mode {
+        tracing::warn!("⚠️  ORP_DEV_MODE is enabled — authentication is permissive");
+        Arc::new(AuthState::dev())
+    } else {
+        // Production: try to build JWT service from JWT_SECRET
+        match JwtService::from_env() {
+            Ok(jwt_svc) => {
+                let api_key_svc = Arc::new(ApiKeyService::new());
+                Arc::new(AuthState::production(Arc::new(jwt_svc), api_key_svc))
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "JWT_SECRET not set and ORP_DEV_MODE not enabled — auth will reject all requests. \
+                     Set JWT_SECRET or ORP_DEV_MODE=true"
+                );
+                Arc::new(AuthState::default())
+            }
+        }
+    };
+
+    let abac_engine: Arc<AbacEngine> = if is_dev_mode {
+        Arc::new(AbacEngine::default_permissive())
+    } else {
+        Arc::new(AbacEngine::default_production())
+    };
+
     tracing::info!("Starting HTTP server on {}:{}", config.server.host, port);
     tracing::info!("Dashboard: http://localhost:{}/", port);
     tracing::info!("API:       http://localhost:{}/api/v1/", port);
     tracing::info!("Health:    http://localhost:{}/api/v1/health", port);
 
     // Start HTTP server (blocks until shutdown)
-    server::http::start_server(storage, query_executor, processor, monitor_engine, port).await?;
+    server::http::start_server(server::http::ServerConfig {
+        storage,
+        query_executor,
+        processor,
+        monitor_engine,
+        auth_state,
+        abac_engine,
+        port,
+    })
+    .await?;
 
     Ok(())
 }

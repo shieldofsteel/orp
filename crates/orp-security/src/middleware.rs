@@ -6,7 +6,7 @@
 
 use axum::{
     async_trait,
-    extract::{FromRef, FromRequestParts},
+    extract::FromRequestParts,
     http::{request::Parts, StatusCode},
     response::{IntoResponse, Json, Response},
 };
@@ -51,22 +51,15 @@ impl AuthContext {
     }
 
     /// Build an anonymous (unauthenticated) context — used in permissive/dev mode.
+    /// Anonymous context has ZERO permissions for security.
     pub fn anonymous() -> Self {
         Self {
             subject: "anonymous".to_string(),
-            permissions: vec![
-                "entities:read".to_string(),
-                "entities:write".to_string(),
-                "graph:read".to_string(),
-                "monitors:read".to_string(),
-                "monitors:write".to_string(),
-                "query:execute".to_string(),
-                "admin".to_string(),
-            ],
+            permissions: vec![],
             email: None,
-            name: Some("Anonymous (dev mode)".to_string()),
+            name: Some("Anonymous".to_string()),
             org_id: None,
-            scopes: vec!["api:read".to_string(), "api:write".to_string()],
+            scopes: vec![],
             auth_method: AuthMethod::DevMode,
         }
     }
@@ -111,6 +104,7 @@ pub enum AuthMethod {
 
 /// Authentication state shared across Axum handlers.
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub struct AuthState {
     /// JWT service — `None` means auth is disabled (dev mode)
     pub jwt_service: Option<Arc<JwtService>>,
@@ -119,16 +113,6 @@ pub struct AuthState {
     /// When true, missing/invalid tokens fall through to anonymous context.
     /// Set to false in production.
     pub permissive_mode: bool,
-}
-
-impl Default for AuthState {
-    fn default() -> Self {
-        Self {
-            jwt_service: None,
-            api_key_service: None,
-            permissive_mode: true,
-        }
-    }
 }
 
 impl AuthState {
@@ -141,9 +125,16 @@ impl AuthState {
         }
     }
 
-    /// Development mode — all requests are allowed with admin context.
+    /// Development mode — permissive only when ORP_DEV_MODE=true.
     pub fn dev() -> Self {
-        Self::default()
+        let permissive = std::env::var("ORP_DEV_MODE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        Self {
+            jwt_service: None,
+            api_key_service: None,
+            permissive_mode: permissive,
+        }
     }
 }
 
@@ -172,9 +163,13 @@ impl IntoResponse for AuthError {
 /// Axum extractor that validates authentication and provides [`AuthContext`].
 ///
 /// Looks for credentials in this order:
-/// 1. `Authorization: Bearer <token>` — JWT
-/// 2. `X-API-Key: <key>` — API key
-/// 3. Falls through to anonymous if `permissive_mode` is true
+/// 1. Pre-injected `AuthContext` in request extensions (set by middleware layer)
+/// 2. `Authorization: Bearer <token>` — JWT
+/// 3. `X-API-Key: <key>` — API key
+/// 4. Falls through to anonymous if `permissive_mode` is true
+///
+/// Requires `Arc<AuthState>` to be present in request extensions.
+/// Use `AuthState::into_layer()` or manually insert it.
 ///
 /// # Usage in handlers
 /// ```rust,ignore
@@ -184,12 +179,22 @@ impl IntoResponse for AuthError {
 impl<S> FromRequestParts<S> for AuthContext
 where
     S: Send + Sync,
-    Arc<AuthState>: axum::extract::FromRef<S>,
 {
     type Rejection = AuthError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let auth_state = Arc::<AuthState>::from_ref(state);
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // Check if AuthContext was already injected (e.g., by a middleware layer)
+        if let Some(ctx) = parts.extensions.get::<AuthContext>() {
+            return Ok(ctx.clone());
+        }
+
+        // Get AuthState from request extensions
+        let auth_state = parts
+            .extensions
+            .get::<Arc<AuthState>>()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(AuthState::default()));
+
         extract_auth(parts, &auth_state).await
     }
 }
@@ -311,11 +316,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_anonymous_context_has_admin() {
+    fn test_anonymous_context_has_zero_permissions() {
         let ctx = AuthContext::anonymous();
-        assert!(ctx.has_permission("entities:read"));
-        assert!(ctx.has_permission("entities:write"));
-        assert!(ctx.has_permission("admin"));
+        assert!(!ctx.has_permission("entities:read"));
+        assert!(!ctx.has_permission("entities:write"));
+        assert!(!ctx.has_permission("admin"));
+        assert!(ctx.permissions.is_empty());
+        assert!(ctx.scopes.is_empty());
         assert_eq!(ctx.auth_method, AuthMethod::DevMode);
     }
 

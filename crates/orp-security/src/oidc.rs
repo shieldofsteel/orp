@@ -607,7 +607,10 @@ mod tests {
     fn test_validate_token_with_jwt_service() {
         use crate::jwt::JwtService;
 
-        let jwt_svc = Arc::new(JwtService::dev());
+        let jwt_svc = Arc::new(JwtService::new(crate::jwt::JwtConfig {
+            hs256_secret: Some(b"test-secret-for-unit-tests-32bytes!".to_vec()),
+            ..crate::jwt::JwtConfig::default()
+        }).unwrap());
         let token = jwt_svc
             .issue_token("user-1", Some("test@example.com"), None, None, vec!["entities:read".to_string()])
             .unwrap();

@@ -93,8 +93,14 @@ export function useWebSocket(
               }
               const update: Partial<Entity> = {
                 updated_at: msg.timestamp,
+                // Merge properties: spread existing properties first, then overlay updates
                 properties: propUpdates as Record<string, unknown>,
               };
+              // Ensure properties are merged (not replaced) by fetching existing entity
+              const existingEntity = useAppStore.getState().entities.get(d.entity_id);
+              if (existingEntity?.properties) {
+                update.properties = { ...existingEntity.properties, ...propUpdates };
+              }
               if (d.geometry) {
                 update.geometry = d.geometry as Entity['geometry'];
               }

@@ -340,6 +340,23 @@ impl DuckDbStorage {
         format!("{:x}", hasher.finalize())
     }
 
+    /// Collect relationship rows into a Vec.
+    fn collect_relationships(
+        mut rows: duckdb::Rows<'_>,
+    ) -> StorageResult<Vec<Relationship>> {
+        let mut rels = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            rels.push(
+                Self::row_to_relationship(row)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            );
+        }
+        Ok(rels)
+    }
+
     /// Haversine distance in km.
     fn haversine(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
         const R: f64 = 6371.0;
@@ -591,39 +608,61 @@ impl Storage for DuckDbStorage {
         let deg_range = radius_km / 111.0;
         let conn = self.conn.lock().unwrap();
 
-        let type_filter = entity_type
-            .map(|t| format!("AND e.entity_type = '{}'", t.replace('\'', "''")))
-            .unwrap_or_default();
+        let lat_min = lat - deg_range;
+        let lat_max = lat + deg_range;
+        let lon_min = lon - deg_range;
+        let lon_max = lon + deg_range;
 
-        let sql = format!(
-            "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
-                    e.confidence, e.source_count,
-                    g.latitude, g.longitude, NULL::DOUBLE,
-                    COALESCE(
-                      (SELECT json_group_object(property_key, json(property_value))
-                       FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
-                      '{{}}'
-                    ),
-                    CAST(e.last_updated AS VARCHAR),
-                    e.is_active
-             FROM entities e
-             JOIN entity_geometry g ON g.entity_id = e.entity_id
-             WHERE e.is_active = TRUE {type_filter}
-               AND g.latitude  BETWEEN {lat_min} AND {lat_max}
-               AND g.longitude BETWEEN {lon_min} AND {lon_max}",
-            type_filter = type_filter,
-            lat_min = lat - deg_range,
-            lat_max = lat + deg_range,
-            lon_min = lon - deg_range,
-            lon_max = lon + deg_range,
-        );
+        let (sql, has_type) = if entity_type.is_some() {
+            (
+                "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                        e.confidence, e.source_count,
+                        g.latitude, g.longitude, NULL::DOUBLE,
+                        COALESCE(
+                          (SELECT json_group_object(property_key, json(property_value))
+                           FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                          '{}'
+                        ),
+                        CAST(e.last_updated AS VARCHAR),
+                        e.is_active
+                 FROM entities e
+                 JOIN entity_geometry g ON g.entity_id = e.entity_id
+                 WHERE e.is_active = TRUE AND e.entity_type = ?
+                   AND g.latitude  BETWEEN ? AND ?
+                   AND g.longitude BETWEEN ? AND ?",
+                true,
+            )
+        } else {
+            (
+                "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                        e.confidence, e.source_count,
+                        g.latitude, g.longitude, NULL::DOUBLE,
+                        COALESCE(
+                          (SELECT json_group_object(property_key, json(property_value))
+                           FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                          '{}'
+                        ),
+                        CAST(e.last_updated AS VARCHAR),
+                        e.is_active
+                 FROM entities e
+                 JOIN entity_geometry g ON g.entity_id = e.entity_id
+                 WHERE e.is_active = TRUE
+                   AND g.latitude  BETWEEN ? AND ?
+                   AND g.longitude BETWEEN ? AND ?",
+                false,
+            )
+        };
 
         let mut stmt = conn
-            .prepare(&sql)
+            .prepare(sql)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let mut rows = if has_type {
+            stmt.query(params![entity_type.unwrap(), lat_min, lat_max, lon_min, lon_max])
+        } else {
+            stmt.query(params![lat_min, lat_max, lon_min, lon_max])
+        }
+        .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut entities = Vec::new();
         while let Some(row) = rows
@@ -649,44 +688,94 @@ impl Storage for DuckDbStorage {
     ) -> StorageResult<Vec<Entity>> {
         let conn = self.conn.lock().unwrap();
 
-        // With spatial extension, use ST_Contains; otherwise fall back to bounding-box.
-        let type_filter = entity_type
-            .map(|t| format!("AND e.entity_type = '{}'", t.replace('\'', "''")))
-            .unwrap_or_default();
-
-        let spatial_filter = if self.spatial_enabled {
-            format!(
-                "AND ST_Contains(ST_GeomFromText('{}'), ST_Point(g.longitude, g.latitude))",
-                polygon_wkt.replace('\'', "''")
+        let (sql, use_type) = if self.spatial_enabled {
+            if entity_type.is_some() {
+                (
+                    "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                            e.confidence, e.source_count,
+                            g.latitude, g.longitude, NULL::DOUBLE,
+                            COALESCE(
+                              (SELECT json_group_object(property_key, json(property_value))
+                               FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                              '{}'
+                            ),
+                            CAST(e.last_updated AS VARCHAR),
+                            e.is_active
+                     FROM entities e
+                     JOIN entity_geometry g ON g.entity_id = e.entity_id
+                     WHERE e.is_active = TRUE AND e.entity_type = ?
+                       AND ST_Contains(ST_GeomFromText(?), ST_Point(g.longitude, g.latitude))",
+                    true,
+                )
+            } else {
+                (
+                    "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                            e.confidence, e.source_count,
+                            g.latitude, g.longitude, NULL::DOUBLE,
+                            COALESCE(
+                              (SELECT json_group_object(property_key, json(property_value))
+                               FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                              '{}'
+                            ),
+                            CAST(e.last_updated AS VARCHAR),
+                            e.is_active
+                     FROM entities e
+                     JOIN entity_geometry g ON g.entity_id = e.entity_id
+                     WHERE e.is_active = TRUE
+                       AND ST_Contains(ST_GeomFromText(?), ST_Point(g.longitude, g.latitude))",
+                    false,
+                )
+            }
+        } else if entity_type.is_some() {
+            (
+                "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                        e.confidence, e.source_count,
+                        g.latitude, g.longitude, NULL::DOUBLE,
+                        COALESCE(
+                          (SELECT json_group_object(property_key, json(property_value))
+                           FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                          '{}'
+                        ),
+                        CAST(e.last_updated AS VARCHAR),
+                        e.is_active
+                 FROM entities e
+                 JOIN entity_geometry g ON g.entity_id = e.entity_id
+                 WHERE e.is_active = TRUE AND e.entity_type = ?",
+                true,
             )
         } else {
-            // Basic bounding-box parse: extract min/max lat/lon from WKT
-            // For production, use a proper WKT parser; here we do a best-effort scan.
-            String::new()
+            (
+                "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                        e.confidence, e.source_count,
+                        g.latitude, g.longitude, NULL::DOUBLE,
+                        COALESCE(
+                          (SELECT json_group_object(property_key, json(property_value))
+                           FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                          '{}'
+                        ),
+                        CAST(e.last_updated AS VARCHAR),
+                        e.is_active
+                 FROM entities e
+                 JOIN entity_geometry g ON g.entity_id = e.entity_id
+                 WHERE e.is_active = TRUE",
+                false,
+            )
         };
 
-        let sql = format!(
-            "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
-                    e.confidence, e.source_count,
-                    g.latitude, g.longitude, NULL::DOUBLE,
-                    COALESCE(
-                      (SELECT json_group_object(property_key, json(property_value))
-                       FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
-                      '{{}}'
-                    ),
-                    CAST(e.last_updated AS VARCHAR),
-                    e.is_active
-             FROM entities e
-             JOIN entity_geometry g ON g.entity_id = e.entity_id
-             WHERE e.is_active = TRUE {type_filter} {spatial_filter}",
-        );
-
         let mut stmt = conn
-            .prepare(&sql)
+            .prepare(sql)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let mut rows = if self.spatial_enabled && use_type {
+            stmt.query(params![entity_type.unwrap(), polygon_wkt])
+        } else if self.spatial_enabled {
+            stmt.query(params![polygon_wkt])
+        } else if use_type {
+            stmt.query(params![entity_type.unwrap()])
+        } else {
+            stmt.query([])
+        }
+        .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut entities = Vec::new();
         while let Some(row) = rows
@@ -821,28 +910,42 @@ impl Storage for DuckDbStorage {
             return Ok(vec![]);
         }
 
-        let ids: Vec<String> = entities.iter().map(|e| format!("'{}'", e.entity_id.replace('\'', "''"))).collect();
-        let ids_str = ids.join(",");
+        let entity_ids: Vec<String> = entities.iter().map(|e| e.entity_id.clone()).collect();
 
-        let conn = self.conn.lock().unwrap();
+        // Use parameterised query: build placeholders dynamically
+        let placeholders: Vec<String> = (0..entity_ids.len()).map(|_| "?".to_string()).collect();
+        let placeholders_str = placeholders.join(",");
+
         let sql = format!(
             "SELECT event_id, entity_id, event_type,
                     CAST(event_timestamp AS VARCHAR), ingestion_timestamp,
                     source_id, event_data, confidence
              FROM events
              WHERE entity_id IN ({})
-               AND event_timestamp >= '{}' AND event_timestamp <= '{}'
+               AND event_timestamp >= ? AND event_timestamp <= ?
              ORDER BY event_timestamp ASC",
-            ids_str,
-            start.to_rfc3339(),
-            end.to_rfc3339(),
+            placeholders_str,
         );
 
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        // Build params: entity_ids... + start + end
+        use duckdb::types::ToSql;
+        let start_str = start.to_rfc3339();
+        let end_str = end.to_rfc3339();
+        let mut param_values: Vec<Box<dyn ToSql>> = entity_ids
+            .iter()
+            .map(|id| Box::new(id.clone()) as Box<dyn ToSql>)
+            .collect();
+        param_values.push(Box::new(start_str));
+        param_values.push(Box::new(end_str));
+        let param_refs: Vec<&dyn ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+
         let mut rows = stmt
-            .query([])
+            .query(param_refs.as_slice())
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut events = Vec::new();
@@ -930,37 +1033,35 @@ impl Storage for DuckDbStorage {
         rel_type: Option<&str>,
     ) -> StorageResult<Vec<Relationship>> {
         let conn = self.conn.lock().unwrap();
-        let type_filter = rel_type
-            .map(|t| format!("AND relationship_type = '{}'", t.replace('\'', "''")))
-            .unwrap_or_default();
 
-        let sql = format!(
-            "SELECT relationship_id, source_entity_id, target_entity_id,
-                    relationship_type, properties, confidence, is_active
-             FROM relationships
-             WHERE source_entity_id = '{}' AND is_active = TRUE {}",
-            source_entity_id.replace('\'', "''"),
-            type_filter,
-        );
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-
-        let mut rels = Vec::new();
-        while let Some(row) = rows
-            .next()
+        let mut stmt = if let Some(rt) = rel_type {
+            let mut s = conn
+                .prepare(
+                    "SELECT relationship_id, source_entity_id, target_entity_id,
+                            relationship_type, properties, confidence, is_active
+                     FROM relationships
+                     WHERE source_entity_id = ? AND is_active = TRUE
+                       AND relationship_type = ?",
+                )
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            let rows = s
+                .query(params![source_entity_id, rt])
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            return Self::collect_relationships(rows);
+        } else {
+            conn.prepare(
+                "SELECT relationship_id, source_entity_id, target_entity_id,
+                        relationship_type, properties, confidence, is_active
+                 FROM relationships
+                 WHERE source_entity_id = ? AND is_active = TRUE",
+            )
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?
-        {
-            rels.push(
-                Self::row_to_relationship(row)
-                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
-            );
-        }
-        Ok(rels)
+        };
+
+        let rows = stmt
+            .query(params![source_entity_id])
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        Self::collect_relationships(rows)
     }
 
     async fn get_incoming_relationships(
@@ -969,37 +1070,35 @@ impl Storage for DuckDbStorage {
         rel_type: Option<&str>,
     ) -> StorageResult<Vec<Relationship>> {
         let conn = self.conn.lock().unwrap();
-        let type_filter = rel_type
-            .map(|t| format!("AND relationship_type = '{}'", t.replace('\'', "''")))
-            .unwrap_or_default();
 
-        let sql = format!(
-            "SELECT relationship_id, source_entity_id, target_entity_id,
-                    relationship_type, properties, confidence, is_active
-             FROM relationships
-             WHERE target_entity_id = '{}' AND is_active = TRUE {}",
-            target_entity_id.replace('\'', "''"),
-            type_filter,
-        );
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-
-        let mut rels = Vec::new();
-        while let Some(row) = rows
-            .next()
+        let mut stmt = if let Some(rt) = rel_type {
+            let mut s = conn
+                .prepare(
+                    "SELECT relationship_id, source_entity_id, target_entity_id,
+                            relationship_type, properties, confidence, is_active
+                     FROM relationships
+                     WHERE target_entity_id = ? AND is_active = TRUE
+                       AND relationship_type = ?",
+                )
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            let rows = s
+                .query(params![target_entity_id, rt])
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            return Self::collect_relationships(rows);
+        } else {
+            conn.prepare(
+                "SELECT relationship_id, source_entity_id, target_entity_id,
+                        relationship_type, properties, confidence, is_active
+                 FROM relationships
+                 WHERE target_entity_id = ? AND is_active = TRUE",
+            )
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?
-        {
-            rels.push(
-                Self::row_to_relationship(row)
-                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
-            );
-        }
-        Ok(rels)
+        };
+
+        let rows = stmt
+            .query(params![target_entity_id])
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        Self::collect_relationships(rows)
     }
 
     // ── Graph / path queries ──────────────────────────────────────────────────
@@ -1021,12 +1120,9 @@ impl Storage for DuckDbStorage {
     ) -> StorageResult<Vec<Vec<Relationship>>> {
         let conn = self.conn.lock().unwrap();
 
-        // Recursive CTE: find all paths from source to target up to max_hops.
-        // We store the path as a JSON array of relationship_ids to detect cycles.
-        let sql = format!(
-            r#"
+        // Recursive CTE uses parameterised placeholders for source/target/max_hops.
+        let sql = r#"
             WITH RECURSIVE path_cte AS (
-              -- Seed: all direct outgoing edges from source
               SELECT
                 relationship_id,
                 source_entity_id,
@@ -1038,11 +1134,10 @@ impl Storage for DuckDbStorage {
                 1 AS hop_count,
                 [relationship_id] AS path_ids
               FROM relationships
-              WHERE source_entity_id = '{src}' AND is_active = TRUE
+              WHERE source_entity_id = ? AND is_active = TRUE
 
               UNION ALL
 
-              -- Expand one hop at a time, avoiding cycles via path_ids
               SELECT
                 r.relationship_id,
                 r.source_entity_id,
@@ -1056,30 +1151,23 @@ impl Storage for DuckDbStorage {
               FROM relationships r
               JOIN path_cte p ON r.source_entity_id = p.target_entity_id
               WHERE r.is_active = TRUE
-                AND p.hop_count < {max_hops}
+                AND p.hop_count < ?
                 AND NOT list_contains(p.path_ids, r.relationship_id)
             )
             SELECT relationship_id, source_entity_id, target_entity_id,
                    relationship_type, properties, confidence, is_active
             FROM path_cte
-            WHERE target_entity_id = '{tgt}'
+            WHERE target_entity_id = ?
             ORDER BY hop_count
-            "#,
-            src = source_entity_id.replace('\'', "''"),
-            tgt = target_entity_id.replace('\'', "''"),
-            max_hops = max_hops,
-        );
+        "#;
 
         let mut stmt = conn
-            .prepare(&sql)
+            .prepare(sql)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
         let mut rows = stmt
-            .query([])
+            .query(params![source_entity_id, max_hops as i64, target_entity_id])
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
-        // Each result row is a relationship on a path that reaches the target.
-        // For simplicity we return each as a single-step path; in production
-        // you'd reconstruct multi-hop paths from the path_ids column.
         let mut paths: Vec<Vec<Relationship>> = Vec::new();
         while let Some(row) = rows
             .next()
@@ -1309,25 +1397,35 @@ impl Storage for DuckDbStorage {
     ) -> StorageResult<Vec<Event>> {
         let conn = self.conn.lock().unwrap();
         let mut conditions = vec!["1=1".to_string()];
+        let mut param_values: Vec<Box<dyn duckdb::types::ToSql>> = Vec::new();
+
         if let Some(eid) = entity_id {
-            conditions.push(format!("ev.entity_id = '{}'", eid.replace('\'', "''")));
+            conditions.push("ev.entity_id = ?".to_string());
+            param_values.push(Box::new(eid.to_string()));
         }
         if let Some(etype) = entity_type {
-            conditions.push(format!(
-                "ev.entity_id IN (SELECT entity_id FROM entities WHERE entity_type = '{}')",
-                etype.replace('\'', "''")
-            ));
+            conditions.push(
+                "ev.entity_id IN (SELECT entity_id FROM entities WHERE entity_type = ?)"
+                    .to_string(),
+            );
+            param_values.push(Box::new(etype.to_string()));
         }
         if let Some(et) = event_type {
-            conditions.push(format!("ev.event_type = '{}'", et.replace('\'', "''")));
+            conditions.push("ev.event_type = ?".to_string());
+            param_values.push(Box::new(et.to_string()));
         }
         if let Some(s) = since {
-            conditions.push(format!("ev.event_timestamp >= '{}'", s.to_rfc3339()));
+            conditions.push("ev.event_timestamp >= ?".to_string());
+            param_values.push(Box::new(s.to_rfc3339()));
         }
         if let Some(u) = until {
-            conditions.push(format!("ev.event_timestamp <= '{}'", u.to_rfc3339()));
+            conditions.push("ev.event_timestamp <= ?".to_string());
+            param_values.push(Box::new(u.to_rfc3339()));
         }
         let where_clause = conditions.join(" AND ");
+        param_values.push(Box::new(limit as i64));
+        param_values.push(Box::new(offset as i64));
+
         let sql = format!(
             "SELECT ev.event_id, ev.entity_id, ev.event_type,
                     CAST(ev.event_timestamp AS VARCHAR), ev.ingestion_timestamp,
@@ -1335,13 +1433,27 @@ impl Storage for DuckDbStorage {
              FROM events ev
              WHERE {where_clause}
              ORDER BY ev.event_timestamp DESC
-             LIMIT {limit} OFFSET {offset}"
+             LIMIT ? OFFSET ?"
         );
-        let mut stmt = conn.prepare(&sql).map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-        let mut rows = stmt.query([]).map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let param_refs: Vec<&dyn duckdb::types::ToSql> =
+            param_values.iter().map(|b| b.as_ref()).collect();
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        let mut rows = stmt
+            .query(param_refs.as_slice())
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
         let mut events = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| StorageError::DatabaseError(e.to_string()))? {
-            events.push(Self::row_to_event(row).map_err(|e| StorageError::DatabaseError(e.to_string()))?);
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            events.push(
+                Self::row_to_event(row)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+            );
         }
         Ok(events)
     }
@@ -1356,27 +1468,39 @@ impl Storage for DuckDbStorage {
     ) -> StorageResult<u64> {
         let conn = self.conn.lock().unwrap();
         let mut conditions = vec!["1=1".to_string()];
+        let mut param_values: Vec<Box<dyn duckdb::types::ToSql>> = Vec::new();
+
         if let Some(eid) = entity_id {
-            conditions.push(format!("ev.entity_id = '{}'", eid.replace('\'', "''")));
+            conditions.push("ev.entity_id = ?".to_string());
+            param_values.push(Box::new(eid.to_string()));
         }
         if let Some(etype) = entity_type {
-            conditions.push(format!(
-                "ev.entity_id IN (SELECT entity_id FROM entities WHERE entity_type = '{}')",
-                etype.replace('\'', "''")
-            ));
+            conditions.push(
+                "ev.entity_id IN (SELECT entity_id FROM entities WHERE entity_type = ?)"
+                    .to_string(),
+            );
+            param_values.push(Box::new(etype.to_string()));
         }
         if let Some(et) = event_type {
-            conditions.push(format!("ev.event_type = '{}'", et.replace('\'', "''")));
+            conditions.push("ev.event_type = ?".to_string());
+            param_values.push(Box::new(et.to_string()));
         }
         if let Some(s) = since {
-            conditions.push(format!("ev.event_timestamp >= '{}'", s.to_rfc3339()));
+            conditions.push("ev.event_timestamp >= ?".to_string());
+            param_values.push(Box::new(s.to_rfc3339()));
         }
         if let Some(u) = until {
-            conditions.push(format!("ev.event_timestamp <= '{}'", u.to_rfc3339()));
+            conditions.push("ev.event_timestamp <= ?".to_string());
+            param_values.push(Box::new(u.to_rfc3339()));
         }
         let where_clause = conditions.join(" AND ");
         let sql = format!("SELECT COUNT(*) FROM events ev WHERE {where_clause}");
-        let n: i64 = conn.query_row(&sql, [], |r| r.get(0))
+
+        let param_refs: Vec<&dyn duckdb::types::ToSql> =
+            param_values.iter().map(|b| b.as_ref()).collect();
+
+        let n: i64 = conn
+            .query_row(&sql, param_refs.as_slice(), |r| r.get(0))
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
         Ok(n as u64)
     }
@@ -1413,35 +1537,58 @@ impl Storage for DuckDbStorage {
         limit: usize,
     ) -> StorageResult<Vec<Entity>> {
         let conn = self.conn.lock().unwrap();
-        let pattern = format!("%{}%", query.replace('\'', "''"));
-        let type_filter = entity_type
-            .map(|t| format!("AND e.entity_type = '{}'", t.replace('\'', "''")))
-            .unwrap_or_default();
+        let pattern = format!("%{}%", query);
 
-        let sql = format!(
-            "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
-                    e.confidence, e.source_count,
-                    g.latitude, g.longitude, NULL::DOUBLE,
-                    COALESCE(
-                      (SELECT json_group_object(property_key, json(property_value))
-                       FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
-                      '{{}}'
-                    ),
-                    CAST(e.last_updated AS VARCHAR),
-                    e.is_active
-             FROM entities e
-             LEFT JOIN entity_geometry g ON g.entity_id = e.entity_id
-             WHERE e.is_active = TRUE {type_filter}
-               AND (e.name ILIKE '{pattern}' OR e.entity_id ILIKE '{pattern}')
-             LIMIT {limit}",
-        );
+        let (sql, use_type) = if entity_type.is_some() {
+            (
+                "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                        e.confidence, e.source_count,
+                        g.latitude, g.longitude, NULL::DOUBLE,
+                        COALESCE(
+                          (SELECT json_group_object(property_key, json(property_value))
+                           FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                          '{}'
+                        ),
+                        CAST(e.last_updated AS VARCHAR),
+                        e.is_active
+                 FROM entities e
+                 LEFT JOIN entity_geometry g ON g.entity_id = e.entity_id
+                 WHERE e.is_active = TRUE AND e.entity_type = ?
+                   AND (e.name ILIKE ? OR e.entity_id ILIKE ?)
+                 LIMIT ?",
+                true,
+            )
+        } else {
+            (
+                "SELECT e.entity_id, e.entity_type, e.canonical_id, e.name,
+                        e.confidence, e.source_count,
+                        g.latitude, g.longitude, NULL::DOUBLE,
+                        COALESCE(
+                          (SELECT json_group_object(property_key, json(property_value))
+                           FROM entity_properties WHERE entity_id = e.entity_id AND is_latest = TRUE),
+                          '{}'
+                        ),
+                        CAST(e.last_updated AS VARCHAR),
+                        e.is_active
+                 FROM entities e
+                 LEFT JOIN entity_geometry g ON g.entity_id = e.entity_id
+                 WHERE e.is_active = TRUE
+                   AND (e.name ILIKE ? OR e.entity_id ILIKE ?)
+                 LIMIT ?",
+                false,
+            )
+        };
 
         let mut stmt = conn
-            .prepare(&sql)
+            .prepare(sql)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let mut rows = if use_type {
+            stmt.query(params![entity_type.unwrap(), pattern, pattern, limit as i64])
+        } else {
+            stmt.query(params![pattern, pattern, limit as i64])
+        }
+        .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut entities = Vec::new();
         while let Some(row) = rows

@@ -123,9 +123,10 @@ pub struct JwtConfig {
 
 impl Default for JwtConfig {
     fn default() -> Self {
+        let hs256_secret = std::env::var("JWT_SECRET").ok().map(|s| s.into_bytes());
         Self {
             algorithm: JwtAlgorithm::HS256,
-            hs256_secret: Some(b"change-me-in-production-32-bytes!!".to_vec()),
+            hs256_secret,
             rs256_private_key_pem: None,
             rs256_public_key_pem: None,
             issuer: "http://localhost:9090/auth".to_string(),
@@ -164,9 +165,13 @@ impl JwtService {
         Ok(Self { config })
     }
 
-    /// Create a new JwtService with a default HS256 dev config.
-    pub fn dev() -> Self {
-        Self::new(JwtConfig::default()).expect("default config is valid")
+    /// Create a new JwtService with HS256 config from JWT_SECRET env var.
+    ///
+    /// Panics if JWT_SECRET is not set. For tests, use `JwtService::new()` with
+    /// an explicit config.
+    pub fn from_env() -> Result<Self, JwtError> {
+        let config = JwtConfig::default();
+        Self::new(config)
     }
 
     /// Issue an access token for the given subject + attributes.
@@ -233,19 +238,13 @@ impl JwtService {
         Ok(data.claims)
     }
 
-    /// Validate without audience check (for refresh tokens).
-    pub fn validate_any_audience(&self, token: &str) -> Result<Claims, JwtError> {
+    /// Validate a refresh token — checks signature and issuer, uses refresh audience.
+    pub fn validate_refresh_token(&self, token: &str) -> Result<Claims, JwtError> {
         let key = self.decoding_key()?;
         let mut validation = Validation::new(self.algorithm());
         validation.set_issuer(&[&self.config.issuer]);
-        validation.insecure_disable_signature_validation();
-        // Re-enable signature validation properly
-        let key2 = self.decoding_key()?;
-        let mut val2 = Validation::new(self.algorithm());
-        val2.set_issuer(&[&self.config.issuer]);
-        val2.validate_aud = false;
-        let data: TokenData<Claims> = decode(token, &key2, &val2)?;
-        let _ = key; // suppress unused warning
+        validation.set_audience(&[format!("{}-refresh", self.config.audience)]);
+        let data: TokenData<Claims> = decode(token, &key, &validation)?;
         Ok(data.claims)
     }
 
@@ -309,7 +308,11 @@ mod tests {
     use super::*;
 
     fn default_service() -> JwtService {
-        JwtService::dev()
+        JwtService::new(JwtConfig {
+            hs256_secret: Some(b"test-secret-for-unit-tests-32bytes!".to_vec()),
+            ..JwtConfig::default()
+        })
+        .unwrap()
     }
 
     #[test]

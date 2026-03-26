@@ -5,6 +5,8 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use orp_proto::{Entity, GeoPoint, Relationship};
+use orp_security::middleware::AuthContext;
+use orp_security::{AbacEngine, EvaluationContext, EvaluationResult, Resource, Subject};
 use orp_stream::monitor::{
     AlertSeverity, GeofenceTrigger, MonitorAction, MonitorCondition, MonitorRule, ThresholdOp,
 };
@@ -45,6 +47,63 @@ fn error_response(
             },
         }),
     )
+}
+
+// ---- ABAC helper ----
+
+fn check_abac(
+    abac: &AbacEngine,
+    auth: &AuthContext,
+    action: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let ctx = EvaluationContext {
+        subject: Subject {
+            sub: auth.subject.clone(),
+            permissions: auth.permissions.clone(),
+            role: if auth.has_permission("admin") {
+                Some("admin".to_string())
+            } else {
+                None
+            },
+            org_id: auth.org_id.clone(),
+            attributes: HashMap::new(),
+        },
+        action: action.to_string(),
+        resource: Resource {
+            r#type: resource_type.to_string(),
+            id: resource_id.to_string(),
+            attributes: HashMap::new(),
+        },
+    };
+    let decision = abac.evaluate(&ctx);
+    if decision.result == EvaluationResult::Deny {
+        return Err(error_response(
+            "FORBIDDEN",
+            StatusCode::FORBIDDEN,
+            &format!("Access denied: {}", decision.reason),
+        ));
+    }
+    Ok(())
+}
+
+// ---- Audit helper ----
+
+async fn audit_log(
+    storage: &dyn orp_storage::traits::Storage,
+    operation: &str,
+    entity_type: Option<&str>,
+    entity_id: Option<&str>,
+    user_id: &str,
+    details: serde_json::Value,
+) {
+    if let Err(e) = storage
+        .log_audit(operation, entity_type, entity_id, Some(user_id), details)
+        .await
+    {
+        tracing::warn!("Audit log write failed: {}", e);
+    }
 }
 
 // ---- Health ----
@@ -109,7 +168,16 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResp
     })
 }
 
-pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
+pub async fn metrics(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    // Require auth — the AuthContext extractor already validated credentials.
+    // Additionally check ABAC for metrics access.
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "admin", "system", "metrics") {
+        return resp.into_response();
+    }
+
     let stats = state.storage.get_stats().await.unwrap_or_default();
     let proc_stats = state.processor.stats();
     let uptime = state.started_at.elapsed().as_secs();
@@ -151,6 +219,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
         alert_count,
         uptime,
     )
+    .into_response()
 }
 
 // ---- Entities ----
@@ -218,9 +287,14 @@ fn entity_to_response(e: &Entity) -> EntityResponse {
 }
 
 pub async fn list_entities(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListParams>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "entity", "*") {
+        return resp.into_response();
+    }
+
     let page = params.page.unwrap_or(1).max(1);
     let limit = params.limit.unwrap_or(100).min(1000);
     let offset = (page - 1) * limit;
@@ -279,9 +353,15 @@ struct CreateGeoJson {
 }
 
 pub async fn create_entity(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateEntityRequest>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:write", "entity", &body.id)
+    {
+        return resp.into_response();
+    }
+
     if body.id.is_empty() {
         return error_response(
             "VALIDATION_ERROR",
@@ -306,7 +386,18 @@ pub async fn create_entity(
     };
 
     match state.storage.insert_entity(&entity).await {
-        Ok(()) => (StatusCode::CREATED, Json(entity_to_response(&entity))).into_response(),
+        Ok(()) => {
+            audit_log(
+                state.storage.as_ref(),
+                "entity_created",
+                Some(&entity.entity_type),
+                Some(&entity.entity_id),
+                &auth.subject,
+                serde_json::json!({"entity_id": entity.entity_id}),
+            )
+            .await;
+            (StatusCode::CREATED, Json(entity_to_response(&entity))).into_response()
+        }
         Err(e) => error_response(
             "INTERNAL_ERROR",
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -317,9 +408,14 @@ pub async fn create_entity(
 }
 
 pub async fn get_entity(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "entity", &id) {
+        return resp.into_response();
+    }
+
     match state.storage.get_entity(&id).await {
         Ok(Some(entity)) => Json(entity_to_response(&entity)).into_response(),
         Ok(None) => error_response(
@@ -338,10 +434,15 @@ pub async fn get_entity(
 }
 
 pub async fn update_entity(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:write", "entity", &id) {
+        return resp.into_response();
+    }
+
     match state.storage.get_entity(&id).await {
         Ok(Some(mut entity)) => {
             if let Some(props) = body.get("properties").and_then(|p| p.as_object()) {
@@ -368,7 +469,18 @@ pub async fn update_entity(
             entity.last_updated = chrono::Utc::now();
 
             match state.storage.insert_entity(&entity).await {
-                Ok(()) => Json(entity_to_response(&entity)).into_response(),
+                Ok(()) => {
+                    audit_log(
+                        state.storage.as_ref(),
+                        "entity_updated",
+                        Some(&entity.entity_type),
+                        Some(&entity.entity_id),
+                        &auth.subject,
+                        serde_json::json!({"entity_id": entity.entity_id}),
+                    )
+                    .await;
+                    Json(entity_to_response(&entity)).into_response()
+                }
                 Err(e) => error_response(
                     "INTERNAL_ERROR",
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -393,12 +505,28 @@ pub async fn update_entity(
 }
 
 pub async fn delete_entity(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:delete", "entity", &id) {
+        return resp.into_response();
+    }
+
     match state.storage.get_entity(&id).await {
         Ok(Some(_)) => match state.storage.delete_entity(&id).await {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Ok(()) => {
+                audit_log(
+                    state.storage.as_ref(),
+                    "entity_deleted",
+                    Some("entity"),
+                    Some(&id),
+                    &auth.subject,
+                    serde_json::json!({"entity_id": id}),
+                )
+                .await;
+                StatusCode::NO_CONTENT.into_response()
+            }
             Err(e) => error_response(
                 "INTERNAL_ERROR",
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -431,9 +559,14 @@ pub struct SearchParams {
 }
 
 pub async fn search_entities(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "entity", "*") {
+        return resp.into_response();
+    }
+
     let limit = params.limit.unwrap_or(100).min(1000);
     let start = std::time::Instant::now();
 
@@ -502,9 +635,14 @@ pub async fn search_entities(
 }
 
 pub async fn get_entity_relationships(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "graph:read", "relationship", &id) {
+        return resp.into_response();
+    }
+
     match state.storage.get_relationships_for_entity(&id).await {
         Ok(rels) => {
             let outgoing: Vec<_> = rels
@@ -558,10 +696,15 @@ pub struct EventsParams {
 }
 
 pub async fn get_entity_events(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(params): Query<EventsParams>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "event", &id) {
+        return resp.into_response();
+    }
+
     let limit = params.limit.unwrap_or(100).min(1000);
     match state.storage.get_events_for_entity(&id, limit).await {
         Ok(events) => {
@@ -600,6 +743,109 @@ pub async fn get_entity_events(
     }
 }
 
+// ---- Events (global) — Missing Endpoint #13 ----
+
+#[derive(Deserialize)]
+pub struct GlobalEventsParams {
+    entity_id: Option<String>,
+    entity_type: Option<String>,
+    event_type: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    page: Option<usize>,
+    limit: Option<usize>,
+}
+
+pub async fn list_events_global(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<GlobalEventsParams>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "event", "*") {
+        return resp.into_response();
+    }
+
+    let page = params.page.unwrap_or(1).max(1);
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let offset = (page - 1) * limit;
+
+    let since = params
+        .since
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let until = params
+        .until
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+    match state
+        .storage
+        .get_events_global(
+            params.entity_id.as_deref(),
+            params.entity_type.as_deref(),
+            params.event_type.as_deref(),
+            since,
+            until,
+            limit,
+            offset,
+        )
+        .await
+    {
+        Ok(events) => {
+            let total = state
+                .storage
+                .count_events_global(
+                    params.entity_id.as_deref(),
+                    params.entity_type.as_deref(),
+                    params.event_type.as_deref(),
+                    since,
+                    until,
+                )
+                .await
+                .unwrap_or(0);
+            let total_pages = if limit > 0 {
+                (total as f64 / limit as f64).ceil() as u64
+            } else {
+                0
+            };
+            let data: Vec<_> = events
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "id": e.event_id,
+                        "entity_id": e.entity_id,
+                        "event_type": e.event_type,
+                        "timestamp": e.event_timestamp.to_rfc3339(),
+                        "source_id": e.source_id,
+                        "data": e.data,
+                        "confidence": e.confidence,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({
+                "data": data,
+                "pagination": {
+                    "page": page,
+                    "limit": limit,
+                    "total_count": total,
+                    "total_pages": total_pages,
+                    "has_next": (page as u64) < total_pages,
+                    "has_prev": page > 1,
+                }
+            }))
+            .into_response()
+        }
+        Err(e) => error_response(
+            "INTERNAL_ERROR",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
 // ---- Relationships ----
 
 #[derive(Deserialize)]
@@ -613,9 +859,20 @@ pub struct CreateRelationshipRequest {
 }
 
 pub async fn create_relationship(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateRelationshipRequest>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(
+        &state.abac_engine,
+        &auth,
+        "graph:write",
+        "relationship",
+        "*",
+    ) {
+        return resp.into_response();
+    }
+
     let rel = Relationship {
         relationship_id: uuid::Uuid::new_v4().to_string(),
         source_entity_id: body.source_id,
@@ -629,18 +886,33 @@ pub async fn create_relationship(
     };
 
     match state.storage.insert_relationship(&rel).await {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "id": rel.relationship_id,
-                "source_id": rel.source_entity_id,
-                "target_id": rel.target_entity_id,
-                "type": rel.relationship_type,
-                "properties": rel.properties,
-                "confidence": rel.confidence,
-            })),
-        )
-            .into_response(),
+        Ok(()) => {
+            audit_log(
+                state.storage.as_ref(),
+                "relationship_created",
+                Some("relationship"),
+                Some(&rel.relationship_id),
+                &auth.subject,
+                serde_json::json!({
+                    "source": rel.source_entity_id,
+                    "target": rel.target_entity_id,
+                    "type": rel.relationship_type,
+                }),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "id": rel.relationship_id,
+                    "source_id": rel.source_entity_id,
+                    "target_id": rel.target_entity_id,
+                    "type": rel.relationship_type,
+                    "properties": rel.properties,
+                    "confidence": rel.confidence,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => error_response(
             "INTERNAL_ERROR",
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -661,9 +933,16 @@ pub struct QueryRequest {
 }
 
 pub async fn execute_query(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Json(body): Json<QueryRequest>,
 ) -> impl IntoResponse {
+    if let Err(resp) =
+        check_abac(&state.abac_engine, &auth, "query:execute", "query", "*")
+    {
+        return resp.into_response();
+    }
+
     if body.query.trim().is_empty() {
         return error_response(
             "INVALID_QUERY",
@@ -672,6 +951,16 @@ pub async fn execute_query(
         )
         .into_response();
     }
+
+    audit_log(
+        state.storage.as_ref(),
+        "query_executed",
+        None,
+        None,
+        &auth.subject,
+        serde_json::json!({"query": body.query}),
+    )
+    .await;
 
     match state.query_executor.execute(&body.query).await {
         Ok(result) => Json(serde_json::json!({
@@ -691,9 +980,14 @@ pub async fn execute_query(
 }
 
 pub async fn graph_query(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "graph:read", "graph", "*") {
+        return resp.into_response();
+    }
+
     let query = body.get("query").and_then(|q| q.as_str()).unwrap_or("");
     if query.is_empty() {
         return error_response(
@@ -729,7 +1023,20 @@ pub async fn graph_query(
 
 // ---- Connectors ----
 
-pub async fn list_connectors(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list_connectors(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(
+        &state.abac_engine,
+        &auth,
+        "connectors:manage",
+        "connector",
+        "*",
+    ) {
+        return resp.into_response();
+    }
+
     match state.storage.get_data_sources().await {
         Ok(sources) => Json(serde_json::json!({
             "data": sources,
@@ -756,9 +1063,20 @@ pub struct CreateConnectorRequest {
 }
 
 pub async fn create_connector(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateConnectorRequest>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(
+        &state.abac_engine,
+        &auth,
+        "connectors:manage",
+        "connector",
+        "*",
+    ) {
+        return resp.into_response();
+    }
+
     let source = orp_proto::DataSource {
         source_id: format!("{}-{}", body.connector_type, uuid::Uuid::new_v4()),
         source_name: body.name,
@@ -769,13 +1087,143 @@ pub async fn create_connector(
     };
 
     match state.storage.register_data_source(&source).await {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "data": source,
-            })),
+        Ok(()) => {
+            audit_log(
+                state.storage.as_ref(),
+                "connector_created",
+                Some("connector"),
+                Some(&source.source_id),
+                &auth.subject,
+                serde_json::json!({"source_id": source.source_id}),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "data": source,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => error_response(
+            "INTERNAL_ERROR",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
         )
-            .into_response(),
+        .into_response(),
+    }
+}
+
+/// PUT /api/v1/connectors/{id} — Missing Endpoint #13
+#[derive(Deserialize)]
+pub struct UpdateConnectorRequest {
+    name: Option<String>,
+    connector_type: Option<String>,
+    trust_score: Option<f64>,
+    enabled: Option<bool>,
+}
+
+pub async fn update_connector(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateConnectorRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(
+        &state.abac_engine,
+        &auth,
+        "connectors:manage",
+        "connector",
+        &id,
+    ) {
+        return resp.into_response();
+    }
+
+    match state.storage.get_data_source(&id).await {
+        Ok(Some(mut source)) => {
+            if let Some(name) = body.name {
+                source.source_name = name;
+            }
+            if let Some(ct) = body.connector_type {
+                source.source_type = ct;
+            }
+            if let Some(ts) = body.trust_score {
+                source.trust_score = ts as f32;
+            }
+            if let Some(en) = body.enabled {
+                source.enabled = en;
+            }
+            match state.storage.update_data_source(&source).await {
+                Ok(_) => {
+                    audit_log(
+                        state.storage.as_ref(),
+                        "connector_updated",
+                        Some("connector"),
+                        Some(&id),
+                        &auth.subject,
+                        serde_json::json!({"source_id": id}),
+                    )
+                    .await;
+                    Json(serde_json::json!({"data": source})).into_response()
+                }
+                Err(e) => error_response(
+                    "INTERNAL_ERROR",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                )
+                .into_response(),
+            }
+        }
+        Ok(None) => error_response(
+            "CONNECTOR_NOT_FOUND",
+            StatusCode::NOT_FOUND,
+            &format!("Connector '{}' not found", id),
+        )
+        .into_response(),
+        Err(e) => error_response(
+            "INTERNAL_ERROR",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// DELETE /api/v1/connectors/{id} — Missing Endpoint #13
+pub async fn delete_connector(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(
+        &state.abac_engine,
+        &auth,
+        "connectors:manage",
+        "connector",
+        &id,
+    ) {
+        return resp.into_response();
+    }
+
+    match state.storage.delete_data_source(&id).await {
+        Ok(true) => {
+            audit_log(
+                state.storage.as_ref(),
+                "connector_deleted",
+                Some("connector"),
+                Some(&id),
+                &auth.subject,
+                serde_json::json!({"source_id": id}),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => error_response(
+            "CONNECTOR_NOT_FOUND",
+            StatusCode::NOT_FOUND,
+            &format!("Connector '{}' not found", id),
+        )
+        .into_response(),
         Err(e) => error_response(
             "INTERNAL_ERROR",
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -787,12 +1235,26 @@ pub async fn create_connector(
 
 // ---- Monitors ----
 
-pub async fn list_monitors(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list_monitors(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(
+        &state.abac_engine,
+        &auth,
+        "monitors:read",
+        "monitor",
+        "*",
+    ) {
+        return resp.into_response();
+    }
+
     let rules = state.monitor_engine.get_rules().await;
     Json(serde_json::json!({
         "data": rules,
         "count": rules.len(),
     }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -847,10 +1309,7 @@ fn parse_severity(s: &str) -> AlertSeverity {
     }
 }
 
-pub async fn create_monitor(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateMonitorRequest>,
-) -> impl IntoResponse {
+fn build_monitor_rule(body: CreateMonitorRequest) -> MonitorRule {
     let condition = match body.condition {
         MonitorConditionRequest::PropertyThreshold {
             property,
@@ -879,7 +1338,7 @@ pub async fn create_monitor(
         }
     };
 
-    let rule = MonitorRule {
+    MonitorRule {
         rule_id: format!("rule-{}", uuid::Uuid::new_v4()),
         name: body.name,
         description: body.description.unwrap_or_default(),
@@ -891,9 +1350,36 @@ pub async fn create_monitor(
         severity: parse_severity(body.severity.as_deref().unwrap_or("info")),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
-    };
+    }
+}
 
+pub async fn create_monitor(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateMonitorRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(
+        &state.abac_engine,
+        &auth,
+        "monitors:write",
+        "monitor",
+        "*",
+    ) {
+        return resp.into_response();
+    }
+
+    let rule = build_monitor_rule(body);
     state.monitor_engine.add_rule(rule.clone()).await;
+
+    audit_log(
+        state.storage.as_ref(),
+        "monitor_created",
+        Some("monitor"),
+        Some(&rule.rule_id),
+        &auth.subject,
+        serde_json::json!({"rule_id": rule.rule_id, "name": rule.name}),
+    )
+    .await;
 
     (
         StatusCode::CREATED,
@@ -905,9 +1391,14 @@ pub async fn create_monitor(
 }
 
 pub async fn get_monitor(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "monitors:read", "monitor", &id) {
+        return resp.into_response();
+    }
+
     match state.monitor_engine.get_rule(&id).await {
         Some(rule) => Json(serde_json::json!({"data": rule})).into_response(),
         None => error_response(
@@ -919,11 +1410,57 @@ pub async fn get_monitor(
     }
 }
 
+/// PUT /api/v1/monitors/{id} — Missing Endpoint #13
+pub async fn update_monitor(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<CreateMonitorRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "monitors:write", "monitor", &id) {
+        return resp.into_response();
+    }
+
+    // Remove old, add new with same ID
+    let _ = state.monitor_engine.remove_rule(&id).await;
+
+    let mut rule = build_monitor_rule(body);
+    rule.rule_id = id.clone();
+
+    state.monitor_engine.add_rule(rule.clone()).await;
+
+    audit_log(
+        state.storage.as_ref(),
+        "monitor_updated",
+        Some("monitor"),
+        Some(&id),
+        &auth.subject,
+        serde_json::json!({"rule_id": id}),
+    )
+    .await;
+
+    Json(serde_json::json!({"data": rule})).into_response()
+}
+
 pub async fn delete_monitor(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "monitors:write", "monitor", &id) {
+        return resp.into_response();
+    }
+
     if state.monitor_engine.remove_rule(&id).await {
+        audit_log(
+            state.storage.as_ref(),
+            "monitor_deleted",
+            Some("monitor"),
+            Some(&id),
+            &auth.subject,
+            serde_json::json!({"rule_id": id}),
+        )
+        .await;
         StatusCode::NO_CONTENT.into_response()
     } else {
         error_response(
@@ -943,22 +1480,42 @@ pub struct AlertsParams {
 }
 
 pub async fn list_alerts(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Query(params): Query<AlertsParams>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "monitors:read", "alert", "*") {
+        return resp.into_response();
+    }
+
     let limit = params.limit.unwrap_or(100).min(1000);
     let alerts = state.monitor_engine.get_alerts(limit).await;
     Json(serde_json::json!({
         "data": alerts,
         "count": alerts.len(),
     }))
+    .into_response()
 }
 
 pub async fn acknowledge_alert(
+    auth: AuthContext,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "monitors:write", "alert", &id) {
+        return resp.into_response();
+    }
+
     if state.monitor_engine.acknowledge_alert(&id).await {
+        audit_log(
+            state.storage.as_ref(),
+            "alert_acknowledged",
+            Some("alert"),
+            Some(&id),
+            &auth.subject,
+            serde_json::json!({"alert_id": id}),
+        )
+        .await;
         Json(serde_json::json!({"status": "acknowledged"})).into_response()
     } else {
         error_response(
