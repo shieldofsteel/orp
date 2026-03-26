@@ -567,6 +567,7 @@ pub struct Entity {
     pub properties: HashMap<String, JsonValue>,
     /// Confidence in f64 per spec (Powerful.md).
     pub confidence: f64,
+    pub created_at: DateTime<Utc>,
     pub last_updated: DateTime<Utc>,
     pub geometry: Option<GeoPoint>,
     pub is_active: bool,
@@ -574,6 +575,7 @@ pub struct Entity {
 
 impl Default for Entity {
     fn default() -> Self {
+        let now = Utc::now();
         Self {
             entity_id: String::new(),
             entity_type: String::new(),
@@ -581,7 +583,8 @@ impl Default for Entity {
             name: None,
             properties: HashMap::new(),
             confidence: 1.0,
-            last_updated: Utc::now(),
+            created_at: now,
+            last_updated: now,
             geometry: None,
             is_active: true,
         }

@@ -1,28 +1,29 @@
-# ORP — Fix ALL Audit Findings
+# ORP — Final A+ Pass
 
-Security + quality hardening. Fix every issue below.
+## CRITICAL BUGS
+1. `orp-query/src/executor.rs` — AND/OR conditions ALWAYS return true. Fix filter to evaluate both sides recursively
+2. `executor.rs` — Type-less MATCH defaults to "ship". Scan all types when none specified
+3. `orp-storage/src/duckdb_engine.rs` — graph_query() returns empty. Implement via recursive CTE on relationships
+4. `duckdb_engine.rs` — begin/commit/rollback are no-ops. Implement real transactions
+5. `orp-security/src/abac.rs` — Box::leak memory leak in principal_matches. Use owned comparison
 
-## CRITICAL (fix all 5)
-1. `http.rs` — Wire AuthState into AppState, add AuthContext extractor to EVERY handler
-2. `middleware.rs` — anonymous() must have ZERO permissions. permissive_mode only when ORP_DEV_MODE=true
-3. `jwt.rs` — Remove hardcoded secret "change-me-in-production". Require JWT_SECRET env var
-4. `jwt.rs` — Delete validate_any_audience or remove insecure_disable_signature_validation()
-5. `duckdb_engine.rs` — Replace ALL format!() SQL with parameterized queries (params![])
+## SECURITY
+6. `http.rs` — Add rate limiting middleware (100 req/sec per IP), return 429 + Retry-After
+7. `handlers.rs` — create_entity: return 409 CONFLICT if entity already exists
+8. `handlers.rs` — Validate lat [-90,90] lon [-180,180] on create/update
+9. `handlers.rs` — Return 400 on malformed `near` search param
+10. `oidc.rs` — Store CSRF state in signed cookie, verify in callback
+11. Add POST/GET/DELETE /api/v1/api-keys endpoints
 
-## HIGH (fix all 6)
-6. `http.rs` — CORS: configurable origins, not allow_origin(Any)
-7. `websocket.rs` — Require auth token in query param, validate before upgrade
-8. Wire AbacEngine into AppState, call evaluate() before data access in handlers
-9. Wire AuditLog into AppState, log every state-mutating operation
-10. Rewrite websocket.rs — tokio::broadcast for real push, not polling. Add entity_created/deleted/relationship_changed/alert_triggered. Multiple subscriptions per client
-11. `http.rs` — Protect /metrics endpoint with auth
+## WEBSOCKET PUSH
+12. Add tokio::broadcast to AppState. Handlers emit events on mutations. WS subscribes to broadcast, remove polling loop
+13. ABAC check per entity before sending to WS client
 
-## Frontend Fix
-12. `frontend/src/hooks/useWebSocket.ts` — merge properties { ...existing, ...update } not replace
+## QUERY + FRONTEND
+14. Push ORDER BY + LIMIT into DuckDB SQL, not Rust-side sort
+15. `useWebSocket.ts` — Pass ?token= from stored JWT
+16. `MapView.tsx` — Filter entities with no geometry (don't cluster at [0,0])
+17. `handlers.rs` — Return separate created_at and updated_at
 
-## Missing Endpoints
-13. Add: GET /events (global), PUT /connectors/{id}, DELETE /connectors/{id}, PUT /monitors/{id}
-
-## Rules
-- cargo test — all must pass. cargo clippy — zero warnings
-- Commit and push to origin when done
+## RULES
+- cargo test — all pass. cargo clippy — zero warnings. Commit + push

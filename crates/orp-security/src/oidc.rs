@@ -11,7 +11,7 @@
 use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -402,6 +402,40 @@ pub fn oidc_router(state: AuthRouterState) -> Router {
         .with_state(state)
 }
 
+/// Build a signed CSRF cookie value: state|HMAC(state, secret).
+fn sign_csrf_state(state_val: &str, secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(state_val.as_bytes());
+    hasher.update(secret.as_bytes());
+    let sig = hex::encode(hasher.finalize());
+    format!("{}|{}", state_val, sig)
+}
+
+/// Verify and extract the CSRF state from a signed cookie value.
+fn verify_csrf_cookie(cookie_val: &str, secret: &str) -> Option<String> {
+    let parts: Vec<&str> = cookie_val.splitn(2, '|').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let state_val = parts[0];
+    let expected = sign_csrf_state(state_val, secret);
+    if expected == cookie_val {
+        Some(state_val.to_string())
+    } else {
+        None
+    }
+}
+
+/// CSRF cookie secret — derived from client_secret or a fixed dev key.
+fn csrf_secret(oidc: &OidcClient) -> String {
+    if oidc.config.client_secret.is_empty() {
+        "orp-dev-csrf-secret".to_string()
+    } else {
+        format!("orp-csrf-{}", &oidc.config.client_secret)
+    }
+}
+
 /// GET /auth/login — redirect to OIDC provider.
 async fn handle_login(
     State(state): State<AuthRouterState>,
@@ -424,9 +458,23 @@ async fn handle_login(
 
     match oidc.authorization_url(&csrf_state) {
         Ok(url) => {
-            // In production, persist csrf_state in a short-lived session/cookie
-            // for verification in the callback.
-            Redirect::temporary(&url).into_response()
+            // Sign and store CSRF state in an httpOnly cookie
+            let secret = csrf_secret(&oidc);
+            let signed = sign_csrf_state(&csrf_state, &secret);
+            let csrf_cookie = format!(
+                "orp_csrf={}; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=600",
+                signed
+            );
+
+            let mut headers = HeaderMap::new();
+            if let Ok(val) = csrf_cookie.parse() {
+                headers.insert(header::SET_COOKIE, val);
+            }
+            if let Ok(val) = url.parse() {
+                headers.insert(header::LOCATION, val);
+            }
+
+            (StatusCode::FOUND, headers).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -446,6 +494,7 @@ async fn handle_login(
 /// GET /auth/callback?code=xxx&state=xxx — exchange code for tokens.
 async fn handle_callback(
     State(state): State<AuthRouterState>,
+    headers_map: HeaderMap,
     Query(params): Query<CallbackParams>,
 ) -> Response {
     let oidc = state.oidc.read().await;
@@ -465,12 +514,72 @@ async fn handle_callback(
             .into_response();
     }
 
+    // Verify CSRF state from signed cookie
+    let secret = csrf_secret(&oidc);
+    let csrf_cookie_val = headers_map
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .find_map(|c| {
+                    let c = c.trim();
+                    c.strip_prefix("orp_csrf=").map(|v| v.to_string())
+                })
+        });
+
+    if let Some(ref callback_state) = params.state {
+        match csrf_cookie_val {
+            Some(ref cookie_val) => {
+                let verified_state = verify_csrf_cookie(cookie_val, &secret);
+                match verified_state {
+                    Some(ref stored_state) if stored_state == callback_state => {
+                        // CSRF verified — proceed
+                    }
+                    _ => {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "CSRF_MISMATCH",
+                                    "status": 403,
+                                    "message": "CSRF state mismatch — possible CSRF attack",
+                                    "timestamp": Utc::now().to_rfc3339()
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            None => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "CSRF_MISSING",
+                            "status": 403,
+                            "message": "Missing CSRF cookie — possible CSRF attack",
+                            "timestamp": Utc::now().to_rfc3339()
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     match oidc.exchange_code(&params.code).await {
         Ok(tokens) => {
             let cookie = oidc.build_auth_cookie(&tokens.access_token, tokens.expires_in);
+            // Clear the CSRF cookie
+            let clear_csrf = "orp_csrf=; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=0";
             let mut headers = HeaderMap::new();
             if let Ok(val) = cookie.parse() {
                 headers.insert(header::SET_COOKIE, val);
+            }
+            if let Ok(val) = clear_csrf.parse() {
+                headers.append(header::SET_COOKIE, val);
             }
             (
                 StatusCode::FOUND,

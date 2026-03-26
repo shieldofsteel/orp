@@ -262,6 +262,9 @@ pub async fn run_start(
     tracing::info!("API:       http://localhost:{}/api/v1/", port);
     tracing::info!("Health:    http://localhost:{}/api/v1/health", port);
 
+    // Build shared API key service
+    let api_key_service = Arc::new(ApiKeyService::new());
+
     // Start HTTP server (blocks until shutdown)
     server::http::start_server(server::http::ServerConfig {
         storage,
@@ -270,6 +273,7 @@ pub async fn run_start(
         monitor_engine,
         auth_state,
         abac_engine,
+        api_key_service,
         port,
     })
     .await?;

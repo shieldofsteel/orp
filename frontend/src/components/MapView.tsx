@@ -97,18 +97,32 @@ export const MapView: React.FC = () => {
 
   const allEntities = useMemo(() => Array.from(entities.values()), [entities]);
 
+  const hasValidGeometry = (e: Entity): boolean => {
+    if (!e.geometry) return false;
+    if (e.geometry.type === 'Point' && Array.isArray(e.geometry.coordinates)) {
+      const [lon, lat] = e.geometry.coordinates as number[];
+      // Filter out entities at [0,0] (likely missing geometry)
+      if (lon === 0 && lat === 0) return false;
+      // Validate coordinate ranges
+      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return false;
+      return true;
+    }
+    if (e.geometry.type === 'Polygon') return true;
+    return false;
+  };
+
   const ships = useMemo(
-    () => allEntities.filter((e) => e.type === 'Ship' && e.geometry?.type === 'Point'),
+    () => allEntities.filter((e) => e.type === 'Ship' && hasValidGeometry(e)),
     [allEntities]
   );
 
   const ports = useMemo(
-    () => allEntities.filter((e) => e.type === 'Port' && e.geometry?.type === 'Point'),
+    () => allEntities.filter((e) => e.type === 'Port' && hasValidGeometry(e)),
     [allEntities]
   );
 
   const weatherSystems = useMemo(
-    () => allEntities.filter((e) => e.type === 'WeatherSystem'),
+    () => allEntities.filter((e) => e.type === 'WeatherSystem' && hasValidGeometry(e)),
     [allEntities]
   );
 

@@ -2,7 +2,16 @@ import { useEffect, useRef, useCallback } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import type { WebSocketMessage, Entity } from '../types';
 
-const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname}:9090/ws/updates`;
+function getWsUrl(): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const base = `${protocol}//${window.location.hostname}:9090/ws/updates`;
+  // Attach stored JWT as query param for WS auth
+  const token = localStorage.getItem('orp_token') ?? sessionStorage.getItem('orp_token') ?? '';
+  if (token) {
+    return `${base}?token=${encodeURIComponent(token)}`;
+  }
+  return base;
+}
 const HEARTBEAT_TIMEOUT_MS = 45_000;
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 60_000;
@@ -61,7 +70,7 @@ export function useWebSocket(
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
     try {
-      const ws = new WebSocket(WS_URL);
+      const ws = new WebSocket(getWsUrl());
       wsRef.current = ws;
 
       ws.onopen = () => {

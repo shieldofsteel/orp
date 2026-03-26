@@ -1,4 +1,5 @@
 use crate::server::http::AppState;
+use crate::server::websocket::BroadcastEvent;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -281,7 +282,7 @@ fn entity_to_response(e: &Entity) -> EntityResponse {
         }),
         confidence: e.confidence,
         is_active: e.is_active,
-        created_at: e.last_updated.to_rfc3339(),
+        created_at: e.created_at.to_rfc3339(),
         updated_at: e.last_updated.to_rfc3339(),
     }
 }
@@ -371,6 +372,49 @@ pub async fn create_entity(
         .into_response();
     }
 
+    // Check if entity already exists → 409 CONFLICT
+    match state.storage.get_entity(&body.id).await {
+        Ok(Some(_)) => {
+            return error_response(
+                "CONFLICT",
+                StatusCode::CONFLICT,
+                &format!("Entity with id '{}' already exists", body.id),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            return error_response(
+                "INTERNAL_ERROR",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            )
+            .into_response();
+        }
+        Ok(None) => {} // good — entity does not exist
+    }
+
+    // Validate lat/lon ranges if geometry is provided
+    if let Some(ref geo) = body.geometry {
+        let lat = geo.coordinates[1];
+        let lon = geo.coordinates[0];
+        if !(-90.0..=90.0).contains(&lat) {
+            return error_response(
+                "VALIDATION_ERROR",
+                StatusCode::BAD_REQUEST,
+                &format!("Latitude must be between -90 and 90, got {}", lat),
+            )
+            .into_response();
+        }
+        if !(-180.0..=180.0).contains(&lon) {
+            return error_response(
+                "VALIDATION_ERROR",
+                StatusCode::BAD_REQUEST,
+                &format!("Longitude must be between -180 and 180, got {}", lon),
+            )
+            .into_response();
+        }
+    }
+
     let entity = Entity {
         entity_id: body.id,
         entity_type: body.entity_type,
@@ -396,6 +440,17 @@ pub async fn create_entity(
                 serde_json::json!({"entity_id": entity.entity_id}),
             )
             .await;
+            // Emit broadcast event for WebSocket clients
+            let _ = state.broadcast_tx.send(BroadcastEvent::EntityCreated {
+                entity_id: entity.entity_id.clone(),
+                entity_type: entity.entity_type.clone(),
+                entity_name: entity.name.clone(),
+                properties: serde_json::to_value(&entity.properties).unwrap_or_default(),
+                geometry: entity.geometry.as_ref().map(|g| {
+                    serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})
+                }),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            });
             (StatusCode::CREATED, Json(entity_to_response(&entity))).into_response()
         }
         Err(e) => error_response(
@@ -458,6 +513,22 @@ pub async fn update_entity(
                     if coords.len() == 2 {
                         let lon = coords[0].as_f64().unwrap_or(0.0);
                         let lat = coords[1].as_f64().unwrap_or(0.0);
+                        if !(-90.0..=90.0).contains(&lat) {
+                            return error_response(
+                                "VALIDATION_ERROR",
+                                StatusCode::BAD_REQUEST,
+                                &format!("Latitude must be between -90 and 90, got {}", lat),
+                            )
+                            .into_response();
+                        }
+                        if !(-180.0..=180.0).contains(&lon) {
+                            return error_response(
+                                "VALIDATION_ERROR",
+                                StatusCode::BAD_REQUEST,
+                                &format!("Longitude must be between -180 and 180, got {}", lon),
+                            )
+                            .into_response();
+                        }
                         entity.geometry = Some(GeoPoint {
                             lat,
                             lon,
@@ -479,6 +550,16 @@ pub async fn update_entity(
                         serde_json::json!({"entity_id": entity.entity_id}),
                     )
                     .await;
+                    // Emit broadcast event
+                    let _ = state.broadcast_tx.send(BroadcastEvent::EntityUpdate {
+                        entity_id: entity.entity_id.clone(),
+                        entity_type: entity.entity_type.clone(),
+                        changes: serde_json::to_value(&entity.properties).unwrap_or_default(),
+                        geometry: entity.geometry.as_ref().map(|g| {
+                            serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})
+                        }),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    });
                     Json(entity_to_response(&entity)).into_response()
                 }
                 Err(e) => error_response(
@@ -514,7 +595,7 @@ pub async fn delete_entity(
     }
 
     match state.storage.get_entity(&id).await {
-        Ok(Some(_)) => match state.storage.delete_entity(&id).await {
+        Ok(Some(deleted_entity)) => match state.storage.delete_entity(&id).await {
             Ok(()) => {
                 audit_log(
                     state.storage.as_ref(),
@@ -525,6 +606,12 @@ pub async fn delete_entity(
                     serde_json::json!({"entity_id": id}),
                 )
                 .await;
+                // Emit broadcast event
+                let _ = state.broadcast_tx.send(BroadcastEvent::EntityDeleted {
+                    entity_id: id.clone(),
+                    entity_type: deleted_entity.entity_type.clone(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                });
                 StatusCode::NO_CONTENT.into_response()
             }
             Err(e) => error_response(
@@ -573,12 +660,30 @@ pub async fn search_entities(
     // Parse "near" parameter: "lat,lon,radius_km"
     if let Some(ref near) = params.near {
         let parts: Vec<&str> = near.split(',').collect();
-        if parts.len() == 3 {
-            if let (Ok(lat), Ok(lon), Ok(radius)) = (
-                parts[0].parse::<f64>(),
-                parts[1].parse::<f64>(),
-                parts[2].parse::<f64>(),
-            ) {
+        if parts.len() != 3 {
+            return error_response(
+                "VALIDATION_ERROR",
+                StatusCode::BAD_REQUEST,
+                "Malformed 'near' parameter. Expected format: lat,lon,radius_km",
+            )
+            .into_response();
+        }
+        let lat = parts[0].parse::<f64>();
+        let lon = parts[1].parse::<f64>();
+        let radius = parts[2].parse::<f64>();
+        match (lat, lon, radius) {
+            (Ok(lat), Ok(lon), Ok(radius)) => {
+                if !(-90.0..=90.0).contains(&lat)
+                    || !(-180.0..=180.0).contains(&lon)
+                    || radius < 0.0
+                {
+                    return error_response(
+                        "VALIDATION_ERROR",
+                        StatusCode::BAD_REQUEST,
+                        "Invalid 'near' values. lat must be [-90,90], lon [-180,180], radius >= 0",
+                    )
+                    .into_response();
+                }
                 match state
                     .storage
                     .get_entities_in_radius(lat, lon, radius, params.entity_type.as_deref())
@@ -604,6 +709,14 @@ pub async fn search_entities(
                         .into_response();
                     }
                 }
+            }
+            _ => {
+                return error_response(
+                    "VALIDATION_ERROR",
+                    StatusCode::BAD_REQUEST,
+                    "Malformed 'near' parameter. lat, lon, and radius_km must be valid numbers.",
+                )
+                .into_response();
             }
         }
     }
@@ -900,6 +1013,15 @@ pub async fn create_relationship(
                 }),
             )
             .await;
+            // Emit broadcast event
+            let _ = state.broadcast_tx.send(BroadcastEvent::RelationshipChanged {
+                relationship_id: rel.relationship_id.clone(),
+                source_id: rel.source_entity_id.clone(),
+                target_id: rel.target_entity_id.clone(),
+                relationship_type: rel.relationship_type.clone(),
+                event: "created".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            });
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
@@ -1524,6 +1646,153 @@ pub async fn acknowledge_alert(
             &format!("Alert '{}' not found", id),
         )
         .into_response()
+    }
+}
+
+// ---- API Keys ----
+
+#[derive(Deserialize)]
+pub struct CreateApiKeyRequestBody {
+    name: String,
+    scopes: Vec<String>,
+    rate_limit: Option<u64>,
+    expires_in: Option<i64>,
+    org_id: Option<String>,
+}
+
+pub async fn create_api_key(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateApiKeyRequestBody>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(
+        &state.abac_engine,
+        &auth,
+        "api-keys:manage",
+        "api_key",
+        "*",
+    ) {
+        return resp.into_response();
+    }
+
+    let req = orp_security::CreateApiKeyRequest {
+        name: body.name,
+        scopes: body.scopes,
+        rate_limit: body.rate_limit,
+        expires_in: body.expires_in,
+        org_id: body.org_id,
+    };
+
+    match state.api_key_service.create_key(req) {
+        Ok(resp) => {
+            audit_log(
+                state.storage.as_ref(),
+                "api_key_created",
+                Some("api_key"),
+                Some(&resp.id),
+                &auth.subject,
+                serde_json::json!({"key_id": resp.id, "name": resp.name}),
+            )
+            .await;
+            (StatusCode::CREATED, Json(serde_json::json!(resp))).into_response()
+        }
+        Err(e) => error_response(
+            "INTERNAL_ERROR",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+pub async fn list_api_keys(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(
+        &state.abac_engine,
+        &auth,
+        "api-keys:manage",
+        "api_key",
+        "*",
+    ) {
+        return resp.into_response();
+    }
+
+    match state.api_key_service.list_keys() {
+        Ok(keys) => {
+            // Strip sensitive fields — don't expose key_hash
+            let safe_keys: Vec<serde_json::Value> = keys
+                .iter()
+                .map(|k| {
+                    serde_json::json!({
+                        "id": k.id,
+                        "name": k.name,
+                        "scopes": k.scopes,
+                        "rate_limit_per_second": k.rate_limit_per_second,
+                        "expires_at": k.expires_at,
+                        "is_revoked": k.is_revoked,
+                        "org_id": k.org_id,
+                        "created_at": k.created_at,
+                        "last_used_at": k.last_used_at,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({
+                "data": safe_keys,
+                "count": safe_keys.len(),
+            }))
+            .into_response()
+        }
+        Err(e) => error_response(
+            "INTERNAL_ERROR",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+pub async fn delete_api_key(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(
+        &state.abac_engine,
+        &auth,
+        "api-keys:manage",
+        "api_key",
+        &id,
+    ) {
+        return resp.into_response();
+    }
+
+    match state.api_key_service.revoke_key(&id) {
+        Ok(()) => {
+            audit_log(
+                state.storage.as_ref(),
+                "api_key_revoked",
+                Some("api_key"),
+                Some(&id),
+                &auth.subject,
+                serde_json::json!({"key_id": id}),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(orp_security::ApiKeyError::NotFound) => error_response(
+            "API_KEY_NOT_FOUND",
+            StatusCode::NOT_FOUND,
+            &format!("API key '{}' not found", id),
+        )
+        .into_response(),
+        Err(e) => error_response(
+            "INTERNAL_ERROR",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )
+        .into_response(),
     }
 }
 

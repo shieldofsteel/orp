@@ -2,17 +2,21 @@ use crate::server::handlers;
 use crate::server::websocket;
 use anyhow::Result;
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
+    http::StatusCode,
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Router,
 };
 use orp_query::QueryExecutor;
-use orp_security::{AbacEngine, AuthState};
+use orp_security::{AbacEngine, ApiKeyService, AuthState};
 use orp_storage::traits::Storage;
 use orp_stream::{MonitorEngine, StreamProcessor};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -24,7 +28,55 @@ pub struct AppState {
     pub monitor_engine: Arc<MonitorEngine>,
     pub auth_state: Arc<AuthState>,
     pub abac_engine: Arc<AbacEngine>,
+    pub api_key_service: Arc<ApiKeyService>,
+    pub broadcast_tx: broadcast::Sender<websocket::BroadcastEvent>,
     pub started_at: std::time::Instant,
+}
+
+/// Per-IP rate limiter state — token bucket with 100 req/sec.
+#[derive(Clone)]
+pub struct RateLimiter {
+    /// IP → (token_count, last_refill_instant)
+    buckets: Arc<tokio::sync::Mutex<HashMap<String, (u64, std::time::Instant)>>>,
+    max_tokens: u64,
+    refill_rate: u64, // tokens per second
+}
+
+impl RateLimiter {
+    pub fn new(max_tokens: u64, refill_rate: u64) -> Self {
+        Self {
+            buckets: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            max_tokens,
+            refill_rate,
+        }
+    }
+
+    /// Try to consume a token for the given IP. Returns Ok(()) or Err(retry_after_secs).
+    pub async fn check(&self, ip: &str) -> Result<(), u64> {
+        let mut buckets = self.buckets.lock().await;
+        let now = std::time::Instant::now();
+
+        let (tokens, last_refill) = buckets
+            .entry(ip.to_string())
+            .or_insert((self.max_tokens, now));
+
+        // Refill tokens based on elapsed time
+        let elapsed = now.duration_since(*last_refill);
+        let new_tokens = elapsed.as_secs() * self.refill_rate
+            + (elapsed.subsec_millis() as u64 * self.refill_rate) / 1000;
+        if new_tokens > 0 {
+            *tokens = (*tokens + new_tokens).min(self.max_tokens);
+            *last_refill = now;
+        }
+
+        if *tokens > 0 {
+            *tokens -= 1;
+            Ok(())
+        } else {
+            // Retry-After: 1 second (one refill window)
+            Err(1u64)
+        }
+    }
 }
 
 /// Build CORS layer from ORP_CORS_ORIGINS env var (comma-separated).
@@ -74,6 +126,49 @@ async fn inject_auth_state(
     next.run(request).await
 }
 
+/// Rate limiting middleware — 100 req/sec per IP, returns 429 + Retry-After.
+async fn rate_limit_middleware(
+    State(limiter): State<RateLimiter>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Extract client IP from X-Forwarded-For or ConnectInfo or fallback
+    let ip = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .or_else(|| {
+            request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0.ip().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    match limiter.check(&ip).await {
+        Ok(()) => next.run(request).await,
+        Err(retry_after) => {
+            let body = serde_json::json!({
+                "error": {
+                    "code": "RATE_LIMITED",
+                    "status": 429,
+                    "message": "Too many requests. Please retry later.",
+                    "retry_after_seconds": retry_after,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                }
+            });
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("Retry-After", retry_after.to_string().as_str().to_owned())],
+                axum::Json(body),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Configuration for starting the HTTP server.
 pub struct ServerConfig {
     pub storage: Arc<dyn Storage>,
@@ -82,10 +177,13 @@ pub struct ServerConfig {
     pub monitor_engine: Arc<MonitorEngine>,
     pub auth_state: Arc<AuthState>,
     pub abac_engine: Arc<AbacEngine>,
+    pub api_key_service: Arc<ApiKeyService>,
     pub port: u16,
 }
 
 pub async fn start_server(config: ServerConfig) -> Result<()> {
+    let (broadcast_tx, _) = broadcast::channel::<websocket::BroadcastEvent>(4096);
+
     let state = Arc::new(AppState {
         storage: config.storage,
         query_executor: config.query_executor,
@@ -93,10 +191,13 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         monitor_engine: config.monitor_engine,
         auth_state: config.auth_state,
         abac_engine: config.abac_engine,
+        api_key_service: config.api_key_service,
+        broadcast_tx,
         started_at: std::time::Instant::now(),
     });
 
     let cors = build_cors_layer();
+    let rate_limiter = RateLimiter::new(100, 100); // 100 tokens, refill 100/sec
 
     let app = Router::new()
         // Health (no auth required)
@@ -155,6 +256,10 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
             "/api/v1/alerts/{id}/acknowledge",
             post(handlers::acknowledge_alert),
         )
+        // API Keys
+        .route("/api/v1/api-keys", post(handlers::create_api_key))
+        .route("/api/v1/api-keys", get(handlers::list_api_keys))
+        .route("/api/v1/api-keys/{id}", delete(handlers::delete_api_key))
         // WebSocket
         .route("/ws/updates", get(websocket::ws_handler))
         // Frontend — serve built Vite assets from frontend/dist/
@@ -162,6 +267,10 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
             ServeDir::new("frontend/dist")
                 .not_found_service(ServeFile::new("frontend/dist/index.html")),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            rate_limiter,
+            rate_limit_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             inject_auth_state,

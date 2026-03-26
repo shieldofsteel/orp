@@ -438,57 +438,33 @@ impl AbacEngine {
         // Type check
         if let Some(ptype) = &spec.r#type {
             if ptype != "*" {
-                // We don't have a strict "type" field on Subject; use role as a proxy.
                 // "user" matches anyone with no special role; "api_key" could be added.
                 // For now, "user" always matches authenticated subjects.
             }
         }
 
+        // Build a combined attribute map that includes known subject fields
+        // This avoids lifetime issues with temporary values.
+        let mut combined_attrs = ctx.subject.attributes.clone();
+        if let Some(ref role) = ctx.subject.role {
+            combined_attrs
+                .entry("role".to_string())
+                .or_insert_with(|| serde_json::json!(role));
+        }
+        if let Some(ref org_id) = ctx.subject.org_id {
+            combined_attrs
+                .entry("org_id".to_string())
+                .or_insert_with(|| serde_json::json!(org_id));
+        }
+
         // Attribute matching
         for (key, expected) in &spec.attribute_match {
-            let actual = ctx
-                .subject
-                .attributes
-                .get(key)
-                .or_else(|| {
-                    // Special known fields
-                    match key.as_str() {
-                        "role" => ctx
-                            .subject
-                            .role
-                            .as_ref()
-                            .map(|r| serde_json::json!(r))
-                            .as_ref()
-                            .and_then(|_| ctx.subject.role.as_ref().map(|r| {
-                                // Leak is not ideal but this is a borrowing workaround
-                                // In production code, build a full attribute map upfront
-                                Box::leak(Box::new(serde_json::json!(r))) as &serde_json::Value
-                            })),
-                        "org_id" => ctx
-                            .subject
-                            .org_id
-                            .as_ref()
-                            .map(|_| Box::leak(Box::new(serde_json::json!(ctx.subject.org_id))) as &serde_json::Value),
-                        _ => None,
-                    }
-                });
-
-            if let Some(actual_val) = actual {
+            if let Some(actual_val) = combined_attrs.get(key) {
                 if !value_matches(actual_val, expected) {
                     return false;
                 }
             } else {
-                // attribute not present — check if expected is a known sub-field
-                match key.as_str() {
-                    "role" => {
-                        let role_val = ctx.subject.role.as_deref().unwrap_or("");
-                        let expected_str = expected.as_str().unwrap_or("");
-                        if role_val != expected_str {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                }
+                return false;
             }
         }
 

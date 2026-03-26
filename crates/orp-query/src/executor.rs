@@ -175,9 +175,9 @@ impl QueryExecutor {
 
         let mut rows = self.execute_query(&query).await?;
 
-        // Apply ORDER BY
+        // Apply ORDER BY in Rust as a fallback (DuckDB already provides ORDER BY
+        // on the entity scan; this handles cross-property sort on projected rows).
         if let Some(ref order) = query.order_by {
-            // Resolve the field name: "s.speed" -> try both "s.speed" and "speed"
             let field = &order.field;
             let short_field = field.split('.').next_back().unwrap_or(field).to_string();
             rows.sort_by(|a, b| {
@@ -247,15 +247,30 @@ impl QueryExecutor {
             }
         }
 
+        // Push LIMIT into the SQL query when possible to avoid fetching
+        // more rows than needed. Use a generous upper bound when WHERE
+        // filters will reduce the result set in Rust.
+        let has_where_filters = query.where_clause.as_ref().is_some_and(|wc| {
+            wc.conditions.iter().any(|c| !matches!(c, Condition::Near { .. }))
+        });
+        let fetch_limit = if has_where_filters {
+            // Need to over-fetch because Rust-side filters will reduce the set
+            10000usize
+        } else {
+            // No additional WHERE filters — we can push LIMIT directly
+            query.limit.unwrap_or(10000)
+        };
+
         // Get base entities - use geo index if available
         let entities = if let Some((lat, lon, radius)) = geo_filter {
             self.storage
                 .get_entities_in_radius(lat, lon, radius, entity_type)
                 .await?
         } else if let Some(etype) = entity_type {
-            self.storage.get_entities_by_type(etype, 10000, 0).await?
+            self.storage.get_entities_by_type(etype, fetch_limit, 0).await?
         } else {
-            self.storage.get_entities_by_type("ship", 10000, 0).await?
+            // No type specified — scan all active entities via search
+            self.storage.search_entities("", None, fetch_limit).await?
         };
 
         // Apply WHERE filters
@@ -285,122 +300,7 @@ impl QueryExecutor {
                 }
 
                 if let Some(ref wc) = query.where_clause {
-                    wc.conditions.iter().all(|c| match c {
-                        Condition::Comparison { left, op, right } => {
-                            let prop_name = left
-                                .strip_prefix(&format!("{}.", variable))
-                                .unwrap_or(left);
-                            let val = e.properties.get(prop_name).or({
-                                // Also check built-in fields
-                                match prop_name {
-                                    "id" | "entity_id" => {
-                                        None // handled below
-                                    }
-                                    _ => None,
-                                }
-                            });
-
-                            // Check built-in properties
-                            let builtin_val = match prop_name {
-                                "id" | "entity_id" => {
-                                    Some(JsonValue::String(e.entity_id.clone()))
-                                }
-                                "name" => e
-                                    .name
-                                    .as_ref()
-                                    .map(|n| JsonValue::String(n.clone())),
-                                "type" | "entity_type" => {
-                                    Some(JsonValue::String(e.entity_type.clone()))
-                                }
-                                "confidence" => {
-                                    Some(serde_json::json!(e.confidence))
-                                }
-                                _ => None,
-                            };
-
-                            let actual = val.or(builtin_val.as_ref());
-
-                            match (actual, right) {
-                                (Some(v), Literal::Number(n)) => {
-                                    let entity_val = v.as_f64().unwrap_or(0.0);
-                                    match op {
-                                        ComparisonOp::Gt => entity_val > *n,
-                                        ComparisonOp::Lt => entity_val < *n,
-                                        ComparisonOp::Gte => entity_val >= *n,
-                                        ComparisonOp::Lte => entity_val <= *n,
-                                        ComparisonOp::Eq => {
-                                            (entity_val - n).abs() < f64::EPSILON
-                                        }
-                                        ComparisonOp::Neq => {
-                                            (entity_val - n).abs() >= f64::EPSILON
-                                        }
-                                        _ => true,
-                                    }
-                                }
-                                (Some(v), Literal::String(s)) => {
-                                    let entity_val = v.as_str().unwrap_or("");
-                                    match op {
-                                        ComparisonOp::Eq => entity_val == s,
-                                        ComparisonOp::Neq => entity_val != s,
-                                        ComparisonOp::Like => {
-                                            entity_val.contains(s.trim_matches('%'))
-                                        }
-                                        _ => true,
-                                    }
-                                }
-                                (Some(v), Literal::Boolean(b)) => {
-                                    let entity_val = v.as_bool().unwrap_or(false);
-                                    match op {
-                                        ComparisonOp::Eq => entity_val == *b,
-                                        ComparisonOp::Neq => entity_val != *b,
-                                        _ => true,
-                                    }
-                                }
-                                _ => true,
-                            }
-                        }
-                        Condition::Near {
-                            lat,
-                            lon,
-                            radius_km,
-                            ..
-                        } => {
-                            if let Some(ref geo) = e.geometry {
-                                haversine_km(geo.lat, geo.lon, *lat, *lon) <= *radius_km
-                            } else {
-                                false
-                            }
-                        }
-                        Condition::Within {
-                            min_lat,
-                            min_lon,
-                            max_lat,
-                            max_lon,
-                            ..
-                        } => {
-                            if let Some(ref geo) = e.geometry {
-                                geo.lat >= *min_lat
-                                    && geo.lat <= *max_lat
-                                    && geo.lon >= *min_lon
-                                    && geo.lon <= *max_lon
-                            } else {
-                                false
-                            }
-                        }
-                        Condition::And(a, b) => {
-                            // Recursively check both conditions
-                            let check = |cond: &Condition| -> bool {
-                                match cond {
-                                    Condition::Comparison { .. }
-                                    | Condition::Near { .. }
-                                    | Condition::Within { .. } => true,
-                                    _ => true,
-                                }
-                            };
-                            check(a) && check(b)
-                        }
-                        Condition::Or(_, _) => true,
-                    })
+                    wc.conditions.iter().all(|c| eval_condition(c, e, variable))
                 } else {
                     true
                 }
@@ -591,6 +491,97 @@ impl QueryExecutor {
         }
 
         agg_row
+    }
+}
+
+/// Recursively evaluate a single condition against an entity.
+fn eval_condition(cond: &Condition, e: &orp_proto::Entity, variable: &str) -> bool {
+    match cond {
+        Condition::Comparison { left, op, right } => {
+            let prop_name = left
+                .strip_prefix(&format!("{}.", variable))
+                .unwrap_or(left);
+
+            let val = e.properties.get(prop_name);
+
+            // Check built-in properties
+            let builtin_val = match prop_name {
+                "id" | "entity_id" => Some(JsonValue::String(e.entity_id.clone())),
+                "name" => e.name.as_ref().map(|n| JsonValue::String(n.clone())),
+                "type" | "entity_type" => Some(JsonValue::String(e.entity_type.clone())),
+                "confidence" => Some(serde_json::json!(e.confidence)),
+                _ => None,
+            };
+
+            let actual = val.or(builtin_val.as_ref());
+
+            match (actual, right) {
+                (Some(v), Literal::Number(n)) => {
+                    let entity_val = v.as_f64().unwrap_or(0.0);
+                    match op {
+                        ComparisonOp::Gt => entity_val > *n,
+                        ComparisonOp::Lt => entity_val < *n,
+                        ComparisonOp::Gte => entity_val >= *n,
+                        ComparisonOp::Lte => entity_val <= *n,
+                        ComparisonOp::Eq => (entity_val - n).abs() < f64::EPSILON,
+                        ComparisonOp::Neq => (entity_val - n).abs() >= f64::EPSILON,
+                        _ => true,
+                    }
+                }
+                (Some(v), Literal::String(s)) => {
+                    let entity_val = v.as_str().unwrap_or("");
+                    match op {
+                        ComparisonOp::Eq => entity_val == s,
+                        ComparisonOp::Neq => entity_val != s,
+                        ComparisonOp::Like => entity_val.contains(s.trim_matches('%')),
+                        _ => true,
+                    }
+                }
+                (Some(v), Literal::Boolean(b)) => {
+                    let entity_val = v.as_bool().unwrap_or(false);
+                    match op {
+                        ComparisonOp::Eq => entity_val == *b,
+                        ComparisonOp::Neq => entity_val != *b,
+                        _ => true,
+                    }
+                }
+                _ => true,
+            }
+        }
+        Condition::Near {
+            lat,
+            lon,
+            radius_km,
+            ..
+        } => {
+            if let Some(ref geo) = e.geometry {
+                haversine_km(geo.lat, geo.lon, *lat, *lon) <= *radius_km
+            } else {
+                false
+            }
+        }
+        Condition::Within {
+            min_lat,
+            min_lon,
+            max_lat,
+            max_lon,
+            ..
+        } => {
+            if let Some(ref geo) = e.geometry {
+                geo.lat >= *min_lat
+                    && geo.lat <= *max_lat
+                    && geo.lon >= *min_lon
+                    && geo.lon <= *max_lon
+            } else {
+                false
+            }
+        }
+        Condition::And(a, b) => {
+            eval_condition(a, e, variable) && eval_condition(b, e, variable)
+        }
+        Condition::Or(a, b) => {
+            eval_condition(a, e, variable) || eval_condition(b, e, variable)
+        }
     }
 }
 

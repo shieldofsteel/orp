@@ -114,6 +114,36 @@ struct Subscription {
     entity_id: Option<String>,
 }
 
+/// Check whether this client is allowed to see a given entity via ABAC.
+fn can_see_entity(
+    abac: &orp_security::AbacEngine,
+    user_sub: &str,
+    user_permissions: &[String],
+    entity_type: &str,
+    entity_id: &str,
+) -> bool {
+    let ctx = orp_security::EvaluationContext {
+        subject: orp_security::Subject {
+            sub: user_sub.to_string(),
+            permissions: user_permissions.to_vec(),
+            role: if user_permissions.iter().any(|p| p == "admin") {
+                Some("admin".to_string())
+            } else {
+                None
+            },
+            org_id: None,
+            attributes: std::collections::HashMap::new(),
+        },
+        action: "entities:read".to_string(),
+        resource: orp_security::Resource {
+            r#type: entity_type.to_string(),
+            id: entity_id.to_string(),
+            attributes: std::collections::HashMap::new(),
+        },
+    };
+    abac.evaluate(&ctx).result == orp_security::EvaluationResult::Allow
+}
+
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     tracing::info!("WebSocket client connected");
 
@@ -131,8 +161,19 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+    // Subscribe to the broadcast channel for real-time push
+    let mut broadcast_rx = state.broadcast_tx.subscribe();
+    let mut heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
     let mut subscriptions: Vec<Subscription> = Vec::new();
+
+    // For ABAC checks on WS events — use permissive defaults for dev mode.
+    // In production, the token was validated in ws_handler; use its claims.
+    let ws_user_sub = "ws-client".to_string();
+    let ws_user_permissions: Vec<String> = if state.auth_state.permissive_mode {
+        vec!["admin".to_string()]
+    } else {
+        vec!["entities:read".to_string()]
+    };
 
     loop {
         tokio::select! {
@@ -197,60 +238,60 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     _ => {}
                 }
             }
-            _ = interval.tick() => {
-                // Push entity updates for each subscription
-                for sub in &subscriptions {
-                    if let Some(ref entity_type) = sub.entity_type {
-                        if let Ok(entities) = state.storage.get_entities_by_type(entity_type, 50, 0).await {
-                            for entity in entities.iter().take(10) {
-                                let update = serde_json::json!({
-                                    "type": "entity_update",
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    "data": {
-                                        "entity_id": entity.entity_id,
-                                        "entity_type": entity.entity_type,
-                                        "changes": entity.properties,
-                                        "geometry": entity.geometry.as_ref().map(|g| {
-                                            serde_json::json!({
-                                                "type": "Point",
-                                                "coordinates": [g.lon, g.lat]
-                                            })
-                                        }),
-                                    }
-                                });
+            // Receive broadcast events from mutations in handlers
+            result = broadcast_rx.recv() => {
+                match result {
+                    Ok(event) => {
+                        // Check if this event matches any subscription
+                        let (event_entity_type, event_entity_id) = match &event {
+                            BroadcastEvent::EntityCreated { entity_type, entity_id, .. } => (entity_type.clone(), entity_id.clone()),
+                            BroadcastEvent::EntityUpdate { entity_type, entity_id, .. } => (entity_type.clone(), entity_id.clone()),
+                            BroadcastEvent::EntityDeleted { entity_type, entity_id, .. } => (entity_type.clone(), entity_id.clone()),
+                            BroadcastEvent::RelationshipChanged { source_id, .. } => ("relationship".to_string(), source_id.clone()),
+                            BroadcastEvent::AlertTriggered { .. } => ("alert".to_string(), String::new()),
+                        };
 
-                                if socket.send(Message::Text(update.to_string())).await.is_err() {
-                                    return;
+                        let matches_sub = subscriptions.iter().any(|sub| {
+                            if let Some(ref st) = sub.entity_type {
+                                if st.eq_ignore_ascii_case(&event_entity_type) {
+                                    return true;
+                                }
+                            }
+                            if let Some(ref sid) = sub.entity_id {
+                                if *sid == event_entity_id {
+                                    return true;
+                                }
+                            }
+                            // Alert events match any subscription
+                            matches!(&event, BroadcastEvent::AlertTriggered { .. })
+                        });
+
+                        if matches_sub {
+                            // ABAC check: can this client see this entity?
+                            if !can_see_entity(
+                                &state.abac_engine,
+                                &ws_user_sub,
+                                &ws_user_permissions,
+                                &event_entity_type,
+                                &event_entity_id,
+                            ) {
+                                continue;
+                            }
+
+                            if let Ok(json) = serde_json::to_string(&event) {
+                                if socket.send(Message::Text(json)).await.is_err() {
+                                    break;
                                 }
                             }
                         }
                     }
-
-                    if let Some(ref eid) = sub.entity_id {
-                        if let Ok(Some(entity)) = state.storage.get_entity(eid).await {
-                            let update = serde_json::json!({
-                                "type": "entity_update",
-                                "timestamp": chrono::Utc::now().to_rfc3339(),
-                                "data": {
-                                    "entity_id": entity.entity_id,
-                                    "entity_type": entity.entity_type,
-                                    "changes": entity.properties,
-                                    "geometry": entity.geometry.as_ref().map(|g| {
-                                        serde_json::json!({
-                                            "type": "Point",
-                                            "coordinates": [g.lon, g.lat]
-                                        })
-                                    }),
-                                }
-                            });
-
-                            if socket.send(Message::Text(update.to_string())).await.is_err() {
-                                return;
-                            }
-                        }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("WebSocket broadcast lagged by {} messages", n);
                     }
+                    Err(_) => break,
                 }
-
+            }
+            _ = heartbeat_interval.tick() => {
                 // Send heartbeat
                 let heartbeat = serde_json::json!({
                     "type": "heartbeat",

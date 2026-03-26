@@ -249,14 +249,21 @@ impl DuckDbStorage {
         let lon: Option<f64> = row.get::<_, Option<f64>>(7).unwrap_or(None);
         let alt: Option<f64> = row.get::<_, Option<f64>>(8).unwrap_or(None);
         let props_str: String = row.get::<_, String>(9).unwrap_or_default();
-        let ts_str: String = row.get::<_, String>(10).unwrap_or_default();
+        let updated_ts_str: String = row.get::<_, String>(10).unwrap_or_default();
         let is_active: bool = row.get::<_, bool>(11).unwrap_or(true);
+        let created_ts_str: String = row.get::<_, String>(12).unwrap_or_default();
 
         let properties: HashMap<String, JsonValue> =
             serde_json::from_str(&props_str).unwrap_or_default();
         let geometry = match (lat, lon) {
             (Some(la), Some(lo)) => Some(GeoPoint { lat: la, lon: lo, alt }),
             _ => None,
+        };
+        let last_updated = Self::parse_ts(&updated_ts_str);
+        let created_at = if created_ts_str.is_empty() {
+            last_updated
+        } else {
+            Self::parse_ts(&created_ts_str)
         };
 
         Ok(Entity {
@@ -266,7 +273,8 @@ impl DuckDbStorage {
             name: row.get::<_, Option<String>>(3).ok().flatten(),
             confidence: row.get::<_, f32>(4).unwrap_or(1.0) as f64,
             is_active,
-            last_updated: Self::parse_ts(&ts_str),
+            created_at,
+            last_updated,
             geometry,
             properties,
         })
@@ -453,7 +461,8 @@ impl Storage for DuckDbStorage {
                           '{}'
                         ) AS properties,
                         CAST(e.last_updated AS VARCHAR),
-                        e.is_active
+                        e.is_active,
+                        CAST(e.first_seen AS VARCHAR)
                  FROM entities e
                  LEFT JOIN entity_geometry g ON g.entity_id = e.entity_id
                  WHERE e.entity_id = ?",
@@ -494,7 +503,8 @@ impl Storage for DuckDbStorage {
                           '{}'
                         ),
                         CAST(e.last_updated AS VARCHAR),
-                        e.is_active
+                        e.is_active,
+                        CAST(e.first_seen AS VARCHAR)
                  FROM entities e
                  LEFT JOIN entity_geometry g ON g.entity_id = e.entity_id
                  WHERE e.entity_type = ? AND e.is_active = TRUE
@@ -624,7 +634,8 @@ impl Storage for DuckDbStorage {
                           '{}'
                         ),
                         CAST(e.last_updated AS VARCHAR),
-                        e.is_active
+                        e.is_active,
+                        CAST(e.first_seen AS VARCHAR)
                  FROM entities e
                  JOIN entity_geometry g ON g.entity_id = e.entity_id
                  WHERE e.is_active = TRUE AND e.entity_type = ?
@@ -643,7 +654,8 @@ impl Storage for DuckDbStorage {
                           '{}'
                         ),
                         CAST(e.last_updated AS VARCHAR),
-                        e.is_active
+                        e.is_active,
+                        CAST(e.first_seen AS VARCHAR)
                  FROM entities e
                  JOIN entity_geometry g ON g.entity_id = e.entity_id
                  WHERE e.is_active = TRUE
@@ -737,7 +749,8 @@ impl Storage for DuckDbStorage {
                           '{}'
                         ),
                         CAST(e.last_updated AS VARCHAR),
-                        e.is_active
+                        e.is_active,
+                        CAST(e.first_seen AS VARCHAR)
                  FROM entities e
                  JOIN entity_geometry g ON g.entity_id = e.entity_id
                  WHERE e.is_active = TRUE AND e.entity_type = ?",
@@ -754,7 +767,8 @@ impl Storage for DuckDbStorage {
                           '{}'
                         ),
                         CAST(e.last_updated AS VARCHAR),
-                        e.is_active
+                        e.is_active,
+                        CAST(e.first_seen AS VARCHAR)
                  FROM entities e
                  JOIN entity_geometry g ON g.entity_id = e.entity_id
                  WHERE e.is_active = TRUE",
@@ -1105,10 +1119,106 @@ impl Storage for DuckDbStorage {
 
     async fn graph_query(
         &self,
-        _query_str: &str,
+        query_str: &str,
     ) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
-        // Passthrough to Kuzu in production; stub here.
-        Ok(vec![])
+        // Parse a simplified graph query format:
+        //   source_type->rel_type->target_type  (e.g. Ship->HEADING_TO->Port)
+        //   or source_id->*->target_type (traverse from specific entity)
+        //   or a raw relationship traversal query
+        //
+        // For general use, perform a recursive CTE over the relationships table
+        // returning connected entities up to 3 hops.
+        let conn = self.conn.lock().unwrap();
+
+        // Try to parse as "entity_id:max_hops" for generic graph exploration
+        let parts: Vec<&str> = query_str.splitn(2, ':').collect();
+        let (start_id, max_hops) = if parts.len() == 2 {
+            let hops: usize = parts[1].parse().unwrap_or(3);
+            (parts[0], hops)
+        } else {
+            (query_str.trim(), 3usize)
+        };
+
+        let sql = r#"
+            WITH RECURSIVE graph_walk AS (
+              -- Base: start from the given entity
+              SELECT
+                r.relationship_id,
+                r.source_entity_id,
+                r.target_entity_id,
+                r.relationship_type,
+                r.properties,
+                r.confidence,
+                1 AS depth,
+                [r.relationship_id] AS visited
+              FROM relationships r
+              WHERE r.is_active = TRUE
+                AND (r.source_entity_id = ? OR r.target_entity_id = ?)
+
+              UNION ALL
+
+              SELECT
+                r2.relationship_id,
+                r2.source_entity_id,
+                r2.target_entity_id,
+                r2.relationship_type,
+                r2.properties,
+                r2.confidence,
+                gw.depth + 1,
+                list_append(gw.visited, r2.relationship_id)
+              FROM relationships r2
+              JOIN graph_walk gw
+                ON (r2.source_entity_id = gw.target_entity_id
+                    OR r2.target_entity_id = gw.source_entity_id)
+              WHERE r2.is_active = TRUE
+                AND gw.depth < ?
+                AND NOT list_contains(gw.visited, r2.relationship_id)
+            )
+            SELECT DISTINCT
+              gw.source_entity_id,
+              gw.target_entity_id,
+              gw.relationship_type,
+              gw.properties,
+              gw.confidence,
+              gw.depth
+            FROM graph_walk gw
+            ORDER BY gw.depth
+            LIMIT 1000
+        "#;
+
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        let mut rows = stmt
+            .query(params![start_id, start_id, max_hops as i64])
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
+            let source: String = row.get(0).unwrap_or_default();
+            let target: String = row.get(1).unwrap_or_default();
+            let rel_type: String = row.get(2).unwrap_or_default();
+            let props_str: String = row.get::<_, String>(3).unwrap_or_default();
+            let confidence: f32 = row.get::<_, f32>(4).unwrap_or(1.0);
+            let depth: i32 = row.get::<_, i32>(5).unwrap_or(0);
+
+            let properties: JsonValue =
+                serde_json::from_str(&props_str).unwrap_or(JsonValue::Null);
+
+            let mut result_row = HashMap::new();
+            result_row.insert("source_entity_id".to_string(), JsonValue::String(source));
+            result_row.insert("target_entity_id".to_string(), JsonValue::String(target));
+            result_row.insert("relationship_type".to_string(), JsonValue::String(rel_type));
+            result_row.insert("properties".to_string(), properties);
+            result_row.insert("confidence".to_string(), serde_json::json!(confidence));
+            result_row.insert("depth".to_string(), serde_json::json!(depth));
+            results.push(result_row);
+        }
+
+        Ok(results)
     }
 
     /// BFS path search up to `max_hops` using a recursive CTE over the relationships table.
@@ -1550,7 +1660,8 @@ impl Storage for DuckDbStorage {
                           '{}'
                         ),
                         CAST(e.last_updated AS VARCHAR),
-                        e.is_active
+                        e.is_active,
+                        CAST(e.first_seen AS VARCHAR)
                  FROM entities e
                  LEFT JOIN entity_geometry g ON g.entity_id = e.entity_id
                  WHERE e.is_active = TRUE AND e.entity_type = ?
@@ -1569,7 +1680,8 @@ impl Storage for DuckDbStorage {
                           '{}'
                         ),
                         CAST(e.last_updated AS VARCHAR),
-                        e.is_active
+                        e.is_active,
+                        CAST(e.first_seen AS VARCHAR)
                  FROM entities e
                  LEFT JOIN entity_geometry g ON g.entity_id = e.entity_id
                  WHERE e.is_active = TRUE
