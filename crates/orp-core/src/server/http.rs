@@ -157,6 +157,12 @@ async fn rate_limit_middleware(
         })
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Exempt ingest endpoints from rate limiting (they need high throughput)
+    let path = request.uri().path();
+    if path.starts_with("/api/v1/ingest") {
+        return next.run(request).await;
+    }
+
     match limiter.check(&ip).await {
         Ok(()) => next.run(request).await,
         Err(retry_after) => {

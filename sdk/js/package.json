@@ -1,0 +1,40 @@
+{
+  "name": "@orp/client",
+  "version": "0.1.0",
+  "description": "Official JavaScript/TypeScript SDK for ORP (Open Relationship Protocol)",
+  "main": "dist/index.js",
+  "module": "dist/index.esm.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc && tsc -p tsconfig.esm.json",
+    "build:cjs": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "orp",
+    "open-relationship-protocol",
+    "knowledge-graph",
+    "entities",
+    "relationships",
+    "federation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shieldofsteel/orp.git",
+    "directory": "sdk/js"
+  }
+}
