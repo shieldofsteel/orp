@@ -690,7 +690,7 @@ mod tests {
     fn test_opc_value_as_f64() {
         assert_eq!(OpcValue::Double(23.5).as_f64(), Some(23.5));
         assert_eq!(OpcValue::Int32(42).as_f64(), Some(42.0));
-        assert_eq!(OpcValue::Float(3.14).as_f64(), Some(3.140000104904175));
+        assert_eq!(OpcValue::Float(3.25).as_f64(), Some(3.25));
         assert_eq!(OpcValue::Boolean(true).as_f64(), None);
         assert_eq!(OpcValue::Null.as_f64(), None);
     }

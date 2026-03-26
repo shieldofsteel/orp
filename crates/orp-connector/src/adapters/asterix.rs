@@ -1075,8 +1075,7 @@ mod tests {
             | (33u64 << 24)
             | (34u64 << 18)
             | (35u64 << 12)
-            | (36u64 << 6)
-            | 0;
+            | (36u64 << 6);
         let bytes = encoded.to_be_bytes();
         let result = decode_icao_6bit(&bytes[2..8]);
         assert_eq!(result, "KLM1234");
@@ -1136,12 +1135,10 @@ mod tests {
     #[test]
     fn test_cat048_with_icao_and_callsign() {
         // Build a record with FSPEC that includes FRN 1, 8 (ICAO), 9 (callsign)
-        let mut record_data: Vec<u8> = Vec::new();
         // FRN 1 = bit7, FRN 8 = bit7 of second byte, FRN 9 = bit6 of second byte
         // First byte: FRN 1 present, FX=1 → 10000001 = 0x81
         // Second byte: FRN 8,9 present, FX=0 → 11000000 = 0xC0
-        record_data.push(0x81);
-        record_data.push(0xC0);
+        let mut record_data: Vec<u8> = vec![0x81, 0xC0];
 
         // FRN 1: SAC=1, SIC=2
         record_data.push(0x01);
@@ -1185,8 +1182,8 @@ mod tests {
             serde_json::json!("hello")
         );
         assert_eq!(
-            AsterixFieldValue::F64(3.14).to_json(),
-            serde_json::json!(3.14)
+            AsterixFieldValue::F64(3.125).to_json(),
+            serde_json::json!(3.125)
         );
         assert_eq!(
             AsterixFieldValue::Bytes(vec![0xAB, 0xCD]).to_json(),

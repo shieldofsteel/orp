@@ -8,6 +8,7 @@ pub mod csv_watcher;
 pub mod database;
 pub mod generic_api;
 pub mod http_poller;
+pub mod modbus;
 pub mod mqtt;
 pub mod opcua;
 pub mod stix;
