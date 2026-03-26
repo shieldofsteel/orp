@@ -1,0 +1,3045 @@
+openapi: 3.1.0
+
+info:
+  title: ORP API
+  version: 1.0.0
+  description: |
+    REST API for the ORP (Object Relationship Platform) Data Fusion engine.
+    Provides entity CRUD, ORP-QL queries, graph traversal, real-time monitoring,
+    connector management, and alert rules for maritime and multi-domain operations.
+
+    ## Authentication
+    All endpoints require either a Bearer JWT (OIDC) or an API key (`X-API-Key` header).
+
+    ## Pagination
+    All list endpoints support `page`, `limit` (max 1000), `sort_by`, and `sort_order` query parameters.
+
+    ## Rate Limiting
+    Default: 1000 req/sec per client API key. Exceeding the limit returns `429 Too Many Requests`.
+  contact:
+    name: ORP Team
+    url: https://github.com/orproject/orp
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:9090/api/v1
+    description: Local development
+  - url: https://orp.example.com/api/v1
+    description: Production
+
+security:
+  - BearerAuth: []
+  - ApiKeyAuth: []
+
+tags:
+  - name: entities
+    description: Entity CRUD and search operations
+  - name: events
+    description: Entity change event log
+  - name: relationships
+    description: Graph relationship queries
+  - name: query
+    description: ORP-QL and natural language query execution
+  - name: graph
+    description: Cypher graph traversal (Kuzu)
+  - name: connectors
+    description: Data source connector management
+  - name: monitors
+    description: Alert rule management
+  - name: alerts
+    description: Alert feed and acknowledgement
+  - name: api-keys
+    description: API key lifecycle management
+  - name: system
+    description: Health and metrics endpoints
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PATHS
+# ──────────────────────────────────────────────────────────────────────────────
+
+paths:
+
+  # ── ENTITIES ────────────────────────────────────────────────────────────────
+
+  /entities:
+    get:
+      operationId: listEntities
+      summary: List all entities
+      description: |
+        Returns a paginated list of all entities with optional filtering by type, tags,
+        and creation/update timestamps.
+      tags: [entities]
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/SortByParam'
+        - $ref: '#/components/parameters/SortOrderParam'
+        - name: type
+          in: query
+          description: Filter by entity type (e.g. Ship, Port, WeatherSystem)
+          schema:
+            type: string
+          example: Ship
+        - name: tags
+          in: query
+          description: Filter by tags (OR logic). Repeat param for multiple tags.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+          example: [container, active]
+        - name: created_after
+          in: query
+          description: Return entities created after this ISO 8601 timestamp
+          schema:
+            type: string
+            format: date-time
+        - name: created_before
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: updated_after
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Paginated entity list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityListResponse'
+              examples:
+                ships:
+                  summary: List of ships
+                  value:
+                    data:
+                      - id: ship-imo-1234567
+                        type: Ship
+                        name: Maersk Seatrade
+                        tags: [container, international, active]
+                        properties:
+                          imo: "1234567"
+                          mmsi: "219018200"
+                          call_sign: OMCN
+                          type: Container ship
+                          length: 366.0
+                          beam: 48.8
+                          speed: 18.5
+                          course: 225.0
+                          destination: Rotterdam
+                        geometry:
+                          type: Point
+                          coordinates: [3.2847, 51.9225]
+                        confidence: 0.99
+                        freshness:
+                          updated_at: '2026-03-26T10:28:45Z'
+                          checked_at: '2026-03-26T10:30:00Z'
+                        created_at: '2026-03-20T14:00:00Z'
+                        updated_at: '2026-03-26T10:28:45Z'
+                    pagination:
+                      page: 1
+                      limit: 10
+                      total_count: 2847
+                      total_pages: 285
+                      has_next: true
+                      has_prev: false
+                empty:
+                  summary: Empty result set
+                  value:
+                    data: []
+                    pagination:
+                      page: 1
+                      limit: 100
+                      total_count: 0
+                      total_pages: 0
+                      has_next: false
+                      has_prev: false
+                ports:
+                  summary: List of ports
+                  value:
+                    data:
+                      - id: port-rdam-01
+                        type: Port
+                        name: Port of Rotterdam
+                        tags: [major, european, container]
+                        properties:
+                          country: Netherlands
+                          iata_code: NLRTM
+                          total_teu: 14000000
+                          congestion: 0.65
+                        geometry:
+                          type: Point
+                          coordinates: [4.2706, 51.9289]
+                        confidence: 1.0
+                        freshness:
+                          updated_at: '2026-03-26T08:00:00Z'
+                          checked_at: '2026-03-26T10:00:00Z'
+                        created_at: '2026-01-01T00:00:00Z'
+                        updated_at: '2026-03-26T08:00:00Z'
+                    pagination:
+                      page: 1
+                      limit: 100
+                      total_count: 512
+                      total_pages: 6
+                      has_next: true
+                      has_prev: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      operationId: createEntity
+      summary: Create or upsert an entity
+      description: |
+        Ingest a new entity. If an entity with the same `id` already exists, its
+        properties are merged (upsert behaviour).
+      tags: [entities]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEntityRequest'
+            examples:
+              ship:
+                summary: Create a ship entity
+                value:
+                  id: ship-imo-1234567
+                  type: Ship
+                  name: Maersk Seatrade
+                  tags: [container, international]
+                  properties:
+                    imo: "1234567"
+                    mmsi: "219018200"
+                    call_sign: OMCN
+                    type: Container ship
+                    speed: 18.5
+                    course: 225.0
+                    destination: Rotterdam
+                  geometry:
+                    type: Point
+                    coordinates: [3.2847, 51.9225]
+                  confidence: 0.99
+                  source: ais-feed-1
+              port:
+                summary: Create a port entity
+                value:
+                  id: port-rdam-01
+                  type: Port
+                  name: Port of Rotterdam
+                  tags: [major, european, container]
+                  properties:
+                    country: Netherlands
+                    iata_code: NLRTM
+                    total_teu: 14000000
+                    congestion: 0.65
+                    container_terminals: 10
+                  geometry:
+                    type: Point
+                    coordinates: [4.2706, 51.9289]
+                  confidence: 1.0
+                  source: openport-database
+              weather:
+                summary: Create a weather system entity
+                value:
+                  id: weather-storm-1
+                  type: WeatherSystem
+                  name: Storm Cell Alpha
+                  tags: [storm, active]
+                  properties:
+                    severity: high
+                    wind_speed_knots: 45
+                    radius_km: 250
+                  geometry:
+                    type: Point
+                    coordinates: [2.5, 51.0]
+                  confidence: 0.87
+                  source: weather-service
+      responses:
+        '201':
+          description: Entity created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Entity'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /entities/search:
+    get:
+      operationId: searchEntities
+      summary: Advanced entity search
+      description: |
+        Multi-criterion search with geospatial predicates, full-text search,
+        property filters, and bounding-box / radius queries.
+      tags: [entities]
+      parameters:
+        - name: type
+          in: query
+          schema:
+            type: string
+          example: Ship
+        - name: near
+          in: query
+          description: "Geospatial point radius filter. Format: lat,lon,radius_km"
+          schema:
+            type: string
+          example: "51.9225,4.2706,50"
+        - name: min_lat
+          in: query
+          schema:
+            type: number
+            format: double
+        - name: min_lon
+          in: query
+          schema:
+            type: number
+            format: double
+        - name: max_lat
+          in: query
+          schema:
+            type: number
+            format: double
+        - name: max_lon
+          in: query
+          schema:
+            type: number
+            format: double
+        - name: text_search
+          in: query
+          description: Full-text search on name and properties
+          schema:
+            type: string
+          example: Maersk
+        - name: tags
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: created_after
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: created_before
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: updated_after
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/SortByParam'
+        - $ref: '#/components/parameters/SortOrderParam'
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EntityListResponse'
+                  - type: object
+                    properties:
+                      search_time_ms:
+                        type: integer
+                        description: Search execution time in milliseconds
+              examples:
+                nearRotterdam:
+                  summary: Ships within 50km of Rotterdam
+                  value:
+                    data:
+                      - id: ship-imo-1234567
+                        type: Ship
+                        name: Maersk Seatrade
+                        tags: [container]
+                        properties:
+                          speed: 18.5
+                          course: 225.0
+                        geometry:
+                          type: Point
+                          coordinates: [3.2847, 51.9225]
+                        confidence: 0.99
+                        freshness:
+                          updated_at: '2026-03-26T10:28:45Z'
+                          checked_at: '2026-03-26T10:30:00Z'
+                        created_at: '2026-03-20T14:00:00Z'
+                        updated_at: '2026-03-26T10:28:45Z'
+                    pagination:
+                      page: 1
+                      limit: 100
+                      total_count: 23
+                      total_pages: 1
+                      has_next: false
+                      has_prev: false
+                    search_time_ms: 12
+                textSearch:
+                  summary: Full-text search results
+                  value:
+                    data:
+                      - id: ship-imo-1234567
+                        type: Ship
+                        name: Maersk Seatrade
+                        tags: [container]
+                        properties: {}
+                        confidence: 0.99
+                        freshness:
+                          updated_at: '2026-03-26T10:28:45Z'
+                          checked_at: '2026-03-26T10:30:00Z'
+                        created_at: '2026-03-20T14:00:00Z'
+                        updated_at: '2026-03-26T10:28:45Z'
+                    pagination:
+                      page: 1
+                      limit: 100
+                      total_count: 5
+                      total_pages: 1
+                      has_next: false
+                      has_prev: false
+                    search_time_ms: 8
+                noResults:
+                  summary: Search with no matches
+                  value:
+                    data: []
+                    pagination:
+                      page: 1
+                      limit: 100
+                      total_count: 0
+                      total_pages: 0
+                      has_next: false
+                      has_prev: false
+                    search_time_ms: 3
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /entities/{id}:
+    parameters:
+      - $ref: '#/components/parameters/EntityIdParam'
+
+    get:
+      operationId: getEntity
+      summary: Get a single entity
+      description: |
+        Returns the complete entity record including all properties, geometry,
+        relationships (both directions), and change history.
+      tags: [entities]
+      responses:
+        '200':
+          description: Entity with full details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityDetail'
+              examples:
+                ship:
+                  summary: Ship with relationships
+                  value:
+                    id: ship-imo-1234567
+                    type: Ship
+                    name: Maersk Seatrade
+                    tags: [container, international, active]
+                    properties:
+                      imo: "1234567"
+                      mmsi: "219018200"
+                      speed: 18.5
+                      course: 225.0
+                      destination: Rotterdam
+                    geometry:
+                      type: Point
+                      coordinates: [3.2847, 51.9225]
+                    confidence: 0.99
+                    freshness:
+                      updated_at: '2026-03-26T10:28:45Z'
+                      checked_at: '2026-03-26T10:30:00Z'
+                    created_at: '2026-03-20T14:00:00Z'
+                    updated_at: '2026-03-26T10:28:45Z'
+                    relationships:
+                      outgoing:
+                        - relationship_type: HEADING_TO
+                          target_id: port-rdam-01
+                          target_type: Port
+                          target_name: Port of Rotterdam
+                          properties:
+                            eta: '2026-03-28T14:00:00Z'
+                            cargo: containers
+                        - relationship_type: OPERATED_BY
+                          target_id: org-maersk
+                          target_type: Organization
+                          target_name: A.P. Moller - Maersk
+                      incoming:
+                        - relationship_type: THREATENS
+                          source_id: weather-storm-1
+                          source_type: WeatherSystem
+                          source_name: Storm Cell Alpha
+                          properties:
+                            distance_km: 180
+                            severity: high
+                    history:
+                      - timestamp: '2026-03-26T10:28:45Z'
+                        changed_properties:
+                          speed: 18.5
+                          course: 225.0
+                        source: ais-feed-1
+                notFound:
+                  summary: Entity not found response
+                  value:
+                    error:
+                      code: NOT_FOUND
+                      status: 404
+                      message: Entity not found
+                      details:
+                        id: ship-unknown-999
+                        type: Entity
+                      timestamp: '2026-03-26T10:30:45Z'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    put:
+      operationId: updateEntity
+      summary: Update (merge) entity properties
+      description: |
+        Merges the supplied fields into the existing entity. Properties not included
+        in the request body are left unchanged (partial update / merge semantics).
+      tags: [entities]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateEntityRequest'
+            examples:
+              updatePosition:
+                summary: Update ship position and speed
+                value:
+                  properties:
+                    speed: 19.2
+                    course: 230.0
+                    destination: Antwerp
+                  geometry:
+                    type: Point
+                    coordinates: [3.5, 51.95]
+              updateTags:
+                summary: Replace tags
+                value:
+                  tags: [container, diverted]
+              updateConfidence:
+                summary: Update confidence score
+                value:
+                  confidence: 0.75
+      responses:
+        '200':
+          description: Updated entity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Entity'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      operationId: deleteEntity
+      summary: Delete entity
+      description: |
+        Soft-deletes the entity. The record is marked as deleted and excluded from
+        normal queries, but history is preserved for auditing.
+      tags: [entities]
+      responses:
+        '204':
+          description: Entity deleted successfully (no response body)
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /entities/{id}/relationships:
+    parameters:
+      - $ref: '#/components/parameters/EntityIdParam'
+
+    get:
+      operationId: getEntityRelationships
+      summary: Get entity relationships
+      description: |
+        Returns all incoming and outgoing relationships for an entity, along with
+        aggregate statistics.
+      tags: [relationships]
+      responses:
+        '200':
+          description: Relationship graph for the entity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RelationshipsResponse'
+              examples:
+                shipRelationships:
+                  summary: Ship relationships
+                  value:
+                    entity_id: ship-imo-1234567
+                    entity_type: Ship
+                    outgoing:
+                      - id: rel-001
+                        type: HEADING_TO
+                        target_id: port-rdam-01
+                        target_type: Port
+                        target_name: Port of Rotterdam
+                        properties:
+                          eta: '2026-03-28T14:00:00Z'
+                          cargo: containers
+                        strength: 0.97
+                        created_at: '2026-03-26T08:00:00Z'
+                        updated_at: '2026-03-26T10:00:00Z'
+                    incoming:
+                      - id: rel-002
+                        type: THREATENS
+                        source_id: weather-storm-1
+                        source_type: WeatherSystem
+                        source_name: Storm Cell Alpha
+                        properties:
+                          distance_km: 180
+                          severity: high
+                        strength: 0.88
+                        created_at: '2026-03-26T06:00:00Z'
+                        updated_at: '2026-03-26T10:00:00Z'
+                    statistics:
+                      total_outgoing: 2
+                      total_incoming: 1
+                emptyRelationships:
+                  summary: Entity with no relationships
+                  value:
+                    entity_id: port-new-01
+                    entity_type: Port
+                    outgoing: []
+                    incoming: []
+                    statistics:
+                      total_outgoing: 0
+                      total_incoming: 0
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /entities/{id}/events:
+    parameters:
+      - $ref: '#/components/parameters/EntityIdParam'
+
+    get:
+      operationId: getEntityEvents
+      summary: Get events for a specific entity
+      description: Returns the change event history for a single entity.
+      tags: [events]
+      parameters:
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+          example: '2026-03-26T00:00:00Z'
+        - name: until
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: event_type
+          in: query
+          schema:
+            type: string
+            enum: [property_change, relationship_created, relationship_deleted, entity_deleted, entity_created]
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Entity event history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventsResponse'
+              examples:
+                propertyChanges:
+                  summary: Ship speed/course updates
+                  value:
+                    data:
+                      - id: evt_1001
+                        timestamp: '2026-03-26T10:28:45Z'
+                        entity_id: ship-imo-1234567
+                        entity_type: Ship
+                        entity_name: Maersk Seatrade
+                        event_type: property_change
+                        changes:
+                          before:
+                            speed: 18.2
+                            course: 220.0
+                          after:
+                            speed: 18.5
+                            course: 225.0
+                        source: ais-feed-1
+                    pagination:
+                      page: 1
+                      limit: 100
+                      total_count: 1
+                      total_pages: 1
+                      has_next: false
+                      has_prev: false
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── EVENTS (global) ─────────────────────────────────────────────────────────
+
+  /events:
+    get:
+      operationId: listEvents
+      summary: List global entity change events
+      description: |
+        Query the global event log across all entities. Useful for building audit
+        trails, replay, and change stream consumers.
+      tags: [events]
+      parameters:
+        - name: entity_id
+          in: query
+          schema:
+            type: string
+        - name: entity_type
+          in: query
+          schema:
+            type: string
+        - name: event_type
+          in: query
+          schema:
+            type: string
+            enum: [property_change, relationship_created, relationship_deleted, entity_deleted, entity_created]
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: until
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: source
+          in: query
+          description: Filter by data source identifier
+          schema:
+            type: string
+          example: ais-feed-1
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Event list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventsResponse'
+              examples:
+                recentEvents:
+                  summary: Recent events across all entities
+                  value:
+                    data:
+                      - id: evt_1001
+                        timestamp: '2026-03-26T10:28:45Z'
+                        entity_id: ship-imo-1234567
+                        entity_type: Ship
+                        entity_name: Maersk Seatrade
+                        event_type: property_change
+                        changes:
+                          before:
+                            speed: 18.2
+                          after:
+                            speed: 18.5
+                        source: ais-feed-1
+                      - id: evt_1002
+                        timestamp: '2026-03-26T10:30:00Z'
+                        entity_id: ship-imo-1234567
+                        entity_type: Ship
+                        entity_name: Maersk Seatrade
+                        event_type: relationship_created
+                        changes:
+                          after:
+                            relationship_type: NEAR
+                            target_id: weather-storm-1
+                            distance_km: 185
+                        source: system-monitor-1
+                    pagination:
+                      page: 1
+                      limit: 100
+                      total_count: 2
+                      total_pages: 1
+                      has_next: false
+                      has_prev: false
+                entityCreated:
+                  summary: Entity creation event
+                  value:
+                    data:
+                      - id: evt_2001
+                        timestamp: '2026-03-26T09:00:00Z'
+                        entity_id: port-antwerp-01
+                        entity_type: Port
+                        entity_name: Port of Antwerp
+                        event_type: entity_created
+                        changes:
+                          after:
+                            name: Port of Antwerp
+                            country: Belgium
+                        source: openport-database
+                    pagination:
+                      page: 1
+                      limit: 100
+                      total_count: 1
+                      total_pages: 1
+                      has_next: false
+                      has_prev: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── QUERY ───────────────────────────────────────────────────────────────────
+
+  /query:
+    post:
+      operationId: executeQuery
+      summary: Execute ORP-QL query
+      description: |
+        Execute a structured ORP-QL query against the entity database.
+        ORP-QL is a Cypher-inspired query language supporting MATCH, WHERE,
+        RETURN, LIMIT, geospatial functions (NEAR, DISTANCE), and graph traversal.
+      tags: [query]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+            examples:
+              fastShips:
+                summary: Ships moving faster than 15 knots
+                value:
+                  query: "MATCH (s:Ship) WHERE s.speed > 15 RETURN s.id, s.name, s.speed"
+                  timeout_ms: 5000
+                  limit: 100
+              geospatial:
+                summary: Ships within 50km of Rotterdam
+                value:
+                  query: "MATCH (s:Ship) WHERE NEAR(s, lat=51.9225, lon=4.2706, radius_km=50) RETURN s.id, s.name, DISTANCE(s, 51.9225, 4.2706) as dist_km"
+              graphTraversal:
+                summary: Ships heading to Rotterdam
+                value:
+                  query: "MATCH (s:Ship)-[r:HEADING_TO]->(p:Port {name: \"Rotterdam\"}) RETURN s.id, s.name, r.eta"
+      responses:
+        '200':
+          description: Query results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResponse'
+              examples:
+                success:
+                  summary: Successful ORP-QL result
+                  value:
+                    status: success
+                    results:
+                      - "s.id": ship-imo-1234567
+                        "s.name": Maersk Seatrade
+                        "s.speed": 18.5
+                      - "s.id": ship-imo-7654321
+                        "s.name": COSCO Shipping Universe
+                        "s.speed": 17.0
+                    metadata:
+                      execution_time_ms: 145
+                      rows_returned: 2
+                      rows_scanned: 2847
+                syntaxError:
+                  summary: ORP-QL syntax error
+                  value:
+                    error:
+                      code: INVALID_QUERY
+                      status: 400
+                      message: ORP-QL syntax error at position 15
+                      details:
+                        near: WHERE
+                        expected: [property filter, geospatial function]
+                        got: unknown_function
+                      timestamp: '2026-03-26T10:30:45Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /query/natural:
+    post:
+      operationId: executeNaturalQuery
+      summary: Natural language query (Phase 2)
+      description: |
+        Translates a natural language question into ORP-QL and executes it.
+        Returns the interpreted query along with results and confidence score.
+        Note: This endpoint is Phase 2 and may return `501 Not Implemented` in Phase 1.
+      tags: [query]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NaturalQueryRequest'
+            examples:
+              tankersNearRotterdam:
+                summary: Find tankers near Rotterdam
+                value:
+                  query: Which tankers are near Rotterdam?
+                  confidence_threshold: 0.8
+              fastShips:
+                summary: Fast ships query
+                value:
+                  query: Show me all ships moving faster than 20 knots
+              congestion:
+                summary: Port congestion query
+                value:
+                  query: List ports with high congestion
+      responses:
+        '200':
+          description: Natural language query result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NaturalQueryResponse'
+              examples:
+                success:
+                  summary: Successful translation and execution
+                  value:
+                    status: success
+                    natural_query: Which tankers are near Rotterdam?
+                    interpreted_query: "MATCH (s:Ship {type: \"tanker\"}) WHERE NEAR(s, lat=51.9225, lon=4.2706, radius_km=50) RETURN s.id, s.name, DISTANCE(s, 51.9225, 4.2706) as distance_km"
+                    confidence: 0.98
+                    interpretation_method: template
+                    results:
+                      - "s.id": ship-imo-1111111
+                        "s.name": Torm Hafnia
+                        distance_km: 22.5
+                    metadata:
+                      execution_time_ms: 156
+                      rows_returned: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── GRAPH ───────────────────────────────────────────────────────────────────
+
+  /graph:
+    post:
+      operationId: executeGraphQuery
+      summary: Execute Cypher graph query (Kuzu)
+      description: |
+        Execute property graph queries using Cypher syntax via the embedded Kuzu
+        graph engine. Supports multi-hop traversals up to 3 hops (Phase 1 limit).
+      tags: [graph]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphQueryRequest'
+            examples:
+              portsReachableByCompany:
+                summary: Ports reachable by Maersk ships
+                value:
+                  query: "MATCH (org:Organization {id: \"org-maersk\"})-[:OWNS]->(s:Ship)-[:HEADING_TO]->(p:Port) RETURN p.id, p.name, COUNT(*) as ships_heading_there"
+                  timeout_ms: 5000
+              shipsNearStorm:
+                summary: Ships threatened by active storm
+                value:
+                  query: "MATCH (w:WeatherSystem {severity: \"high\"})<-[:THREATENS]-(s:Ship) RETURN s.id, s.name, s.speed"
+              twoHopTraversal:
+                summary: Two-hop relationship traversal
+                value:
+                  query: "MATCH (s:Ship)-[:HEADING_TO]->(p:Port)<-[:DOCKED_AT]-(other:Ship) RETURN s.name, p.name, other.name LIMIT 50"
+      responses:
+        '200':
+          description: Graph query results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphQueryResponse'
+              examples:
+                ports:
+                  summary: Ports reachable by Maersk
+                  value:
+                    status: success
+                    results:
+                      - "p.id": port-rdam-01
+                        "p.name": Port of Rotterdam
+                        ships_heading_there: 12
+                      - "p.id": port-antwerp
+                        "p.name": Port of Antwerp
+                        ships_heading_there: 8
+                    metadata:
+                      execution_time_ms: 234
+                      rows_returned: 2
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── CONNECTORS ──────────────────────────────────────────────────────────────
+
+  /connectors:
+    get:
+      operationId: listConnectors
+      summary: List data source connectors
+      description: Returns all configured connectors including status and throughput stats.
+      tags: [connectors]
+      responses:
+        '200':
+          description: Connector list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectorListResponse'
+              examples:
+                connectors:
+                  summary: Two active connectors
+                  value:
+                    data:
+                      - id: conn-ais-1
+                        name: AIS Feed - Global
+                        type: ais
+                        enabled: true
+                        status: healthy
+                        config:
+                          host: ais-feed.company.com
+                          port: 5005
+                          protocol: tcp
+                        stats:
+                          total_ingested: 14500000
+                          last_event_at: '2026-03-26T10:29:55Z'
+                          error_count: 0
+                          events_per_sec: 120.5
+                        created_at: '2026-01-15T10:00:00Z'
+                        updated_at: '2026-03-26T10:00:00Z'
+                      - id: conn-weather-1
+                        name: Weather Service Feed
+                        type: http
+                        enabled: true
+                        status: degraded
+                        config:
+                          url: https://weather.api.example.com/v2
+                          poll_interval_seconds: 60
+                        stats:
+                          total_ingested: 45000
+                          last_event_at: '2026-03-26T10:25:00Z'
+                          error_count: 12
+                          events_per_sec: 0.3
+                        created_at: '2026-02-01T10:00:00Z'
+                        updated_at: '2026-03-26T10:00:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      operationId: createConnector
+      summary: Create a data source connector
+      description: Configure a new data source connector for ingesting entities.
+      tags: [connectors]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConnectorRequest'
+            examples:
+              ais:
+                summary: AIS TCP feed connector
+                value:
+                  name: AIS Feed - Global
+                  type: ais
+                  enabled: true
+                  config:
+                    host: ais-feed.company.com
+                    port: 5005
+                    protocol: tcp
+                    filters:
+                      min_speed: 1.0
+                      max_speed: 50.0
+                  entity_mapping:
+                    entity_type: Ship
+                    id_field: mmsi
+                    name_field: ship_name
+                    geometry_field: position
+                    properties:
+                      imo: imo_number
+                      call_sign: call_sign
+                      speed: speed_over_ground
+                      course: course_over_ground
+              http:
+                summary: HTTP polling connector
+                value:
+                  name: Weather Service
+                  type: http
+                  enabled: true
+                  config:
+                    url: https://weather.api.example.com/v2/systems
+                    poll_interval_seconds: 60
+                    auth_header: Bearer weather_api_key_here
+                  entity_mapping:
+                    entity_type: WeatherSystem
+                    id_field: system_id
+                    name_field: name
+                    properties:
+                      severity: severity_level
+                      wind_speed_knots: wind_speed
+              csv:
+                summary: CSV file import connector
+                value:
+                  name: Port Database Import
+                  type: csv
+                  enabled: true
+                  config:
+                    file_path: /data/ports.csv
+                    delimiter: ","
+                    has_header: true
+                  entity_mapping:
+                    entity_type: Port
+                    id_field: port_id
+                    name_field: port_name
+                    properties:
+                      country: country_code
+                      total_teu: annual_teu
+      responses:
+        '201':
+          description: Connector created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connector'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /connectors/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Connector ID
+        schema:
+          type: string
+        example: conn-ais-1
+
+    put:
+      operationId: updateConnector
+      summary: Update connector configuration
+      description: Update an existing connector's configuration or enabled state.
+      tags: [connectors]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateConnectorRequest'
+            examples:
+              disable:
+                summary: Disable a connector
+                value:
+                  enabled: false
+              updateConfig:
+                summary: Update connection parameters
+                value:
+                  config:
+                    host: new-ais-host.company.com
+                    port: 5006
+      responses:
+        '200':
+          description: Updated connector
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connector'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      operationId: deleteConnector
+      summary: Delete a connector
+      description: Stops and removes the connector. In-flight messages are drained first.
+      tags: [connectors]
+      responses:
+        '204':
+          description: Connector deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── MONITORS ────────────────────────────────────────────────────────────────
+
+  /monitors:
+    get:
+      operationId: listMonitors
+      summary: List alert monitors
+      description: Returns all configured alert monitor rules.
+      tags: [monitors]
+      responses:
+        '200':
+          description: Monitor list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MonitorListResponse'
+              examples:
+                monitors:
+                  summary: Active monitors
+                  value:
+                    data:
+                      - id: mon-speed-coastal
+                        name: Ships speeding in coastal zone
+                        description: Alert if ship speed > 12 knots within 10km of port
+                        enabled: true
+                        entity_type: Ship
+                        condition:
+                          type: threshold
+                          query: "MATCH (s:Ship) WHERE NEAR(s, lat=51.9225, lon=4.2706, radius_km=10) AND s.speed > 12 RETURN s.id"
+                        action:
+                          type: internal_alert
+                        last_triggered: '2026-03-26T09:45:00Z'
+                        trigger_count: 42
+                        created_at: '2026-03-01T10:00:00Z'
+                        updated_at: '2026-03-26T09:45:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      operationId: createMonitor
+      summary: Create an alert monitor
+      description: Create a new alert rule that triggers based on entity state or relationships.
+      tags: [monitors]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMonitorRequest'
+            examples:
+              speedingShip:
+                summary: Ship speeding in coastal zone
+                value:
+                  name: Ships speeding in coastal zone
+                  description: Alert if ship speed > 12 knots within 10km of port
+                  enabled: true
+                  entity_type: Ship
+                  condition:
+                    type: threshold
+                    query: "MATCH (s:Ship) WHERE NEAR(s, lat=51.9225, lon=4.2706, radius_km=10) AND s.speed > 12 RETURN s.id"
+                  action:
+                    type: webhook
+                    target: https://monitoring.company.com/webhook/orpalerts
+                  cooldown_seconds: 300
+              geofence:
+                summary: Ship entering restricted zone
+                value:
+                  name: Restricted zone geofence
+                  enabled: true
+                  entity_type: Ship
+                  condition:
+                    type: geospatial
+                    query: "MATCH (s:Ship) WHERE WITHIN(s, POLYGON([[...]])) RETURN s.id"
+                  action:
+                    type: internal_alert
+                  cooldown_seconds: 60
+              stormProximity:
+                summary: Ship approaching storm
+                value:
+                  name: Storm proximity alert
+                  enabled: true
+                  entity_type: Ship
+                  condition:
+                    type: relationship
+                    query: "MATCH (s:Ship)-[:NEAR]->(w:WeatherSystem {severity: \"extreme\"}) RETURN s.id"
+                  action:
+                    type: email
+                    target: ops-team@company.com
+                    template: storm-proximity-alert
+                  cooldown_seconds: 3600
+      responses:
+        '201':
+          description: Monitor created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Monitor'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /monitors/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Monitor ID
+        schema:
+          type: string
+
+    put:
+      operationId: updateMonitor
+      summary: Update an alert monitor
+      tags: [monitors]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMonitorRequest'
+            examples:
+              disable:
+                summary: Disable a monitor
+                value:
+                  enabled: false
+              updateCooldown:
+                summary: Adjust cooldown period
+                value:
+                  cooldown_seconds: 600
+      responses:
+        '200':
+          description: Updated monitor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Monitor'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      operationId: deleteMonitor
+      summary: Delete an alert monitor
+      tags: [monitors]
+      responses:
+        '204':
+          description: Monitor deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── ALERTS ──────────────────────────────────────────────────────────────────
+
+  /alerts:
+    get:
+      operationId: listAlerts
+      summary: List alerts
+      description: Returns the alert feed, optionally filtered by severity or acknowledgement status.
+      tags: [alerts]
+      parameters:
+        - name: severity
+          in: query
+          schema:
+            type: string
+            enum: [critical, warning, info]
+        - name: acknowledged
+          in: query
+          schema:
+            type: boolean
+        - name: monitor_id
+          in: query
+          schema:
+            type: string
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Alert list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertListResponse'
+              examples:
+                active:
+                  summary: Active unacknowledged alerts
+                  value:
+                    data:
+                      - id: alert-001
+                        monitor_id: mon-speed-coastal
+                        monitor_name: Ships speeding in coastal zone
+                        severity: critical
+                        timestamp: '2026-03-26T10:29:00Z'
+                        acknowledged: false
+                        affected_entities:
+                          - entity_id: ship-imo-1234567
+                            entity_type: Ship
+                            entity_name: Maersk Seatrade
+                            reason: Speed 19.2 kn > threshold 12 kn
+                    pagination:
+                      page: 1
+                      limit: 100
+                      total_count: 1
+                      total_pages: 1
+                      has_next: false
+                      has_prev: false
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /alerts/{id}/acknowledge:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Alert ID
+        schema:
+          type: string
+
+    post:
+      operationId: acknowledgeAlert
+      summary: Acknowledge an alert
+      description: |
+        Marks an alert as acknowledged by the current user. Acknowledged alerts
+        remain visible but are visually de-emphasised in the feed.
+      tags: [alerts]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note:
+                  type: string
+                  description: Optional operator note explaining the acknowledgement
+            examples:
+              withNote:
+                summary: Acknowledge with explanation
+                value:
+                  note: Verified with vessel agent - speed reduction underway
+              withoutNote:
+                summary: Simple acknowledgement
+                value: {}
+      responses:
+        '200':
+          description: Alert acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Alert'
+              examples:
+                acknowledged:
+                  summary: Acknowledged alert
+                  value:
+                    id: alert-001
+                    monitor_id: mon-speed-coastal
+                    monitor_name: Ships speeding in coastal zone
+                    severity: critical
+                    timestamp: '2026-03-26T10:29:00Z'
+                    acknowledged: true
+                    acknowledged_at: '2026-03-26T10:31:00Z'
+                    acknowledged_by: operator@company.com
+                    affected_entities:
+                      - entity_id: ship-imo-1234567
+                        entity_type: Ship
+                        entity_name: Maersk Seatrade
+                        reason: Speed 19.2 kn > threshold 12 kn
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Alert already acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── API KEYS ─────────────────────────────────────────────────────────────────
+
+  /api-keys:
+    get:
+      operationId: listApiKeys
+      summary: List API keys
+      description: Returns all API keys for the current organisation (secrets are not returned).
+      tags: [api-keys]
+      responses:
+        '200':
+          description: API key list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ApiKeyMeta'
+              examples:
+                keys:
+                  summary: Two API keys
+                  value:
+                    data:
+                      - id: key-abc123
+                        name: monitoring-service
+                        scopes: [entities:read, monitors:read]
+                        rate_limit: 10000
+                        created_at: '2026-03-26T10:00:00Z'
+                        expires_at: '2027-03-26T10:00:00Z'
+                        last_used_at: '2026-03-26T10:29:00Z'
+                      - id: key-def456
+                        name: dashboard-client
+                        scopes: [entities:read, graph:read]
+                        rate_limit: 5000
+                        created_at: '2026-02-01T10:00:00Z'
+                        expires_at: null
+                        last_used_at: '2026-03-26T09:00:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      operationId: createApiKey
+      summary: Create an API key
+      description: Generates a new scoped API key. The secret is returned once and never again.
+      tags: [api-keys]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateApiKeyRequest'
+            examples:
+              monitoring:
+                summary: Read-only monitoring key
+                value:
+                  name: monitoring-service
+                  scopes: [entities:read, monitors:read]
+                  rate_limit: 10000
+                  expires_in: 31536000
+              fullAccess:
+                summary: Full-access integration key
+                value:
+                  name: integration-service
+                  scopes: [entities:read, entities:write, graph:read]
+                  rate_limit: 50000
+              noExpiry:
+                summary: Key with no expiry
+                value:
+                  name: internal-dashboard
+                  scopes: [entities:read, graph:read]
+      responses:
+        '201':
+          description: API key created. Secret returned once — store immediately.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyCreated'
+              examples:
+                created:
+                  summary: Newly created key with secret
+                  value:
+                    id: key-abc123
+                    name: monitoring-service
+                    api_key: YOUR_API_KEY_HERE
+                    scopes: [entities:read, monitors:read]
+                    rate_limit: 10000
+                    created_at: '2026-03-26T10:00:00Z'
+                    expires_at: '2027-03-26T10:00:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api-keys/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: API key ID
+        schema:
+          type: string
+
+    delete:
+      operationId: revokeApiKey
+      summary: Revoke an API key
+      description: Immediately revokes an API key. Active requests using this key will fail.
+      tags: [api-keys]
+      responses:
+        '204':
+          description: API key revoked
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── SYSTEM ──────────────────────────────────────────────────────────────────
+
+  /health:
+    get:
+      operationId: getHealth
+      summary: System health check
+      description: |
+        Returns health status for all system components. Used by load balancers
+        and uptime monitoring. Does not require authentication.
+      tags: [system]
+      security: []
+      responses:
+        '200':
+          description: System is healthy or degraded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                healthy:
+                  summary: All systems healthy
+                  value:
+                    status: healthy
+                    timestamp: '2026-03-26T10:30:00Z'
+                    version: 1.0.0
+                    components:
+                      database:
+                        status: healthy
+                        latency_ms: 2
+                      graph_engine:
+                        status: healthy
+                        latency_ms: 5
+                      stream_processor:
+                        status: healthy
+                        events_per_sec: 12500
+                        queue_depth: 0
+                      api_server:
+                        status: healthy
+                degraded:
+                  summary: Degraded system state
+                  value:
+                    status: degraded
+                    timestamp: '2026-03-26T10:30:00Z'
+                    version: 1.0.0
+                    components:
+                      database:
+                        status: healthy
+                        latency_ms: 2
+                      graph_engine:
+                        status: degraded
+                        latency_ms: 450
+                      stream_processor:
+                        status: healthy
+                        events_per_sec: 12500
+                        queue_depth: 150
+                      api_server:
+                        status: healthy
+                unhealthy:
+                  summary: Critical system failure
+                  value:
+                    status: unhealthy
+                    timestamp: '2026-03-26T10:30:00Z'
+                    version: 1.0.0
+                    components:
+                      database:
+                        status: error
+                      graph_engine:
+                        status: error
+                      stream_processor:
+                        status: error
+                      api_server:
+                        status: healthy
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus metrics
+      description: |
+        Returns Prometheus-format metrics for scraping. Follows OpenTelemetry
+        conventions. No authentication required (should be network-restricted in production).
+      tags: [system]
+      security: []
+      responses:
+        '200':
+          description: Prometheus text-format metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP orp_entities_total Total number of entities
+                # TYPE orp_entities_total gauge
+                orp_entities_total{type="Ship"} 2847
+                orp_entities_total{type="Port"} 512
+                orp_entities_total{type="WeatherSystem"} 64
+
+                # HELP orp_query_latency_ms Query execution latency
+                # TYPE orp_query_latency_ms histogram
+                orp_query_latency_ms_bucket{le="50"} 450
+                orp_query_latency_ms_bucket{le="100"} 780
+                orp_query_latency_ms_bucket{le="500"} 1200
+                orp_query_latency_ms_bucket{le="5000"} 1250
+
+                # HELP orp_stream_throughput_events_per_sec Stream processor throughput
+                # TYPE orp_stream_throughput_events_per_sec gauge
+                orp_stream_throughput_events_per_sec 12500
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WEBSOCKET (documented as path, not a REST endpoint)
+# ──────────────────────────────────────────────────────────────────────────────
+
+  /ws/updates:
+    get:
+      operationId: wsUpdates
+      summary: WebSocket real-time update stream
+      description: |
+        **WebSocket endpoint** — upgrade via `ws://` or `wss://`.
+
+        Provides real-time entity updates via a subscription model.
+
+        ### Connection
+        ```
+        ws://localhost:9090/ws/updates?token=<bearer_token>
+        ```
+
+        ### Client → Server Messages
+
+        **Subscribe to entity type:**
+        ```json
+        { "type": "subscribe", "id": "sub-1", "data": { "entity_type": "Ship" } }
+        ```
+
+        **Subscribe to geographic region:**
+        ```json
+        { "type": "subscribe", "id": "sub-2", "data": { "entity_type": "Ship", "region": { "min_lat": 51.5, "min_lon": 3.0, "max_lat": 52.5, "max_lon": 5.0 } } }
+        ```
+
+        **Subscribe to specific entity:**
+        ```json
+        { "type": "subscribe", "id": "sub-3", "data": { "entity_id": "ship-imo-1234567" } }
+        ```
+
+        **Unsubscribe:**
+        ```json
+        { "type": "unsubscribe", "id": "unsub-1", "data": { "subscription_id": "sub-1" } }
+        ```
+
+        ### Server → Client Messages
+
+        **Entity updated:**
+        ```json
+        { "type": "entity_update", "timestamp": "2026-03-26T10:42:15Z", "data": { "entity_id": "ship-imo-1234567", "entity_type": "Ship", "changes": { "speed": { "before": 18.5, "after": 19.2 }, "course": { "before": 225.0, "after": 230.0 } }, "source": "ais-feed-1" } }
+        ```
+
+        **Entity created:**
+        ```json
+        { "type": "entity_created", "timestamp": "2026-03-26T10:43:00Z", "data": { "entity_id": "ship-imo-9999999", "entity_type": "Ship", "entity_name": "New Vessel", "properties": { "mmsi": "123456789", "speed": 15.0 }, "source": "ais-feed-1" } }
+        ```
+
+        **Alert fired:**
+        ```json
+        { "type": "alert", "timestamp": "2026-03-26T10:44:00Z", "data": { "alert_id": "alert-001", "monitor_id": "mon-speed-coastal", "monitor_name": "Ships speeding in coastal zone", "severity": "critical", "affected_entities": [{ "entity_id": "ship-imo-1234567", "reason": "Speed 19.2 kn > threshold 12 kn" }] } }
+        ```
+      tags: [system]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: token
+          in: query
+          description: Bearer token for WebSocket authentication (alternative to Authorization header)
+          schema:
+            type: string
+      responses:
+        '101':
+          description: Switching Protocols — WebSocket connection established
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+# ──────────────────────────────────────────────────────────────────────────────
+# COMPONENTS
+# ──────────────────────────────────────────────────────────────────────────────
+
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: OIDC JWT token obtained from the /auth/login flow
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key with scoped permissions (prefix orpk_prod_)
+
+  parameters:
+    EntityIdParam:
+      name: id
+      in: path
+      required: true
+      description: Entity ID (URI-safe string)
+      schema:
+        type: string
+      example: ship-imo-1234567
+
+    PageParam:
+      name: page
+      in: query
+      description: Page number (1-indexed)
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+      example: 1
+
+    LimitParam:
+      name: limit
+      in: query
+      description: Items per page (max 1000)
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+      example: 50
+
+    SortByParam:
+      name: sort_by
+      in: query
+      description: Field name to sort by
+      schema:
+        type: string
+      example: created_at
+
+    SortOrderParam:
+      name: sort_order
+      in: query
+      description: Sort direction
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: desc
+
+  schemas:
+
+    # ── Pagination ─────────────────────────────────────────────────────────────
+
+    PaginationInfo:
+      type: object
+      required: [page, limit, total_count, total_pages, has_next, has_prev]
+      properties:
+        page:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 100
+        total_count:
+          type: integer
+          example: 2847
+        total_pages:
+          type: integer
+          example: 29
+        has_next:
+          type: boolean
+        has_prev:
+          type: boolean
+
+    PaginationLinks:
+      type: object
+      properties:
+        first:
+          type: string
+        last:
+          type: string
+        next:
+          type: string
+          nullable: true
+        prev:
+          type: string
+          nullable: true
+
+    # ── Error ──────────────────────────────────────────────────────────────────
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, status, message, timestamp]
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code
+              example: NOT_FOUND
+              enum:
+                - INVALID_REQUEST
+                - INVALID_QUERY
+                - UNAUTHORIZED
+                - FORBIDDEN
+                - NOT_FOUND
+                - CONFLICT
+                - RATE_LIMITED
+                - VALIDATION_ERROR
+                - INTERNAL_ERROR
+            status:
+              type: integer
+              description: HTTP status code
+              example: 404
+            message:
+              type: string
+              description: Human-readable error message
+              example: Entity not found
+            details:
+              type: object
+              additionalProperties: true
+              description: Additional context for debugging
+            trace_id:
+              type: string
+              description: Correlation ID for distributed tracing
+            timestamp:
+              type: string
+              format: date-time
+              example: '2026-03-26T10:30:45Z'
+
+    # ── GeoJSON ────────────────────────────────────────────────────────────────
+
+    GeoJsonGeometry:
+      type: object
+      required: [type, coordinates]
+      properties:
+        type:
+          type: string
+          enum: [Point, LineString, Polygon, MultiPoint]
+        coordinates:
+          description: GeoJSON coordinates ([lon, lat] for Point)
+          oneOf:
+            - type: array
+              items:
+                type: number
+              description: Point coordinates [lon, lat]
+            - type: array
+              items:
+                type: array
+                items:
+                  type: number
+              description: LineString or ring coordinates
+            - type: array
+              items:
+                type: array
+                items:
+                  type: array
+                  items:
+                    type: number
+              description: Polygon coordinates
+
+    # ── Freshness ──────────────────────────────────────────────────────────────
+
+    Freshness:
+      type: object
+      required: [updated_at, checked_at]
+      properties:
+        updated_at:
+          type: string
+          format: date-time
+          description: When entity properties were last changed
+        checked_at:
+          type: string
+          format: date-time
+          description: When entity was last validated
+
+    # ── Entity ─────────────────────────────────────────────────────────────────
+
+    Entity:
+      type: object
+      required: [id, type, name, tags, properties, confidence, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          description: Unique entity identifier (URI-safe)
+          example: ship-imo-1234567
+        type:
+          type: string
+          description: Entity type
+          example: Ship
+        name:
+          type: string
+          description: Human-readable name
+          example: Maersk Seatrade
+        tags:
+          type: array
+          items:
+            type: string
+          example: [container, international, active]
+        properties:
+          type: object
+          additionalProperties: true
+          description: Type-specific entity properties
+        geometry:
+          $ref: '#/components/schemas/GeoJsonGeometry'
+          nullable: true
+        confidence:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 1.0
+          description: Data confidence score
+          example: 0.99
+        freshness:
+          $ref: '#/components/schemas/Freshness'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    EntityDetail:
+      allOf:
+        - $ref: '#/components/schemas/Entity'
+        - type: object
+          properties:
+            relationships:
+              type: object
+              properties:
+                outgoing:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/OutgoingRelationship'
+                incoming:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/IncomingRelationship'
+            history:
+              type: array
+              items:
+                $ref: '#/components/schemas/EntityHistoryEntry'
+
+    EntityListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Entity'
+        pagination:
+          $ref: '#/components/schemas/PaginationInfo'
+        links:
+          $ref: '#/components/schemas/PaginationLinks'
+
+    EntityHistoryEntry:
+      type: object
+      required: [timestamp, changed_properties, source]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        changed_properties:
+          type: object
+          additionalProperties: true
+        source:
+          type: string
+
+    CreateEntityRequest:
+      type: object
+      required: [id, type, name, properties]
+      properties:
+        id:
+          type: string
+          description: Unique entity ID (must be URI-safe)
+        type:
+          type: string
+        name:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+          default: []
+        properties:
+          type: object
+          additionalProperties: true
+        geometry:
+          $ref: '#/components/schemas/GeoJsonGeometry'
+        confidence:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 1.0
+          default: 1.0
+        source:
+          type: string
+          description: Data source identifier
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Internal metadata (not exposed in queries)
+
+    UpdateEntityRequest:
+      type: object
+      description: All fields are optional — only supplied fields are updated (merge semantics)
+      properties:
+        name:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        properties:
+          type: object
+          additionalProperties: true
+        geometry:
+          $ref: '#/components/schemas/GeoJsonGeometry'
+        confidence:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 1.0
+
+    # ── Relationships ──────────────────────────────────────────────────────────
+
+    OutgoingRelationship:
+      type: object
+      required: [id, type, target_id, target_type, target_name, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          example: HEADING_TO
+        target_id:
+          type: string
+        target_type:
+          type: string
+        target_name:
+          type: string
+        properties:
+          type: object
+          additionalProperties: true
+          nullable: true
+        strength:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 1.0
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    IncomingRelationship:
+      type: object
+      required: [id, type, source_id, source_type, source_name, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        source_id:
+          type: string
+        source_type:
+          type: string
+        source_name:
+          type: string
+        properties:
+          type: object
+          additionalProperties: true
+          nullable: true
+        strength:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 1.0
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    RelationshipsResponse:
+      type: object
+      required: [entity_id, entity_type, outgoing, incoming, statistics]
+      properties:
+        entity_id:
+          type: string
+        entity_type:
+          type: string
+        outgoing:
+          type: array
+          items:
+            $ref: '#/components/schemas/OutgoingRelationship'
+        incoming:
+          type: array
+          items:
+            $ref: '#/components/schemas/IncomingRelationship'
+        statistics:
+          type: object
+          required: [total_outgoing, total_incoming]
+          properties:
+            total_outgoing:
+              type: integer
+            total_incoming:
+              type: integer
+
+    # ── Events ─────────────────────────────────────────────────────────────────
+
+    EventRecord:
+      type: object
+      required: [id, timestamp, entity_id, entity_type, entity_name, event_type, changes, source]
+      properties:
+        id:
+          type: string
+          example: evt_1001
+        timestamp:
+          type: string
+          format: date-time
+        entity_id:
+          type: string
+        entity_type:
+          type: string
+        entity_name:
+          type: string
+        event_type:
+          type: string
+          enum:
+            - property_change
+            - relationship_created
+            - relationship_deleted
+            - entity_deleted
+            - entity_created
+        changes:
+          type: object
+          properties:
+            before:
+              type: object
+              additionalProperties: true
+              nullable: true
+            after:
+              type: object
+              additionalProperties: true
+              nullable: true
+        source:
+          type: string
+        trace_id:
+          type: string
+          nullable: true
+
+    EventsResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventRecord'
+        pagination:
+          $ref: '#/components/schemas/PaginationInfo'
+
+    # ── Query ──────────────────────────────────────────────────────────────────
+
+    QueryRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          description: ORP-QL query string
+          example: "MATCH (s:Ship) WHERE s.speed > 15 RETURN s.id, s.name, s.speed"
+        timeout_ms:
+          type: integer
+          default: 5000
+          description: Query timeout in milliseconds
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          default: 100
+        offset:
+          type: integer
+          minimum: 0
+          default: 0
+
+    QueryResponse:
+      type: object
+      required: [status, results, metadata]
+      properties:
+        status:
+          type: string
+          enum: [success, error]
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        metadata:
+          type: object
+          required: [execution_time_ms, rows_returned]
+          properties:
+            execution_time_ms:
+              type: integer
+            rows_returned:
+              type: integer
+            rows_scanned:
+              type: integer
+              nullable: true
+        query_plan:
+          type: string
+          nullable: true
+          description: Query execution plan (debug only)
+
+    NaturalQueryRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          description: Natural language question
+          example: Which tankers are near Rotterdam?
+        confidence_threshold:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 1.0
+          default: 0.7
+        timeout_ms:
+          type: integer
+          default: 5000
+
+    NaturalQueryResponse:
+      type: object
+      required: [status, natural_query, interpreted_query, confidence, interpretation_method, results, metadata]
+      properties:
+        status:
+          type: string
+          enum: [success, partial, ambiguous]
+        natural_query:
+          type: string
+        interpreted_query:
+          type: string
+          description: Generated ORP-QL query
+        confidence:
+          type: number
+          format: double
+        interpretation_method:
+          type: string
+          enum: [template, model, interactive]
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        alternatives:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              query:
+                type: string
+              confidence:
+                type: number
+        metadata:
+          type: object
+          required: [execution_time_ms, rows_returned]
+          properties:
+            execution_time_ms:
+              type: integer
+            rows_returned:
+              type: integer
+
+    GraphQueryRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          description: Cypher query string (Kuzu)
+          example: "MATCH (org:Organization {id: \"org-maersk\"})-[:OWNS]->(s:Ship)-[:HEADING_TO]->(p:Port) RETURN p.id, p.name, COUNT(*) as ships"
+        timeout_ms:
+          type: integer
+          default: 5000
+
+    GraphQueryResponse:
+      type: object
+      required: [status, results, metadata]
+      properties:
+        status:
+          type: string
+          enum: [success, error]
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        metadata:
+          type: object
+          required: [execution_time_ms, rows_returned]
+          properties:
+            execution_time_ms:
+              type: integer
+            rows_returned:
+              type: integer
+        query_plan:
+          type: string
+          nullable: true
+
+    # ── Connectors ─────────────────────────────────────────────────────────────
+
+    ConnectorStats:
+      type: object
+      required: [total_ingested, last_event_at, error_count, events_per_sec]
+      properties:
+        total_ingested:
+          type: integer
+        last_event_at:
+          type: string
+          format: date-time
+          nullable: true
+        error_count:
+          type: integer
+        events_per_sec:
+          type: number
+          format: double
+
+    Connector:
+      type: object
+      required: [id, name, type, enabled, status, config, stats, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+          enum: [ais, ads-b, http, mqtt, csv, json]
+        enabled:
+          type: boolean
+        status:
+          type: string
+          enum: [healthy, degraded, error]
+        config:
+          type: object
+          additionalProperties: true
+          description: Type-specific configuration (secrets redacted)
+        stats:
+          $ref: '#/components/schemas/ConnectorStats'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    ConnectorListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Connector'
+
+    EntityMapping:
+      type: object
+      required: [entity_type, id_field]
+      properties:
+        entity_type:
+          type: string
+          example: Ship
+        id_field:
+          type: string
+          example: mmsi
+        name_field:
+          type: string
+          nullable: true
+        geometry_field:
+          type: string
+          nullable: true
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+
+    CreateConnectorRequest:
+      type: object
+      required: [name, type, config, entity_mapping]
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum: [ais, ads-b, http, mqtt, csv, json]
+        enabled:
+          type: boolean
+          default: true
+        config:
+          type: object
+          additionalProperties: true
+        entity_mapping:
+          $ref: '#/components/schemas/EntityMapping'
+
+    UpdateConnectorRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        enabled:
+          type: boolean
+        config:
+          type: object
+          additionalProperties: true
+        entity_mapping:
+          $ref: '#/components/schemas/EntityMapping'
+
+    # ── Monitors ───────────────────────────────────────────────────────────────
+
+    MonitorCondition:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [threshold, geospatial, relationship, anomaly]
+        query:
+          type: string
+          nullable: true
+          description: ORP-QL query that returns matching entities when condition is met
+
+    MonitorAction:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [webhook, email, internal_alert, custom]
+        target:
+          type: string
+          nullable: true
+          description: Webhook URL, email address, or custom target
+        template:
+          type: string
+          nullable: true
+
+    Monitor:
+      type: object
+      required: [id, name, enabled, entity_type, condition, action, trigger_count, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        enabled:
+          type: boolean
+        entity_type:
+          type: string
+        condition:
+          $ref: '#/components/schemas/MonitorCondition'
+        action:
+          $ref: '#/components/schemas/MonitorAction'
+        last_triggered:
+          type: string
+          format: date-time
+          nullable: true
+        trigger_count:
+          type: integer
+        cooldown_seconds:
+          type: integer
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    MonitorListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Monitor'
+
+    CreateMonitorRequest:
+      type: object
+      required: [name, entity_type, condition, action]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        enabled:
+          type: boolean
+          default: true
+        entity_type:
+          type: string
+        condition:
+          $ref: '#/components/schemas/MonitorCondition'
+        action:
+          $ref: '#/components/schemas/MonitorAction'
+        cooldown_seconds:
+          type: integer
+          nullable: true
+
+    UpdateMonitorRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        enabled:
+          type: boolean
+        condition:
+          $ref: '#/components/schemas/MonitorCondition'
+        action:
+          $ref: '#/components/schemas/MonitorAction'
+        cooldown_seconds:
+          type: integer
+
+    # ── Alerts ─────────────────────────────────────────────────────────────────
+
+    AffectedEntity:
+      type: object
+      required: [entity_id, entity_type]
+      properties:
+        entity_id:
+          type: string
+        entity_type:
+          type: string
+        entity_name:
+          type: string
+          nullable: true
+        reason:
+          type: string
+          nullable: true
+
+    Alert:
+      type: object
+      required: [id, monitor_id, monitor_name, severity, timestamp, acknowledged, affected_entities]
+      properties:
+        id:
+          type: string
+        monitor_id:
+          type: string
+        monitor_name:
+          type: string
+        severity:
+          type: string
+          enum: [critical, warning, info]
+        timestamp:
+          type: string
+          format: date-time
+        acknowledged:
+          type: boolean
+        acknowledged_at:
+          type: string
+          format: date-time
+          nullable: true
+        acknowledged_by:
+          type: string
+          nullable: true
+        affected_entities:
+          type: array
+          items:
+            $ref: '#/components/schemas/AffectedEntity'
+
+    AlertListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Alert'
+        pagination:
+          $ref: '#/components/schemas/PaginationInfo'
+
+    # ── API Keys ───────────────────────────────────────────────────────────────
+
+    ApiKeyMeta:
+      type: object
+      required: [id, name, scopes, rate_limit, created_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        rate_limit:
+          type: integer
+          description: Maximum requests per second
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    ApiKeyCreated:
+      allOf:
+        - $ref: '#/components/schemas/ApiKeyMeta'
+        - type: object
+          required: [api_key]
+          properties:
+            api_key:
+              type: string
+              description: The secret API key (only returned at creation time)
+              example: orpk_prod_abc123def456ghi789
+
+    CreateApiKeyRequest:
+      type: object
+      required: [name, scopes]
+      properties:
+        name:
+          type: string
+          description: Descriptive name for this key
+          example: monitoring-service
+        scopes:
+          type: array
+          items:
+            type: string
+            enum:
+              - entities:read
+              - entities:write
+              - graph:read
+              - graph:write
+              - monitors:read
+              - monitors:write
+              - connectors:read
+              - connectors:write
+              - admin
+          example: [entities:read, monitors:read]
+        rate_limit:
+          type: integer
+          description: Max requests per second (default 1000)
+          default: 1000
+        expires_in:
+          type: integer
+          nullable: true
+          description: Expiry in seconds from now. Omit for no expiry.
+          example: 31536000
+
+    # ── Health ─────────────────────────────────────────────────────────────────
+
+    ComponentHealth:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, error]
+        latency_ms:
+          type: integer
+          nullable: true
+
+    StreamHealth:
+      allOf:
+        - $ref: '#/components/schemas/ComponentHealth'
+        - type: object
+          properties:
+            events_per_sec:
+              type: number
+              nullable: true
+            queue_depth:
+              type: integer
+              nullable: true
+
+    HealthResponse:
+      type: object
+      required: [status, timestamp, version, components]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        timestamp:
+          type: string
+          format: date-time
+        version:
+          type: string
+          example: 1.0.0
+        components:
+          type: object
+          required: [database, graph_engine, stream_processor, api_server]
+          properties:
+            database:
+              $ref: '#/components/schemas/ComponentHealth'
+            graph_engine:
+              $ref: '#/components/schemas/ComponentHealth'
+            stream_processor:
+              $ref: '#/components/schemas/StreamHealth'
+            api_server:
+              $ref: '#/components/schemas/ComponentHealth'
+
+  # ── Responses ─────────────────────────────────────────────────────────────
+
+  responses:
+    BadRequest:
+      description: Bad request — malformed JSON or missing required fields
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: INVALID_REQUEST
+              status: 400
+              message: Missing required field 'id'
+              details:
+                field: id
+                reason: required
+              timestamp: '2026-03-26T10:30:45Z'
+
+    Unauthorized:
+      description: Authentication required or token invalid/expired
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: UNAUTHORIZED
+              status: 401
+              message: Bearer token is expired
+              details:
+                reason: token_expired
+              timestamp: '2026-03-26T10:30:45Z'
+
+    Forbidden:
+      description: Insufficient permissions
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: FORBIDDEN
+              status: 403
+              message: Permission denied
+              details:
+                required_scope: entities:write
+              timestamp: '2026-03-26T10:30:45Z'
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: NOT_FOUND
+              status: 404
+              message: Entity not found
+              details:
+                id: ship-unknown-999
+                type: Entity
+              timestamp: '2026-03-26T10:30:45Z'
+
+    Conflict:
+      description: Conflict — resource already exists or state conflict
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    ValidationError:
+      description: Semantic validation error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: VALIDATION_ERROR
+              status: 422
+              message: Validation failed
+              details:
+                field: confidence
+                reason: must be between 0.0 and 1.0
+              timestamp: '2026-03-26T10:30:45Z'
+
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until rate limit resets
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: RATE_LIMITED
+              status: 429
+              message: Rate limit exceeded
+              details:
+                retry_after_seconds: 60
+              timestamp: '2026-03-26T10:30:45Z'
+
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: INTERNAL_ERROR
+              status: 500
+              message: An unexpected error occurred
+              details:
+                trace_id: req_abc123
+              timestamp: '2026-03-26T10:30:45Z'

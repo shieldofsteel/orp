@@ -9,6 +9,7 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
+use orp_audit::crypto::EventSigner;
 use orp_query::QueryExecutor;
 use orp_security::{AbacEngine, ApiKeyService, AuthState};
 use orp_storage::traits::Storage;
@@ -29,6 +30,8 @@ pub struct AppState {
     pub auth_state: Arc<AuthState>,
     pub abac_engine: Arc<AbacEngine>,
     pub api_key_service: Arc<ApiKeyService>,
+    /// Ed25519 signer for audit log cryptographic integrity.
+    pub audit_signer: Arc<EventSigner>,
     pub broadcast_tx: broadcast::Sender<websocket::BroadcastEvent>,
     pub started_at: std::time::Instant,
 }
@@ -178,11 +181,17 @@ pub struct ServerConfig {
     pub auth_state: Arc<AuthState>,
     pub abac_engine: Arc<AbacEngine>,
     pub api_key_service: Arc<ApiKeyService>,
+    /// Optional Ed25519 signer; a fresh one is generated if None.
+    pub audit_signer: Option<Arc<EventSigner>>,
     pub port: u16,
 }
 
 pub async fn start_server(config: ServerConfig) -> Result<()> {
     let (broadcast_tx, _) = broadcast::channel::<websocket::BroadcastEvent>(4096);
+
+    let audit_signer = config
+        .audit_signer
+        .unwrap_or_else(|| Arc::new(EventSigner::new()));
 
     let state = Arc::new(AppState {
         storage: config.storage,
@@ -192,6 +201,7 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         auth_state: config.auth_state,
         abac_engine: config.abac_engine,
         api_key_service: config.api_key_service,
+        audit_signer,
         broadcast_tx,
         started_at: std::time::Instant::now(),
     });

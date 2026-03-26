@@ -274,6 +274,7 @@ pub async fn run_start(
         auth_state,
         abac_engine,
         api_key_service,
+        audit_signer: None, // freshly generated at startup
         port,
     })
     .await?;

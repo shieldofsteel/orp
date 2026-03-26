@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useId } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import type { QueryMode, QueryHistoryEntry } from '../types';
 
@@ -57,7 +57,6 @@ async function executeQuery(
   }
 
   const json = await res.json();
-  // Normalise: the API returns { data: [...] } or { results: [...] }
   return (json as { data?: unknown[]; results?: unknown[] }).data ??
     (json as { results?: unknown[] }).results ??
     (Array.isArray(json) ? json : [json]);
@@ -96,20 +95,42 @@ function ResultsTable({ results }: ResultsTableProps) {
     }
   };
 
+  const displayCount = Math.min(sorted.length, 200);
+
   return (
     <div className="overflow-auto orp-scrollbar max-h-48 border-t border-gray-800">
-      <table className="w-full text-[11px]">
+      <table
+        className="w-full text-[11px]"
+        aria-label={`Query results — ${results.length} row${results.length !== 1 ? 's' : ''}`}
+        aria-rowcount={results.length}
+      >
         <thead className="sticky top-0 bg-gray-900 z-10">
           <tr>
             {columns.map((col) => (
               <th
                 key={col}
+                scope="col"
                 onClick={() => handleSort(col)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    handleSort(col);
+                  }
+                }}
+                tabIndex={0}
+                role="columnheader"
+                aria-sort={
+                  sortCol === col
+                    ? sortDir === 'asc'
+                      ? 'ascending'
+                      : 'descending'
+                    : 'none'
+                }
                 className="px-3 py-1.5 text-left text-gray-500 font-medium whitespace-nowrap cursor-pointer hover:text-gray-300 select-none border-b border-gray-800"
               >
                 {col}
                 {sortCol === col && (
-                  <span className="ml-1 text-blue-400">
+                  <span className="ml-1 text-blue-400" aria-hidden="true">
                     {sortDir === 'asc' ? '↑' : '↓'}
                   </span>
                 )}
@@ -119,7 +140,7 @@ function ResultsTable({ results }: ResultsTableProps) {
         </thead>
         <tbody className="divide-y divide-gray-800/50">
           {sorted.slice(0, 200).map((row, i) => (
-            <tr key={i} className="hover:bg-gray-800/40 transition-colors">
+            <tr key={i} className="hover:bg-gray-800/40 transition-colors" aria-rowindex={i + 1}>
               {columns.map((col) => (
                 <td key={col} className="px-3 py-1 text-gray-300 whitespace-nowrap font-mono text-[10px]">
                   {row[col] == null
@@ -134,7 +155,7 @@ function ResultsTable({ results }: ResultsTableProps) {
         </tbody>
       </table>
       {results.length > 200 && (
-        <div className="px-3 py-1 text-[10px] text-gray-600 border-t border-gray-800">
+        <div className="px-3 py-1 text-[10px] text-gray-600 border-t border-gray-800" role="status">
           Showing 200 of {results.length} rows
         </div>
       )}
@@ -164,6 +185,15 @@ export const QueryBar: React.FC = () => {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const suggestionsRef = useRef<HTMLDivElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>();
+
+  // Stable IDs for ARIA relationships
+  const uid = useId();
+  const listboxId = `orpql-suggestions-${uid}`;
+  const inputId = `orpql-input-${uid}`;
+  const statusId = `orpql-status-${uid}`;
+  const errorId = `orpql-error-${uid}`;
+
+  const getSuggestionItemId = (index: number) => `${listboxId}-option-${index}`;
 
   // Debounced suggestion generation
   useEffect(() => {
@@ -229,8 +259,11 @@ export const QueryBar: React.FC = () => {
         e.preventDefault();
         setQuery(suggestions[activeSuggestion]);
         setShowSuggestions(false);
+        setActiveSuggestion(-1);
       } else if (e.key === 'Escape') {
+        e.preventDefault();
         setShowSuggestions(false);
+        setActiveSuggestion(-1);
       }
     }
   };
@@ -242,14 +275,26 @@ export const QueryBar: React.FC = () => {
     inputRef.current?.focus();
   };
 
+  // Results status text for aria-live
+  const statusText =
+    queryLoading
+      ? 'Running query…'
+      : queryError
+      ? `Query error: ${queryError}`
+      : queryResults.length > 0
+      ? `${queryResults.length} result${queryResults.length !== 1 ? 's' : ''} returned`
+      : '';
+
   return (
     <div className="flex flex-col gap-1.5">
       {/* Mode Toggle */}
-      <div className="flex items-center gap-1 mb-1">
+      <div className="flex items-center gap-1 mb-1" role="group" aria-label="Query mode selection">
         {(['structured', 'natural'] as QueryMode[]).map((m) => (
           <button
             key={m}
             onClick={() => setQueryMode(m)}
+            aria-pressed={queryMode === m}
+            aria-label={m === 'structured' ? 'ORP-QL structured query mode' : 'Natural language query mode'}
             className={`text-[10px] px-2 py-0.5 rounded border transition-colors ${
               queryMode === m
                 ? 'bg-blue-900/60 border-blue-700 text-blue-300'
@@ -262,6 +307,9 @@ export const QueryBar: React.FC = () => {
         {queryHistory.length > 0 && (
           <button
             onClick={() => setShowHistory((v) => !v)}
+            aria-expanded={showHistory}
+            aria-haspopup="listbox"
+            aria-label={`Query history — ${queryHistory.length} entries`}
             className="ml-auto text-[10px] text-gray-600 hover:text-gray-400 transition-colors"
           >
             History ({queryHistory.length})
@@ -271,10 +319,16 @@ export const QueryBar: React.FC = () => {
 
       {/* History dropdown */}
       {showHistory && (
-        <div className="rounded-md border border-gray-700 bg-gray-900 divide-y divide-gray-800 mb-1 orp-scrollbar overflow-y-auto max-h-36">
+        <div
+          role="listbox"
+          aria-label="Recent queries"
+          className="rounded-md border border-gray-700 bg-gray-900 divide-y divide-gray-800 mb-1 orp-scrollbar overflow-y-auto max-h-36"
+        >
           {queryHistory.map((entry) => (
             <button
               key={entry.id}
+              role="option"
+              aria-selected={false}
               onClick={() => pickHistory(entry)}
               className="w-full text-left px-3 py-1.5 hover:bg-gray-800 transition-colors"
             >
@@ -288,10 +342,16 @@ export const QueryBar: React.FC = () => {
         </div>
       )}
 
-      {/* Query Input */}
+      {/* Query Input — combobox pattern */}
       <div className="relative">
+        <label htmlFor={inputId} className="sr-only">
+          {queryMode === 'structured'
+            ? 'ORP-QL query input. Press Ctrl+Enter or Cmd+Enter to execute.'
+            : 'Natural language query input. Press Ctrl+Enter or Cmd+Enter to execute.'}
+        </label>
         <textarea
           ref={inputRef}
+          id={inputId}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKeyDown}
@@ -304,6 +364,19 @@ export const QueryBar: React.FC = () => {
           }
           rows={2}
           disabled={queryLoading}
+          // Combobox ARIA attributes
+          role="combobox"
+          aria-haspopup="listbox"
+          aria-expanded={showSuggestions}
+          aria-autocomplete="list"
+          aria-controls={showSuggestions ? listboxId : undefined}
+          aria-activedescendant={
+            showSuggestions && activeSuggestion >= 0
+              ? getSuggestionItemId(activeSuggestion)
+              : undefined
+          }
+          aria-describedby={`${statusId}${queryError ? ` ${errorId}` : ''}`}
+          aria-busy={queryLoading}
           className={`w-full bg-gray-800/80 border text-[11px] font-mono rounded-md px-3 py-2 text-gray-200 placeholder-gray-600 resize-none outline-none transition-colors ${
             queryError
               ? 'border-red-700 focus:border-red-500'
@@ -311,36 +384,44 @@ export const QueryBar: React.FC = () => {
           }`}
           spellCheck={false}
         />
+
         {/* Syntax hint for ORP-QL */}
         {queryMode === 'structured' && query.length === 0 && (
-          <div className="absolute right-2 bottom-2 text-[9px] text-gray-600 pointer-events-none">
+          <div className="absolute right-2 bottom-2 text-[9px] text-gray-600 pointer-events-none" aria-hidden="true">
             ⌘↵ to run
           </div>
         )}
 
-        {/* Suggestions dropdown */}
+        {/* Suggestions listbox */}
         {showSuggestions && suggestions.length > 0 && (
           <div
             ref={suggestionsRef}
+            id={listboxId}
+            role="listbox"
+            aria-label={`${suggestions.length} autocomplete suggestion${suggestions.length !== 1 ? 's' : ''}`}
             className="absolute left-0 top-full mt-1 z-50 w-full rounded-md border border-gray-700 bg-gray-900 shadow-xl overflow-hidden"
           >
             {suggestions.map((s, i) => (
-              <button
+              <div
                 key={s}
+                id={getSuggestionItemId(i)}
+                role="option"
+                aria-selected={i === activeSuggestion}
                 onMouseDown={(e) => {
                   e.preventDefault();
                   setQuery(s);
                   setShowSuggestions(false);
+                  setActiveSuggestion(-1);
                   inputRef.current?.focus();
                 }}
-                className={`w-full text-left px-3 py-1.5 text-[10px] font-mono transition-colors ${
+                className={`w-full text-left px-3 py-1.5 text-[10px] font-mono transition-colors cursor-pointer ${
                   i === activeSuggestion
                     ? 'bg-blue-900/50 text-blue-200'
                     : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200'
                 }`}
               >
                 {s}
-              </button>
+              </div>
             ))}
           </div>
         )}
@@ -351,37 +432,48 @@ export const QueryBar: React.FC = () => {
         <button
           onClick={handleSubmit}
           disabled={!query.trim() || queryLoading}
+          aria-label={queryLoading ? 'Executing query, please wait' : 'Execute query (Ctrl+Enter)'}
+          aria-busy={queryLoading}
           className="flex items-center gap-1.5 bg-blue-700 hover:bg-blue-600 disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed text-white text-[11px] font-medium px-3 py-1.5 rounded-md transition-colors"
         >
           {queryLoading ? (
             <>
-              <span className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+              <span className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" aria-hidden="true" />
               Running…
             </>
           ) : (
-            <>Execute <span className="text-[9px] text-blue-300 ml-0.5">⌘↵</span></>
+            <>Execute <span className="text-[9px] text-blue-300 ml-0.5" aria-hidden="true">⌘↵</span></>
           )}
         </button>
+
         {queryError && (
-          <span className="text-[10px] text-red-400 truncate">{queryError}</span>
-        )}
-        {!queryError && queryResults.length > 0 && !queryLoading && (
-          <span className="text-[10px] text-gray-500">
-            {queryResults.length} row{queryResults.length !== 1 ? 's' : ''}
+          <span id={errorId} className="text-[10px] text-red-400 truncate" role="alert">
+            {queryError}
           </span>
         )}
+
+        {/* Results count — aria-live so screen readers hear the update */}
+        <span
+          id={statusId}
+          aria-live="polite"
+          aria-atomic="true"
+          className={`text-[10px] text-gray-500 ${statusText ? '' : 'sr-only'}`}
+        >
+          {statusText}
+        </span>
       </div>
 
       {/* Results table */}
       {queryResults.length > 0 && (
         <div className="mt-1 rounded-md border border-gray-800 overflow-hidden">
           <div className="flex items-center justify-between px-3 py-1 bg-gray-900 border-b border-gray-800">
-            <span className="text-[10px] text-gray-500">Results</span>
+            <h3 className="text-[10px] text-gray-500">Results</h3>
             <button
               onClick={() => setQueryResults([])}
+              aria-label="Clear query results"
               className="text-[9px] text-gray-600 hover:text-gray-400 transition-colors"
             >
-              ✕
+              <span aria-hidden="true">✕</span>
             </button>
           </div>
           <ResultsTable results={queryResults} />

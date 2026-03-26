@@ -1,4 +1,4 @@
-import React, { useMemo, useCallback, useState } from 'react';
+import React, { useMemo, useCallback, useState, useRef, useEffect } from 'react';
 import DeckGL from '@deck.gl/react';
 import {
   ScatterplotLayer,
@@ -21,7 +21,6 @@ function shipColor(speed: number, selected: boolean): [number, number, number, n
 }
 
 function congestionColor(congestion: number): [number, number, number, number] {
-  // 0 = green, 0.5 = amber, 1 = red
   if (congestion > 0.75) return [220, 50, 50, 200];
   if (congestion > 0.4) return [255, 165, 0, 180];
   return [50, 180, 100, 160];
@@ -52,15 +51,13 @@ function getPointCoords(d: Entity): [number, number] {
   return [0, 0];
 }
 
-// Build polygon from WeatherSystem geometry or create approximate circle
 function getWeatherPolygon(d: Entity): number[][] {
   if (d.geometry?.type === 'Polygon') {
     return (d.geometry.coordinates as number[][][])[0] ?? [];
   }
-  // Fallback: generate circle around point
   if (d.geometry?.type === 'Point') {
     const [lon, lat] = d.geometry.coordinates as number[];
-    const r = ((d.properties.radius_km as number) ?? 100) / 111; // rough degrees
+    const r = ((d.properties.radius_km as number) ?? 100) / 111;
     const pts: number[][] = [];
     for (let i = 0; i <= 32; i++) {
       const angle = (i / 32) * 2 * Math.PI;
@@ -70,6 +67,10 @@ function getWeatherPolygon(d: Entity): number[][] {
   }
   return [];
 }
+
+// How many degrees to pan per keypress and zoom per keypress
+const PAN_DELTA = 0.5;
+const ZOOM_DELTA = 0.5;
 
 export const MapView: React.FC = () => {
   const entities = useAppStore((s) => s.entities);
@@ -95,15 +96,17 @@ export const MapView: React.FC = () => {
     bearing: 0,
   });
 
+  // Track whether the map container is focused for keyboard controls
+  const [mapFocused, setMapFocused] = useState(false);
+  const mapWrapperRef = useRef<HTMLDivElement>(null);
+
   const allEntities = useMemo(() => Array.from(entities.values()), [entities]);
 
   const hasValidGeometry = (e: Entity): boolean => {
     if (!e.geometry) return false;
     if (e.geometry.type === 'Point' && Array.isArray(e.geometry.coordinates)) {
       const [lon, lat] = e.geometry.coordinates as number[];
-      // Filter out entities at [0,0] (likely missing geometry)
       if (lon === 0 && lat === 0) return false;
-      // Validate coordinate ranges
       if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return false;
       return true;
     }
@@ -147,10 +150,65 @@ export const MapView: React.FC = () => {
     }
   }, []);
 
+  // ── Keyboard navigation for map ─────────────────────────────────────────
+  const handleMapKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      // Only intercept when map is focused and no modifier keys that might be
+      // browser shortcuts (Ctrl/Meta).
+      if (e.ctrlKey || e.metaKey) return;
+
+      let handled = false;
+
+      switch (e.key) {
+        case 'ArrowLeft':
+          setViewState((vs) => ({ ...vs, longitude: vs.longitude - PAN_DELTA }));
+          handled = true;
+          break;
+        case 'ArrowRight':
+          setViewState((vs) => ({ ...vs, longitude: vs.longitude + PAN_DELTA }));
+          handled = true;
+          break;
+        case 'ArrowUp':
+          setViewState((vs) => ({ ...vs, latitude: Math.min(85, vs.latitude + PAN_DELTA) }));
+          handled = true;
+          break;
+        case 'ArrowDown':
+          setViewState((vs) => ({ ...vs, latitude: Math.max(-85, vs.latitude - PAN_DELTA) }));
+          handled = true;
+          break;
+        case '+':
+        case '=':
+          setViewState((vs) => ({ ...vs, zoom: Math.min(22, vs.zoom + ZOOM_DELTA) }));
+          handled = true;
+          break;
+        case '-':
+          setViewState((vs) => ({ ...vs, zoom: Math.max(0, vs.zoom - ZOOM_DELTA) }));
+          handled = true;
+          break;
+        case 'Home':
+          // Reset to default view
+          setViewState({
+            longitude: mapCenter[0],
+            latitude: mapCenter[1],
+            zoom: mapZoom,
+            pitch: 0,
+            bearing: 0,
+          });
+          handled = true;
+          break;
+      }
+
+      if (handled) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    },
+    [mapCenter, mapZoom]
+  );
+
   const layers = useMemo(() => {
     const result = [];
 
-    // ── 1. Weather PolygonLayer (rendered first, behind ships) ──
     if (showWeatherLayer) {
       result.push(
         new PolygonLayer({
@@ -176,7 +234,6 @@ export const MapView: React.FC = () => {
       );
     }
 
-    // ── 2. Port ScatterplotLayer (size by TEU, color by congestion) ──
     result.push(
       new ScatterplotLayer({
         id: 'port-layer',
@@ -205,7 +262,6 @@ export const MapView: React.FC = () => {
       })
     );
 
-    // ── 3. Ship Track PathLayer (last 50 positions) ──
     if (showShipTracksLayer) {
       result.push(
         new PathLayer({
@@ -240,7 +296,6 @@ export const MapView: React.FC = () => {
       );
     }
 
-    // ── 4. Ship IconLayer (course angle, speed color) ──
     result.push(
       new ScatterplotLayer({
         id: 'ship-layer',
@@ -270,13 +325,9 @@ export const MapView: React.FC = () => {
           getRadius: [selectedEntityId],
           getLineColor: [selectedEntityId],
         },
-
       })
     );
 
-    // ── 5. Density overlay (heatmap-style ScatterplotLayer, toggle-able) ──
-    // Note: @deck.gl/aggregation-layers (HeatmapLayer) is not bundled; we approximate
-    // density with a large-radius, low-opacity ScatterplotLayer.
     if (showHeatmapLayer && ships.length > 0) {
       result.push(
         new ScatterplotLayer({
@@ -310,11 +361,30 @@ export const MapView: React.FC = () => {
   ]);
 
   return (
-    <div className="relative flex-1 overflow-hidden">
+    <div
+      ref={mapWrapperRef}
+      className="relative flex-1 overflow-hidden"
+      // Accessible label and role for screen readers
+      role="application"
+      aria-label="Interactive map showing maritime entities — ships, ports, and weather systems. Use arrow keys to pan, + and - to zoom, Home to reset view."
+      // Make the map focusable so keyboard events work
+      tabIndex={0}
+      onKeyDown={handleMapKeyDown}
+      onFocus={() => setMapFocused(true)}
+      onBlur={() => setMapFocused(false)}
+    >
+      {/* Keyboard focus ring indicator */}
+      {mapFocused && (
+        <div
+          className="pointer-events-none absolute inset-0 z-50 ring-2 ring-blue-500 ring-inset"
+          aria-hidden="true"
+        />
+      )}
+
       <DeckGL
         viewState={viewState}
         onViewStateChange={(e) => setViewState(e.viewState as typeof viewState)}
-        controller={{ dragRotate: false }}
+        controller={{ dragRotate: false, keyboard: false /* we handle keyboard ourselves */ }}
         layers={layers}
         getCursor={({ isDragging, isHovering }) =>
           isDragging ? 'grabbing' : isHovering ? 'pointer' : 'grab'
@@ -327,55 +397,98 @@ export const MapView: React.FC = () => {
         />
       </DeckGL>
 
-      {/* Tooltip */}
+      {/* Tooltip — announced via existing hover; not separately announced as it's supplemental */}
       {tooltip && (
         <div
           className="pointer-events-none absolute z-50 rounded bg-gray-900/95 border border-gray-700 px-2.5 py-1.5 text-xs text-gray-100 shadow-lg whitespace-nowrap"
           style={{ left: tooltip.x + 12, top: tooltip.y - 10 }}
+          aria-hidden="true"
         >
           {tooltip.content}
         </div>
       )}
 
-      {/* Map Legend */}
-      <div className="absolute bottom-12 right-3 z-10 rounded-md bg-gray-900/90 border border-gray-700 p-2.5 text-[10px] text-gray-400 space-y-1 backdrop-blur-sm">
-        <div className="text-gray-300 font-semibold text-[11px] mb-1.5">Ships</div>
-        <div className="flex items-center gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-green-500 inline-block" />
-          <span>&lt; 10 kn</span>
+      {/* Keyboard instructions — visible only on focus */}
+      {mapFocused && (
+        <div
+          className="absolute top-3 left-3 z-10 rounded-md bg-gray-900/90 border border-blue-700 p-2 text-[10px] text-gray-300 backdrop-blur-sm"
+          aria-live="polite"
+          role="status"
+        >
+          <span className="font-semibold text-blue-300">Keyboard controls:</span>{' '}
+          Arrow keys to pan · + / − to zoom · Home to reset
         </div>
-        <div className="flex items-center gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-blue-400 inline-block" />
-          <span>10–20 kn</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-orange-400 inline-block" />
-          <span>&gt; 20 kn</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block" />
-          <span>Selected</span>
-        </div>
-        <div className="border-t border-gray-700 mt-1.5 pt-1.5 text-gray-300 font-semibold text-[11px]">
-          Ports
-        </div>
-        <div className="flex items-center gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-green-400 inline-block opacity-80" />
-          <span>Low congestion</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-orange-400 inline-block opacity-80" />
-          <span>Medium</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block opacity-80" />
-          <span>High</span>
-        </div>
+      )}
+
+      {/* Map Legend — aria-hidden since it duplicates tooltip info */}
+      <div
+        className="absolute bottom-12 right-3 z-10 rounded-md bg-gray-900/90 border border-gray-700 p-2.5 text-[10px] text-gray-400 space-y-1 backdrop-blur-sm"
+        aria-label="Map legend"
+        role="img"
+      >
+        <div className="text-gray-300 font-semibold text-[11px] mb-1.5" aria-hidden="true">Ships</div>
+        <dl className="space-y-1">
+          <div className="flex items-center gap-1.5">
+            <dt className="sr-only">Green dot</dt>
+            <dd className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-green-500 inline-block" aria-hidden="true" />
+              <span>&lt; 10 kn</span>
+            </dd>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <dt className="sr-only">Blue dot</dt>
+            <dd className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-blue-400 inline-block" aria-hidden="true" />
+              <span>10–20 kn</span>
+            </dd>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <dt className="sr-only">Orange dot</dt>
+            <dd className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-orange-400 inline-block" aria-hidden="true" />
+              <span>&gt; 20 kn</span>
+            </dd>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <dt className="sr-only">Red dot</dt>
+            <dd className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block" aria-hidden="true" />
+              <span>Selected</span>
+            </dd>
+          </div>
+          <div className="border-t border-gray-700 mt-1.5 pt-1.5 text-gray-300 font-semibold text-[11px]" aria-hidden="true">
+            Ports
+          </div>
+          <div className="flex items-center gap-1.5">
+            <dt className="sr-only">Green port dot</dt>
+            <dd className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-green-400 inline-block opacity-80" aria-hidden="true" />
+              <span>Low congestion</span>
+            </dd>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <dt className="sr-only">Orange port dot</dt>
+            <dd className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-orange-400 inline-block opacity-80" aria-hidden="true" />
+              <span>Medium</span>
+            </dd>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <dt className="sr-only">Red port dot</dt>
+            <dd className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block opacity-80" aria-hidden="true" />
+              <span>High</span>
+            </dd>
+          </div>
+        </dl>
       </div>
 
       {/* Entity count badge */}
-      <div className="absolute top-3 right-3 z-10">
-        <span className="rounded bg-gray-900/80 border border-gray-700 px-2 py-1 text-[10px] text-gray-400">
+      <div className="absolute top-3 right-3 z-10" aria-live="polite" aria-atomic="true">
+        <span
+          className="rounded bg-gray-900/80 border border-gray-700 px-2 py-1 text-[10px] text-gray-400"
+          aria-label={`${ships.length} ships and ${ports.length} ports loaded on map`}
+        >
           {ships.length} ships · {ports.length} ports
         </span>
       </div>

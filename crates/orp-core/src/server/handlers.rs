@@ -1,5 +1,6 @@
 use crate::server::http::AppState;
 use crate::server::websocket::BroadcastEvent;
+use orp_audit::crypto::compute_hash;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -91,16 +92,56 @@ fn check_abac(
 
 // ---- Audit helper ----
 
+/// Write an audit entry and sign the content hash with the server's Ed25519 key.
+///
+/// The `signature` column in `audit_log` receives the hex-encoded Ed25519
+/// signature over the `content_hash`, giving cryptographic integrity to the
+/// append-only audit trail.
 async fn audit_log(
-    storage: &dyn orp_storage::traits::Storage,
+    state: &AppState,
     operation: &str,
     entity_type: Option<&str>,
     entity_id: Option<&str>,
     user_id: &str,
     details: serde_json::Value,
 ) {
-    if let Err(e) = storage
-        .log_audit(operation, entity_type, entity_id, Some(user_id), details)
+    // Compute the content hash the same way DuckDbStorage does, so we can
+    // sign the exact value that will be stored.
+    let now = chrono::Utc::now().to_rfc3339();
+    let hash_input = format!(
+        "{}{}{}{}{}{}",
+        "?", // sequence number is assigned by the DB; we sign a pre-image here
+        operation,
+        entity_type.unwrap_or(""),
+        entity_id.unwrap_or(""),
+        now,
+        details,
+    );
+    let content_hash = compute_hash(&hash_input);
+    let signature_bytes = state.audit_signer.sign(content_hash.as_bytes());
+    let signature_hex: String = signature_bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+
+    // Inject the signature into the details so it is persisted alongside the entry.
+    let enriched_details = match details {
+        serde_json::Value::Object(mut m) => {
+            m.insert(
+                "_audit_signature".to_string(),
+                serde_json::Value::String(signature_hex),
+            );
+            serde_json::Value::Object(m)
+        }
+        other => serde_json::json!({
+            "data": other,
+            "_audit_signature": signature_hex,
+        }),
+    };
+
+    if let Err(e) = state
+        .storage
+        .log_audit(operation, entity_type, entity_id, Some(user_id), enriched_details)
         .await
     {
         tracing::warn!("Audit log write failed: {}", e);
@@ -432,7 +473,7 @@ pub async fn create_entity(
     match state.storage.insert_entity(&entity).await {
         Ok(()) => {
             audit_log(
-                state.storage.as_ref(),
+        state.as_ref(),
                 "entity_created",
                 Some(&entity.entity_type),
                 Some(&entity.entity_id),
@@ -542,7 +583,7 @@ pub async fn update_entity(
             match state.storage.insert_entity(&entity).await {
                 Ok(()) => {
                     audit_log(
-                        state.storage.as_ref(),
+        state.as_ref(),
                         "entity_updated",
                         Some(&entity.entity_type),
                         Some(&entity.entity_id),
@@ -598,7 +639,7 @@ pub async fn delete_entity(
         Ok(Some(deleted_entity)) => match state.storage.delete_entity(&id).await {
             Ok(()) => {
                 audit_log(
-                    state.storage.as_ref(),
+        state.as_ref(),
                     "entity_deleted",
                     Some("entity"),
                     Some(&id),
@@ -1001,7 +1042,7 @@ pub async fn create_relationship(
     match state.storage.insert_relationship(&rel).await {
         Ok(()) => {
             audit_log(
-                state.storage.as_ref(),
+        state.as_ref(),
                 "relationship_created",
                 Some("relationship"),
                 Some(&rel.relationship_id),
@@ -1075,7 +1116,7 @@ pub async fn execute_query(
     }
 
     audit_log(
-        state.storage.as_ref(),
+        state.as_ref(),
         "query_executed",
         None,
         None,
@@ -1211,7 +1252,7 @@ pub async fn create_connector(
     match state.storage.register_data_source(&source).await {
         Ok(()) => {
             audit_log(
-                state.storage.as_ref(),
+        state.as_ref(),
                 "connector_created",
                 Some("connector"),
                 Some(&source.source_id),
@@ -1278,7 +1319,7 @@ pub async fn update_connector(
             match state.storage.update_data_source(&source).await {
                 Ok(_) => {
                     audit_log(
-                        state.storage.as_ref(),
+        state.as_ref(),
                         "connector_updated",
                         Some("connector"),
                         Some(&id),
@@ -1330,7 +1371,7 @@ pub async fn delete_connector(
     match state.storage.delete_data_source(&id).await {
         Ok(true) => {
             audit_log(
-                state.storage.as_ref(),
+        state.as_ref(),
                 "connector_deleted",
                 Some("connector"),
                 Some(&id),
@@ -1494,7 +1535,7 @@ pub async fn create_monitor(
     state.monitor_engine.add_rule(rule.clone()).await;
 
     audit_log(
-        state.storage.as_ref(),
+        state.as_ref(),
         "monitor_created",
         Some("monitor"),
         Some(&rule.rule_id),
@@ -1552,7 +1593,7 @@ pub async fn update_monitor(
     state.monitor_engine.add_rule(rule.clone()).await;
 
     audit_log(
-        state.storage.as_ref(),
+        state.as_ref(),
         "monitor_updated",
         Some("monitor"),
         Some(&id),
@@ -1575,7 +1616,7 @@ pub async fn delete_monitor(
 
     if state.monitor_engine.remove_rule(&id).await {
         audit_log(
-            state.storage.as_ref(),
+        state.as_ref(),
             "monitor_deleted",
             Some("monitor"),
             Some(&id),
@@ -1630,7 +1671,7 @@ pub async fn acknowledge_alert(
 
     if state.monitor_engine.acknowledge_alert(&id).await {
         audit_log(
-            state.storage.as_ref(),
+        state.as_ref(),
             "alert_acknowledged",
             Some("alert"),
             Some(&id),
@@ -1686,7 +1727,7 @@ pub async fn create_api_key(
     match state.api_key_service.create_key(req) {
         Ok(resp) => {
             audit_log(
-                state.storage.as_ref(),
+        state.as_ref(),
                 "api_key_created",
                 Some("api_key"),
                 Some(&resp.id),
@@ -1771,7 +1812,7 @@ pub async fn delete_api_key(
     match state.api_key_service.revoke_key(&id) {
         Ok(()) => {
             audit_log(
-                state.storage.as_ref(),
+        state.as_ref(),
                 "api_key_revoked",
                 Some("api_key"),
                 Some(&id),

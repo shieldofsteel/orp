@@ -1121,106 +1121,12 @@ impl Storage for DuckDbStorage {
         &self,
         query_str: &str,
     ) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
-        // Parse a simplified graph query format:
-        //   source_type->rel_type->target_type  (e.g. Ship->HEADING_TO->Port)
-        //   or source_id->*->target_type (traverse from specific entity)
-        //   or a raw relationship traversal query
-        //
-        // For general use, perform a recursive CTE over the relationships table
-        // returning connected entities up to 3 hops.
-        let conn = self.conn.lock().unwrap();
-
-        // Try to parse as "entity_id:max_hops" for generic graph exploration
-        let parts: Vec<&str> = query_str.splitn(2, ':').collect();
-        let (start_id, max_hops) = if parts.len() == 2 {
-            let hops: usize = parts[1].parse().unwrap_or(3);
-            (parts[0], hops)
-        } else {
-            (query_str.trim(), 3usize)
-        };
-
-        let sql = r#"
-            WITH RECURSIVE graph_walk AS (
-              -- Base: start from the given entity
-              SELECT
-                r.relationship_id,
-                r.source_entity_id,
-                r.target_entity_id,
-                r.relationship_type,
-                r.properties,
-                r.confidence,
-                1 AS depth,
-                [r.relationship_id] AS visited
-              FROM relationships r
-              WHERE r.is_active = TRUE
-                AND (r.source_entity_id = ? OR r.target_entity_id = ?)
-
-              UNION ALL
-
-              SELECT
-                r2.relationship_id,
-                r2.source_entity_id,
-                r2.target_entity_id,
-                r2.relationship_type,
-                r2.properties,
-                r2.confidence,
-                gw.depth + 1,
-                list_append(gw.visited, r2.relationship_id)
-              FROM relationships r2
-              JOIN graph_walk gw
-                ON (r2.source_entity_id = gw.target_entity_id
-                    OR r2.target_entity_id = gw.source_entity_id)
-              WHERE r2.is_active = TRUE
-                AND gw.depth < ?
-                AND NOT list_contains(gw.visited, r2.relationship_id)
-            )
-            SELECT DISTINCT
-              gw.source_entity_id,
-              gw.target_entity_id,
-              gw.relationship_type,
-              gw.properties,
-              gw.confidence,
-              gw.depth
-            FROM graph_walk gw
-            ORDER BY gw.depth
-            LIMIT 1000
-        "#;
-
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-        let mut rows = stmt
-            .query(params![start_id, start_id, max_hops as i64])
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-
-        let mut results = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
-        {
-            let source: String = row.get(0).unwrap_or_default();
-            let target: String = row.get(1).unwrap_or_default();
-            let rel_type: String = row.get(2).unwrap_or_default();
-            let props_str: String = row.get::<_, String>(3).unwrap_or_default();
-            let confidence: f32 = row.get::<_, f32>(4).unwrap_or(1.0);
-            let depth: i32 = row.get::<_, i32>(5).unwrap_or(0);
-
-            let properties: JsonValue =
-                serde_json::from_str(&props_str).unwrap_or(JsonValue::Null);
-
-            let mut result_row = HashMap::new();
-            result_row.insert("source_entity_id".to_string(), JsonValue::String(source));
-            result_row.insert("target_entity_id".to_string(), JsonValue::String(target));
-            result_row.insert("relationship_type".to_string(), JsonValue::String(rel_type));
-            result_row.insert("properties".to_string(), properties);
-            result_row.insert("confidence".to_string(), serde_json::json!(confidence));
-            result_row.insert("depth".to_string(), serde_json::json!(depth));
-            results.push(result_row);
-        }
-
-        Ok(results)
+        // Delegate to GraphEngine which maintains dedicated graph tables and
+        // supports Cypher-like syntax, raw SQL, and multi-hop traversal against
+        // graph_nodes / graph_edges views.
+        let graph = crate::graph_engine::GraphEngine::new(Arc::clone(&self.conn))?;
+        graph.cypher_query(query_str)
     }
-
     /// BFS path search up to `max_hops` using a recursive CTE over the relationships table.
     async fn path_query(
         &self,
@@ -2061,7 +1967,44 @@ mod tests {
         s.begin_transaction().await.unwrap();
         s.insert_entity(&make_entity("tx1", "ship")).await.unwrap();
         s.commit_transaction().await.unwrap();
+        // After COMMIT the entity must be visible
         assert!(s.get_entity("tx1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_18b_transactions_rollback() {
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        // Insert and commit a baseline entity so we know the DB is functional
+        s.insert_entity(&make_entity("baseline", "ship"))
+            .await
+            .unwrap();
+
+        s.begin_transaction().await.unwrap();
+        s.insert_entity(&make_entity("rolled-back", "ship"))
+            .await
+            .unwrap();
+        // The entity should be visible within the transaction before rollback
+        assert!(s.get_entity("rolled-back").await.unwrap().is_some());
+        s.rollback_transaction().await.unwrap();
+        // After ROLLBACK the entity must NOT be visible
+        assert!(
+            s.get_entity("rolled-back").await.unwrap().is_none(),
+            "Entity inserted within a rolled-back transaction must not persist"
+        );
+        // Baseline entity should still be present
+        assert!(s.get_entity("baseline").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_18c_nested_transactions_not_supported() {
+        // DuckDB does not support nested transactions — calling BEGIN twice should error
+        let s = DuckDbStorage::new_in_memory().unwrap();
+        s.begin_transaction().await.unwrap();
+        let result = s.begin_transaction().await;
+        // Expect an error; clean up regardless
+        let is_err = result.is_err();
+        let _ = s.rollback_transaction().await;
+        assert!(is_err, "Nested BEGIN should return an error in DuckDB");
     }
 
     #[tokio::test]

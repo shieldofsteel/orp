@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 orp-proto = { path = "../orp-proto" }
 orp-storage = { path = "../orp-storage" }
+orp-audit = { path = "../orp-audit" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

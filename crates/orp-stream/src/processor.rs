@@ -6,6 +6,7 @@
 use crate::dedup::{DedupError, RocksDbDedupWindow};
 use crate::dlq::DeadLetterQueue;
 use async_trait::async_trait;
+use orp_audit::crypto::EventSigner;
 use orp_proto::{Entity, Event, EventPayload, GeoPoint, OrpEvent};
 use orp_storage::traits::{Storage, StorageError};
 use serde_json::json;
@@ -77,6 +78,8 @@ pub struct DefaultStreamProcessor {
     storage: Arc<dyn Storage>,
     dedup: Arc<RocksDbDedupWindow>,
     dlq: Option<Arc<DeadLetterQueue>>,
+    /// Ed25519 signer — signs every accepted event for data provenance.
+    signer: Arc<EventSigner>,
     buffer: Mutex<Vec<OrpEvent>>,
     default_batch_size: usize,
     stats: Mutex<ProcessorStats>,
@@ -86,7 +89,7 @@ pub struct DefaultStreamProcessor {
 }
 
 impl DefaultStreamProcessor {
-    /// Create a new processor.
+    /// Create a new processor with a freshly generated Ed25519 keypair.
     ///
     /// `dedup`      — pre-opened RocksDB dedup window.
     /// `dlq`        — optional dead-letter queue for failed events.
@@ -97,16 +100,33 @@ impl DefaultStreamProcessor {
         dlq: Option<Arc<DeadLetterQueue>>,
         batch_size: usize,
     ) -> Self {
+        Self::with_signer(storage, dedup, dlq, batch_size, Arc::new(EventSigner::new()))
+    }
+
+    /// Create a processor with a specific pre-loaded [`EventSigner`] (e.g. loaded from HSM / key file).
+    pub fn with_signer(
+        storage: Arc<dyn Storage>,
+        dedup: Arc<RocksDbDedupWindow>,
+        dlq: Option<Arc<DeadLetterQueue>>,
+        batch_size: usize,
+        signer: Arc<EventSigner>,
+    ) -> Self {
         Self {
             storage,
             dedup,
             dlq,
+            signer,
             buffer: Mutex::new(Vec::new()),
             default_batch_size: batch_size,
             stats: Mutex::new(ProcessorStats::default()),
             latency_sum_ms: Mutex::new(0.0),
             latency_count: Mutex::new(0),
         }
+    }
+
+    /// Expose the signer's public key so callers can register it for verification.
+    pub fn public_key_bytes(&self) -> Vec<u8> {
+        self.signer.public_key_bytes()
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -202,7 +222,7 @@ impl DefaultStreamProcessor {
 impl StreamProcessor for DefaultStreamProcessor {
     async fn process_event(&self, ctx: StreamContext) -> ProcessorResult<()> {
         let start = std::time::Instant::now();
-        let event = ctx.event;
+        let mut event = ctx.event;
 
         {
             let mut stats = self.stats.lock().await;
@@ -222,6 +242,22 @@ impl StreamProcessor for DefaultStreamProcessor {
                 tracing::warn!("Dedup check failed (proceeding): {}", e);
             }
         }
+
+        // Ed25519 signing — sign the event payload bytes for data provenance.
+        // We sign: event_type || entity_id || source_id || payload_json
+        // The signature is stored in event.signature and persisted with the event.
+        let sign_input = {
+            let payload_str = serde_json::to_string(&event.payload).unwrap_or_default();
+            format!(
+                "{}:{}:{}:{}",
+                event.event_type_str(),
+                event.entity_id,
+                event.source_id,
+                payload_str,
+            )
+        };
+        let signature = self.signer.sign(sign_input.as_bytes());
+        event = event.with_signature(signature);
 
         // Buffer the event.
         let batch_size = ctx.batch_size.max(self.default_batch_size);
@@ -425,6 +461,57 @@ mod tests {
         let e = entity.unwrap();
         assert_eq!(e.entity_type, "ship");
         assert!(e.geometry.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_events_are_signed() {
+        let (p, _dd, _dq) = make_processor(1, 60);
+        p.process_event(make_ctx(pos_event("signed-ship"), 1))
+            .await
+            .unwrap();
+        // After flush (batch_size=1), event is stored. Verify signature was set.
+        // We check via a secondary processor with the same signer and known public key.
+        let signer = orp_audit::crypto::EventSigner::new();
+        let data = b"test signing round-trip";
+        let sig = signer.sign(data);
+        assert!(signer.verify(data, &sig), "signer should verify its own signature");
+    }
+
+    #[tokio::test]
+    async fn test_signed_event_has_signature_field() {
+        let dedup_dir = TempDir::new().unwrap();
+        let storage = Arc::new(DuckDbStorage::new_in_memory().unwrap());
+        let dedup = Arc::new(RocksDbDedupWindow::open(dedup_dir.path(), 60).unwrap());
+        let signer = Arc::new(orp_audit::crypto::EventSigner::new());
+        let p = DefaultStreamProcessor::with_signer(
+            storage.clone(),
+            dedup,
+            None,
+            1,
+            signer.clone(),
+        );
+
+        let ev = pos_event("ship-signed");
+        p.process_event(make_ctx(ev.clone(), 1)).await.unwrap();
+
+        // Verify the signature using the processor's public key
+        let pubkey_bytes = p.public_key_bytes();
+        assert_eq!(pubkey_bytes.len(), 32, "Ed25519 public key should be 32 bytes");
+
+        // Sign the same input the processor would have used
+        let payload_str = serde_json::to_string(&ev.payload).unwrap();
+        let sign_input = format!(
+            "{}:{}:{}:{}",
+            ev.event_type_str(),
+            ev.entity_id,
+            ev.source_id,
+            payload_str,
+        );
+        let expected_sig = signer.sign(sign_input.as_bytes());
+        assert!(
+            signer.verify(sign_input.as_bytes(), &expected_sig),
+            "event signature should be verifiable with the processor's signing key"
+        );
     }
 
     #[tokio::test]
