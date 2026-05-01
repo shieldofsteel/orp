@@ -11,7 +11,7 @@
 //!   2. Look up the [`ApiKeyRecord`] by `id` in the [`KeyStore`].
 //!   3. `argon2id.verify_password(plaintext, &record.phc_hash)`.
 //!
-//! Storage is delegated to the [`KeyStore`](crate::keystore::KeyStore)
+//! Storage is delegated to the [`KeyStore`](crate::keystore)
 //! trait — `InMemoryKeyStore` for tests and dev mode, `DuckDbKeyStore`
 //! for production. The previous SHA-256-unsalted scheme + global
 //! `HashMap<key_hash, record>` is gone; nothing in this module touches
@@ -529,17 +529,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limit_exceeded() {
+        // Use limit=1 + 2 calls instead of limit=2 + 3 calls. The rate
+        // limiter's window is 1 wall-clock second wide; on slow CI runners
+        // 3 await-bearing calls can straddle a window rollover and give a
+        // false negative. Two back-to-back calls land in the same window
+        // with much higher reliability while still exercising the same
+        // "exceeded" branch.
         let svc = test_service();
         let req = CreateApiKeyRequest {
-            rate_limit: Some(2), // only 2 req/s
+            rate_limit: Some(1),
             ..make_request()
         };
         let resp = svc.create_key(req).unwrap();
-
-        // First two should succeed
+        // First call in the window should succeed.
         svc.validate_key(&resp.api_key).await.unwrap();
-        svc.validate_key(&resp.api_key).await.unwrap();
-        // Third should be rate limited
+        // Second call in the same window must be rate-limited.
         let result = svc.validate_key(&resp.api_key).await;
         assert!(matches!(result, Err(ApiKeyError::RateLimitExceeded { .. })));
     }

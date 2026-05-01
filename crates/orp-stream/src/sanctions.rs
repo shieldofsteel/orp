@@ -268,7 +268,7 @@ impl SanctionsDatabase {
     /// Load from JSON format (see the private `JsonSanctionsFile` struct
     /// inside this module for the expected schema).
     ///
-    /// Like [`load_from_csv`], reads asynchronously and parses off-runtime.
+    /// Like [`Self::load_from_csv`], reads asynchronously and parses off-runtime.
     pub async fn load_from_json(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mtime = file_mtime_async(&path).await;
@@ -349,7 +349,7 @@ impl SanctionsDatabase {
 
     /// Reload from source file if the file has changed since last load.
     ///
-    /// I/O and parsing are off-runtime (see [`load_from_csv`]).
+    /// I/O and parsing are off-runtime (see [`Self::load_from_csv`]).
     pub async fn reload_if_changed(&self) -> anyhow::Result<bool> {
         let path = match &self.source_path {
             Some(p) => p.clone(),

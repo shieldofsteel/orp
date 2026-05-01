@@ -322,9 +322,12 @@ pub enum Commands {
     /// supplied — that the cert chain validates.
     ///
     /// Examples:
+    ///
+    /// ```text
     ///   orp doctor
     ///   orp doctor --config config.yaml
     ///   orp doctor --https-url https://orp.example.com/api/v1/health
+    /// ```
     ///
     /// Exit codes:
     ///   0   everything green or yellow (warnings only)
@@ -349,8 +352,11 @@ pub enum Commands {
     /// reviewer needs cryptographic proof the log was not tampered with.
     ///
     /// Examples:
+    ///
+    /// ```text
     ///   orp audit verify --db ~/.local/share/orp/orp.duckdb --public-key <hex>
     ///   orp audit export --db ~/.local/share/orp/orp.duckdb --out audit.jsonl
+    /// ```
     Audit {
         #[command(subcommand)]
         action: AuditAction,

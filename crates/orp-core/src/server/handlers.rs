@@ -103,8 +103,8 @@ fn check_abac(
 
 /// Append an entry to the immutable, hash-chained audit log.
 ///
-/// Routes through `state.audit_log` (a [`PersistentAuditLog`] in production,
-/// [`InMemoryAuditLog`] in tests / `--in-memory`). The trait object computes
+/// Routes through `state.audit_log` (a [`orp_audit::PersistentAuditLog`] in production,
+/// [`orp_audit::InMemoryAuditLog`] in tests / `--in-memory`). The trait object computes
 /// the content hash and Ed25519 signature over the exact persisted bytes,
 /// replacing the v0.2.0 path that signed a pre-image with a `?` placeholder
 /// for the sequence number — that signature was never verifiable.

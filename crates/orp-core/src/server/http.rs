@@ -47,8 +47,8 @@ pub struct AppState {
     #[allow(dead_code)]
     pub audit_signer: Arc<EventSigner>,
     /// Persistent (or in-memory) audit log. Production code uses
-    /// [`PersistentAuditLog`]; tests and `--in-memory` use
-    /// [`InMemoryAuditLog`]. Both implement [`AuditLogger`] so handlers
+    /// [`orp_audit::PersistentAuditLog`]; tests and `--in-memory` use
+    /// [`orp_audit::InMemoryAuditLog`]. Both implement [`orp_audit::AuditLogger`] so handlers
     /// only see the trait.
     pub audit_log: Arc<dyn AuditLogger>,
     pub broadcast_tx: broadcast::Sender<websocket::BroadcastEvent>,
@@ -264,7 +264,7 @@ pub struct ServerConfig {
     pub api_key_service: Arc<ApiKeyService>,
     /// Optional Ed25519 signer; a fresh one is generated if None.
     pub audit_signer: Option<Arc<EventSigner>>,
-    /// Optional pre-built audit logger. If `None` an [`InMemoryAuditLog`]
+    /// Optional pre-built audit logger. If `None` an [`orp_audit::InMemoryAuditLog`]
     /// using `audit_signer` is created — that's the path the v0.2.0 test
     /// harness relies on. `run_start` always passes a `PersistentAuditLog`.
     pub audit_log: Option<Arc<dyn AuditLogger>>,

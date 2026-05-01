@@ -233,7 +233,7 @@ impl QuantileEstimator {
 /// Per-feature streaming two-sided envelope anomaly flagger.
 ///
 /// Maintains a rolling window of the last `N=2048` samples per feature
-/// (via [`QuantileEstimator`]) and, on each call, computes a two-sided
+/// (via an internal `QuantileEstimator`) and, on each call, computes a two-sided
 /// envelope `[p0.25, p99.75]` directly from a sorted `BTreeMap` walk —
 /// no `clone`, no `sort_by` per call. A feature value is "outside" if it
 /// is `< low` or `> high` on that axis. The returned score is the maximum
