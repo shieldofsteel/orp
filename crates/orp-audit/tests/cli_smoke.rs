@@ -47,17 +47,14 @@ async fn write_then_read_back_via_cli_path() {
     // signature column is what the writer put there, not what the reader
     // generates.
     let vk = VerifyKey::from_hex(&pubkey_hex).unwrap();
-    let conn_arc = {
-        // Use the helper that the CLI walks: read_all + manual chain check.
-        let conn = duckdb::Connection::open(&path).unwrap();
-        let entries = PersistentAuditLog::read_all(&conn).unwrap();
-        for e in entries {
-            assert!(
-                vk.verify_signature(&e.content_hash, &e.signature),
-                "signature must verify for seq {}",
-                e.sequence_number
-            );
-        }
-    };
-    let _ = conn_arc;
+    // Use the helper that the CLI walks: read_all + manual chain check.
+    let conn = duckdb::Connection::open(&path).unwrap();
+    let entries = PersistentAuditLog::read_all(&conn).unwrap();
+    for e in entries {
+        assert!(
+            vk.verify_signature(&e.content_hash, &e.signature),
+            "signature must verify for seq {}",
+            e.sequence_number
+        );
+    }
 }
