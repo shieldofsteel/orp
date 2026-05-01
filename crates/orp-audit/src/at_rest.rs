@@ -41,7 +41,7 @@
 //! signer flow: load if present, generate + persist on first run.
 
 use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use rand::rngs::OsRng;
@@ -67,10 +67,14 @@ impl AtRestKey {
                 want: KEY_LEN,
             });
         }
-        let key = Key::<Aes256Gcm>::from_slice(bytes);
-        Ok(Self {
-            cipher: Aes256Gcm::new(key),
-        })
+        // Aes256Gcm::new_from_slice is the length-checked, non-deprecated
+        // path. The previous `Key::<…>::from_slice` is deprecated in newer
+        // generic-array (CI's Rust hard-fails on the deprecation lint).
+        let cipher = Aes256Gcm::new_from_slice(bytes).map_err(|_| AtRestError::BadKeyLength {
+            got: bytes.len(),
+            want: KEY_LEN,
+        })?;
+        Ok(Self { cipher })
     }
 
     /// Load the at-rest key from `path`, or generate a fresh 32-byte key
@@ -104,15 +108,18 @@ impl AtRestKey {
     /// Encrypt + base64-encode `plaintext` for storage in a VARCHAR column.
     /// Each call uses a fresh random nonce (stored alongside the ciphertext).
     pub fn seal(&self, plaintext: &[u8]) -> Result<String, AtRestError> {
-        let mut nonce = [0u8; NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce);
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        // `Nonce::from(arr)` uses the stable `From<[u8; 12]>` impl on
+        // GenericArray; the older `Nonce::from_slice` path is deprecated.
+        let nonce = Nonce::from(nonce_bytes);
         let ct = self
             .cipher
-            .encrypt(Nonce::from_slice(&nonce), plaintext)
+            .encrypt(&nonce, plaintext)
             .map_err(|_| AtRestError::EncryptFailed)?;
         let mut out = Vec::with_capacity(FORMAT_MAGIC.len() + NONCE_LEN + ct.len());
         out.extend_from_slice(FORMAT_MAGIC);
-        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ct);
         Ok(URL_SAFE_NO_PAD.encode(&out))
     }
@@ -132,9 +139,11 @@ impl AtRestKey {
         }
         let nonce_start = FORMAT_MAGIC.len();
         let ct_start = nonce_start + NONCE_LEN;
-        let nonce = Nonce::from_slice(&bytes[nonce_start..ct_start]);
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        nonce_bytes.copy_from_slice(&bytes[nonce_start..ct_start]);
+        let nonce = Nonce::from(nonce_bytes);
         self.cipher
-            .decrypt(nonce, &bytes[ct_start..])
+            .decrypt(&nonce, &bytes[ct_start..])
             .map_err(|_| AtRestError::DecryptFailed)
     }
 }
