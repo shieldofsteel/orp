@@ -1,3 +1,10 @@
+// media_servers exposes feature-gated entry points that the v0.4
+// follow-up wires to /api/v1/media/streams/{id}/whip|whep + RTMP/SRT
+// listener bootstrap. Until those wires land, clippy without `--tests`
+// reports dead_code on the public stub functions; allow at module
+// scope (same pattern as `server/notifications.rs`).
+#![allow(dead_code)]
+
 //! Server-mode media planes: WebRTC (WHIP/WHEP), RTMP, SRT.
 //!
 //! ORP's relay path goes ORP → outside (we proxy a registered upstream
@@ -80,7 +87,7 @@ pub async fn handle_whep_offer(
         // spawns the sans-IO loop. ~120 LOC. The skeleton compiles,
         // tests pin the FeatureDisabled contract, and downstream
         // consumers can write feature-gated wiring today.
-        return Err(MediaServerError::FeatureDisabled("media-webrtc"));
+        Err(MediaServerError::FeatureDisabled("media-webrtc"))
     }
     #[cfg(not(feature = "media-webrtc"))]
     {
@@ -97,7 +104,7 @@ pub async fn handle_whip_offer(
 ) -> Result<SdpAnswer, MediaServerError> {
     #[cfg(feature = "media-webrtc")]
     {
-        return Err(MediaServerError::FeatureDisabled("media-webrtc"));
+        Err(MediaServerError::FeatureDisabled("media-webrtc"))
     }
     #[cfg(not(feature = "media-webrtc"))]
     {
@@ -126,7 +133,7 @@ pub async fn run_rtmp_listener(
         // 5. for each video event: flv_demux() → Annex-B NALs
         // 6. broadcast::Sender::send to subscribers.
         let _ = addr;
-        return Err(MediaServerError::FeatureDisabled("media-rtmp"));
+        Err(MediaServerError::FeatureDisabled("media-rtmp"))
     }
     #[cfg(not(feature = "media-rtmp"))]
     {
@@ -158,7 +165,7 @@ pub async fn run_srt_listener(
         //   let (_binding, mut incoming) = b.bind(addr.port()).await?;
         //   while let Some(req) = incoming.next().await { spawn ingest task }
         let _ = addr;
-        return Err(MediaServerError::FeatureDisabled("media-srt"));
+        Err(MediaServerError::FeatureDisabled("media-srt"))
     }
     #[cfg(not(feature = "media-srt"))]
     {

@@ -1,3 +1,10 @@
+// Hooks module is fully implemented but not yet wired into the relay
+// path — `fire_hook` is intended to be called from MediaRegistry's
+// publish/read transitions in the v0.4 follow-up. Allow dead_code at
+// module scope so clippy doesn't fight the staged rollout, mirroring
+// the pattern in `server/notifications.rs`.
+#![allow(dead_code)]
+
 //! Sandboxed lifecycle hooks for the media subsystem.
 //!
 //! MediaMTX and go2rtc operators expect external commands to fire on
@@ -182,6 +189,19 @@ pub fn url_encode_for_env(s: &str) -> String {
     out
 }
 
+/// Bundle of static-ish parameters threaded through every hook fire.
+/// The hook subsystem is configured once at startup (workdir, audit
+/// logger, classification banner, the audit pubkey for logging) and
+/// only the per-event bits change per call. Grouping them satisfies
+/// clippy's `too_many_arguments` while keeping the call site readable.
+pub struct HookContext {
+    pub enabled: bool,
+    pub workdir: PathBuf,
+    pub audit: Arc<dyn AuditLogger>,
+    pub pubkey_hex: String,
+    pub classification_banner: String,
+}
+
 /// Fire one hook. Records to the audit chain regardless of outcome.
 ///
 /// `env_overrides` is the caller-supplied event-specific data
@@ -190,16 +210,24 @@ pub fn url_encode_for_env(s: &str) -> String {
 /// `ORP_AUDIT_PUBKEY_HEX`, `ORP_CLASSIFICATION_BANNER`) are added by
 /// this function.
 pub async fn fire_hook(
-    enabled: bool,
-    workdir: &Path,
+    ctx: &HookContext,
     hook: HookKind,
     spec: &HookSpec,
-    audit: Arc<dyn AuditLogger>,
     stream_id: &str,
-    pubkey_hex: &str,
-    classification_banner: &str,
     env_overrides: BTreeMap<String, String>,
 ) -> Result<HookResult, HookError> {
+    let HookContext {
+        enabled,
+        workdir,
+        audit,
+        pubkey_hex,
+        classification_banner,
+    } = ctx;
+    let enabled = *enabled;
+    let workdir = workdir.as_path();
+    let audit = audit.clone();
+    let pubkey_hex = pubkey_hex.as_str();
+    let classification_banner = classification_banner.as_str();
     if !enabled {
         return Err(HookError::Disabled);
     }
@@ -380,22 +408,28 @@ mod tests {
         }
     }
 
+    fn ctx(enabled: bool, audit: Arc<dyn AuditLogger>) -> HookContext {
+        HookContext {
+            enabled,
+            workdir: PathBuf::from("/tmp"),
+            audit,
+            pubkey_hex: "deadbeef".to_string(),
+            classification_banner: "UNCLASSIFIED".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn fire_hook_disabled_returns_disabled() {
         let audit: Arc<dyn AuditLogger> = Arc::new(orp_audit::InMemoryAuditLog::new());
         let result = fire_hook(
-            false,
-            Path::new("/tmp"),
+            &ctx(false, audit),
             HookKind::Ready,
             &HookSpec {
                 argv: vec!["/bin/true".to_string()],
                 restart: false,
                 timeout_ms: None,
             },
-            audit,
             "stream-1",
-            "deadbeef",
-            "UNCLASSIFIED",
             BTreeMap::new(),
         )
         .await;
@@ -406,18 +440,14 @@ mod tests {
     async fn fire_hook_rejects_empty_argv() {
         let audit: Arc<dyn AuditLogger> = Arc::new(orp_audit::InMemoryAuditLog::new());
         let result = fire_hook(
-            true,
-            Path::new("/tmp"),
+            &ctx(true, audit),
             HookKind::Ready,
             &HookSpec {
                 argv: vec![],
                 restart: false,
                 timeout_ms: None,
             },
-            audit,
             "stream-1",
-            "deadbeef",
-            "U",
             BTreeMap::new(),
         )
         .await;
@@ -428,8 +458,7 @@ mod tests {
     async fn fire_hook_rejects_shell_meta_in_argv() {
         let audit: Arc<dyn AuditLogger> = Arc::new(orp_audit::InMemoryAuditLog::new());
         let result = fire_hook(
-            true,
-            Path::new("/tmp"),
+            &ctx(true, audit),
             HookKind::Ready,
             &HookSpec {
                 argv: vec![
@@ -440,10 +469,7 @@ mod tests {
                 restart: false,
                 timeout_ms: None,
             },
-            audit,
             "stream-1",
-            "deadbeef",
-            "U",
             BTreeMap::new(),
         )
         .await;
@@ -455,18 +481,14 @@ mod tests {
     async fn fire_hook_runs_true_and_records_audit() {
         let audit: Arc<dyn AuditLogger> = Arc::new(orp_audit::InMemoryAuditLog::new());
         let result = fire_hook(
-            true,
-            Path::new("/tmp"),
+            &ctx(true, audit.clone()),
             HookKind::Ready,
             &HookSpec {
                 argv: vec!["/usr/bin/true".to_string()],
                 restart: false,
                 timeout_ms: Some(2_000),
             },
-            audit.clone(),
             "stream-1",
-            "deadbeef",
-            "UNCLASSIFIED",
             BTreeMap::new(),
         )
         .await;

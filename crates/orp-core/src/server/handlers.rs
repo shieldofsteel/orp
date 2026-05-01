@@ -1860,7 +1860,7 @@ async fn relay_rtsp_h264_response(
     // (the producer never sends those — it just closes tx on error and
     // the body sees graceful EOF).
     let body_stream =
-        tokio_stream::wrappers::ReceiverStream::new(rx).map(|b| Ok::<Bytes, std::io::Error>(b));
+        tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<Bytes, std::io::Error>);
     let body = Body::from_stream(body_stream);
 
     Response::builder()
@@ -3537,12 +3537,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rtsp_relay_reports_not_implemented() {
+    async fn test_rtsp_relay_returns_h264_byte_stream() {
+        // Post-v0.4 baseline: RTSP relay no longer reports
+        // 501 Not Implemented — `relay_rtsp_h264_response` spawns the
+        // retina client and streams Annex-B chunks back as
+        // Content-Type: video/h264. This test pins:
+        //   * Registration succeeds for a literal-IP rtsp:// source.
+        //   * GET /relay returns 200 OK with the right MIME (the body
+        //     itself comes from a connect to TEST-NET-3 which never
+        //     answers, so the body stream will close shortly after — we
+        //     only assert the status + content-type round-trip).
         let (app, _) = make_test_app().await;
         let body = serde_json::json!({
             "id": "rtsp-cam",
             "name": "RTSP Camera",
-            "source_url": "rtsp://203.0.113.20/live"
+            "source_url": "rtsp://203.0.113.20/live",
+            "allow_private_network": false
         });
         let create = app
             .clone()
@@ -3564,7 +3574,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(ct, "video/h264");
     }
 
     // ── Monitors ─────────────────────────────────────────────────────────────

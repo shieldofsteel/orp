@@ -799,8 +799,12 @@ mod tests {
         );
         assert_eq!(stream.entity_id(), "media:cam-1");
         assert!(stream.capabilities.low_latency_view);
-        assert!(!stream.capabilities.in_binary_relay);
-        assert_eq!(stream.status, MediaStreamStatus::NeedsRelay);
+        // Post-v0.4: RTSP IS relay-ready (retina pulls H.264 Annex-B
+        // through the same MediaStreamHandle pipeline as HTTP/MJPEG/HLS).
+        // Pre-v0.4 baseline asserted `!in_binary_relay`; this tracks the
+        // shipped capability instead of the historical limitation.
+        assert!(stream.capabilities.in_binary_relay);
+        assert_eq!(stream.status, MediaStreamStatus::RelayReady);
     }
 
     #[test]
