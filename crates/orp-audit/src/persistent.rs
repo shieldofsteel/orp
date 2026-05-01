@@ -38,6 +38,16 @@ use async_trait::async_trait;
 use duckdb::{params, Connection};
 use std::sync::{Arc, Mutex};
 
+/// Round a `DateTime<Utc>` down to microsecond precision so it survives a
+/// DuckDB `TIMESTAMP` round-trip without losing bits the audit-chain hash
+/// is computed over. Without this the chain replay computes a different
+/// pre-image than the one that was hashed at insert time.
+fn truncate_to_micros(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    use chrono::Timelike;
+    let micros = dt.nanosecond() / 1_000;
+    dt.with_nanosecond(micros * 1_000).unwrap_or(dt)
+}
+
 /// SQL fragments — kept here so this crate is self-contained and the table is
 /// idempotently created even if `orp-storage`'s base schema hasn't run yet
 /// (e.g. when callers use `PersistentAuditLog::open` against a bare DB file).
@@ -234,7 +244,13 @@ impl AuditLogger for PersistentAuditLog {
         // succeeded. The lock keeps the chain head linearised.
         let _guard = self.chain_lock.lock().await;
 
-        let timestamp = chrono::Utc::now();
+        // Truncate to microsecond precision BEFORE hashing. DuckDB's
+        // TIMESTAMP column rounds nanoseconds, so a hash computed from the
+        // nanosecond-precision `Utc::now()` would diverge from the hash
+        // recomputed during replay (read-back hits the truncated value).
+        // This was a platform-portable failure hiding behind macOS's
+        // sometimes-zero-ns clock — Linux CI surfaced it consistently.
+        let timestamp = truncate_to_micros(chrono::Utc::now());
 
         let conn = self
             .conn
@@ -483,6 +499,26 @@ mod tests {
 
     fn vk_from_signer(s: &EventSigner) -> VerifyKey {
         VerifyKey::from_bytes(&s.public_key_bytes()).unwrap()
+    }
+
+    #[test]
+    fn truncate_to_micros_drops_only_sub_microsecond_bits() {
+        use chrono::{Datelike, TimeZone, Timelike};
+        // Pick a timestamp with non-zero nanoseconds — the bug masking case
+        // is exactly when the live clock returns sub-microsecond precision.
+        let dt = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 1, 15, 24, 0)
+            .unwrap()
+            .with_nanosecond(123_456_789)
+            .unwrap();
+        let truncated = truncate_to_micros(dt);
+        // Only the bottom 3 digits (789 ns) are dropped.
+        assert_eq!(truncated.nanosecond(), 123_456_000);
+        // Higher-order fields are untouched.
+        assert_eq!(truncated.second(), 0);
+        assert_eq!(truncated.year(), 2026);
+        // The truncated value is a fixed point of the function.
+        assert_eq!(truncate_to_micros(truncated), truncated);
     }
 
     #[tokio::test]
