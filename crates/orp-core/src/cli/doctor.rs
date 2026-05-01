@@ -197,7 +197,7 @@ pub fn check_duckdb(config: &Config) -> DoctorCheck {
 }
 
 /// 3. RocksDB directory parent is writable. We don't open RocksDB itself
-/// because it would lock the directory and slow doctor down materially.
+///    because it would lock the directory and slow doctor down materially.
 pub fn check_rocksdb_dir(config: &Config) -> DoctorCheck {
     let path = &config.storage.rocksdb.path;
     let p = Path::new(path);
@@ -222,7 +222,7 @@ pub fn check_rocksdb_dir(config: &Config) -> DoctorCheck {
 }
 
 /// 4. The configured server port is free (or already bound by another ORP
-/// instance — we can't tell, so it's yellow).
+///    instance — we can't tell, so it's yellow).
 pub fn check_port_free(config: &Config) -> DoctorCheck {
     let port = config.server.port;
     let addr = format!("127.0.0.1:{}", port);
@@ -236,15 +236,15 @@ pub fn check_port_free(config: &Config) -> DoctorCheck {
             "Server port free",
             format!(":{} is already in use ({})", port, e),
         )
-        .with_hint(format!(
+        .with_hint(
             "If ORP is already running, this is fine — `orp status` to confirm. \
-             Otherwise, change server.port or pass `--port <n>`."
-        )),
+             Otherwise, change server.port or pass `--port <n>`.",
+        ),
     }
 }
 
 /// 5. Common config errors. If `config.yaml` is present, validate it. If not,
-/// that's fine — `orp start` falls back to defaults.
+///    that's fine — `orp start` falls back to defaults.
 pub fn check_config(path: Option<&str>) -> DoctorCheck {
     let p = path.unwrap_or("config.yaml");
     if !Path::new(p).exists() {
@@ -261,9 +261,9 @@ pub fn check_config(path: Option<&str>) -> DoctorCheck {
 }
 
 /// 6. Cert chain validity. Only run when an HTTPS URL is supplied. We do a
-/// best-effort connect and rely on the system trust roots; on success we
-/// report the leaf's CN / SAN and not-after date. On failure we surface the
-/// underlying TLS error.
+///    best-effort connect and rely on the system trust roots; on success we
+///    report the leaf's CN / SAN and not-after date. On failure we surface the
+///    underlying TLS error.
 pub fn check_cert_chain(https_url: Option<&str>) -> DoctorCheck {
     let Some(url) = https_url else {
         return DoctorCheck::green("Cert chain validity", "skipped — pass --https-url to test");
