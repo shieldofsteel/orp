@@ -14,3 +14,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 nom = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "qparse"
+harness = false

@@ -777,7 +777,7 @@ mod tests {
     fn test_roundtrip_known_tags() {
         let pts: u64 = 1_700_000_000_000_000;
         let lat = (51.0 * (i32::MAX as f64) / 90.0) as i32;
-        let lon = (-1.0 * (i32::MAX as f64) / 180.0) as i32;
+        let lon = (-(i32::MAX as f64) / 180.0) as i32;
         let alt: u16 = ((1500.0 + 900.0) * 65535.0 / 19900.0) as u16;
         let flat = (51.001 * (i32::MAX as f64) / 90.0) as i32;
         let flon = (-0.999 * (i32::MAX as f64) / 180.0) as i32;

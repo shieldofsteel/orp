@@ -41,6 +41,11 @@ nom = "7.1"
 sha2 = "0.10"
 ed25519-dalek = { version = "2.1", features = ["serde"] }
 rand = "0.8"
+# Bench harness — kept here so each crate can pull it as a dev-dep without
+# duplicating version pins. Criterion is dev-only; it never lands in the
+# release binary.
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

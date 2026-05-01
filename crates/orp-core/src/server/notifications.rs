@@ -1031,7 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn test_api_register_then_list() {
         let (eng, _) = make_app();
-        let app = notification_router(eng.clone());
+        let _app = notification_router(eng.clone());
         // Register
         let body = serde_json::json!({
             "name": "slack-prod",

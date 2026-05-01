@@ -45,3 +45,10 @@ kafka = ["dep:rdkafka"]
 nats = ["dep:async-nats"]
 # Enable all optional adapters.
 all-adapters = ["kafka", "nats"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "parsers"
+harness = false

@@ -17,4 +17,16 @@ duckdb = { version = "1.2", features = ["bundled"] }
 sha2 = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
+criterion = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+
+[[bench]]
+name = "duckdb_writes"
+harness = false
+
+[[bench]]
+name = "duckdb_queries"
+harness = false
