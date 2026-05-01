@@ -1145,8 +1145,7 @@ fn parse_simple_eq(s: &str) -> Option<ParsedEq> {
 
     let rhs = rhs.trim();
     // Accept either single-quoted string literal or a bare numeric literal.
-    let value = if rhs.starts_with('\'') {
-        let after = &rhs[1..];
+    let value = if let Some(after) = rhs.strip_prefix('\'') {
         let end = after.find('\'')?;
         after[..end].to_string()
     } else if rhs.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '-') {
