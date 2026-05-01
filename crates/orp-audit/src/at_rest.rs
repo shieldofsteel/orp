@@ -98,8 +98,7 @@ impl AtRestKey {
             std::fs::set_permissions(&tmp, perms)?;
         }
         std::fs::rename(&tmp, path)?;
-        AtRestKey::from_bytes(&sk)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        AtRestKey::from_bytes(&sk).map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     /// Encrypt + base64-encode `plaintext` for storage in a VARCHAR column.

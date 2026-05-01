@@ -309,11 +309,24 @@ impl ApiKeyService {
     }
 
     fn check_rate_limit(&self, key_id: &str, limit: u64) -> Result<(), ApiKeyError> {
+        self.check_rate_limit_at(key_id, limit, Utc::now())
+    }
+
+    /// Time-injecting variant of [`Self::check_rate_limit`]. Tests pin
+    /// `now` explicitly so the wall-clock-driven 1-second window doesn't
+    /// roll over between two awaits on a slow CI runner — the window-
+    /// rollover false-negative this fixes was the recurring Linux-only
+    /// CI failure pre-v0.3.2.
+    fn check_rate_limit_at(
+        &self,
+        key_id: &str,
+        limit: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(), ApiKeyError> {
         let mut rl = self
             .rate_limits
             .write()
             .map_err(|e| ApiKeyError::Storage(e.to_string()))?;
-        let now = Utc::now();
         let slot = rl.entry(key_id.to_string()).or_default();
 
         let elapsed = (now - slot.window_start).num_seconds();
@@ -527,24 +540,47 @@ mod tests {
         assert_eq!(keys.len(), 2);
     }
 
-    #[tokio::test]
-    async fn test_rate_limit_exceeded() {
-        // Use limit=1 + 2 calls instead of limit=2 + 3 calls. The rate
-        // limiter's window is 1 wall-clock second wide; on slow CI runners
-        // 3 await-bearing calls can straddle a window rollover and give a
-        // false negative. Two back-to-back calls land in the same window
-        // with much higher reliability while still exercising the same
-        // "exceeded" branch.
+    #[test]
+    fn test_rate_limit_exceeded() {
+        // Deterministic version: pin `now` so we don't depend on the
+        // wall clock at all. The previous wall-clock-driven test was
+        // intermittently flaky on slow Linux CI runners where two
+        // await-bearing calls could straddle the 1-second window edge.
+        // check_rate_limit_at takes the same path as check_rate_limit,
+        // just with explicit time — ensures the assertion stays meaningful.
         let svc = test_service();
         let req = CreateApiKeyRequest {
             rate_limit: Some(1),
             ..make_request()
         };
         let resp = svc.create_key(req).unwrap();
-        // First call in the window should succeed.
-        svc.validate_key(&resp.api_key).await.unwrap();
-        // Second call in the same window must be rate-limited.
-        let result = svc.validate_key(&resp.api_key).await;
+        // Look up the record to get the key id.
+        let parsed = parse_raw_key(&resp.api_key).expect("parse key");
+        let id = parsed.0;
+        let t0 = Utc::now();
+        // Two checks pinned to the same instant — the window cannot roll
+        // because we never advance time across the boundary.
+        svc.check_rate_limit_at(id, 1, t0).unwrap();
+        let result = svc.check_rate_limit_at(id, 1, t0);
         assert!(matches!(result, Err(ApiKeyError::RateLimitExceeded { .. })));
+    }
+
+    #[test]
+    fn test_rate_limit_window_rollover_resets() {
+        // Time-injection coverage: after >=1 second, the window resets and
+        // a fresh call is allowed. Without this we'd never test the reset
+        // branch — the previous test only covered "still inside window".
+        let svc = test_service();
+        let req = CreateApiKeyRequest {
+            rate_limit: Some(1),
+            ..make_request()
+        };
+        let resp = svc.create_key(req).unwrap();
+        let id = parse_raw_key(&resp.api_key).expect("parse key").0;
+        let t0 = Utc::now();
+        svc.check_rate_limit_at(id, 1, t0).unwrap();
+        // 1.5 seconds later the window rolls.
+        let t1 = t0 + chrono::Duration::milliseconds(1_500);
+        svc.check_rate_limit_at(id, 1, t1).unwrap();
     }
 }

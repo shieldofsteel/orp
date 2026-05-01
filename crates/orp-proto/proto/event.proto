@@ -29,8 +29,8 @@ message OrpEvent {
 
 // Multi-domain classification label. Mirrors
 // `orp_security::classification::Classification`. Designed for IL5/IL6
-// + NATO COSMIC procurement so events carry their own marking and ABAC
-// can dominance-check at the receiver.
+// and NATO COSMIC procurement so events carry their own marking and
+// ABAC can dominance-check at the receiver.
 message Classification {
   // CAPCO short name: "UNCLASSIFIED", "CUI", "SECRET", "TOP SECRET",
   // "COSMIC TOP SECRET", "NATO RESTRICTED", etc.

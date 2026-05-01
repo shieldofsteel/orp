@@ -261,12 +261,17 @@ impl PersistentAuditLog {
                 .map_err(|e| AuditError::Database(e.to_string()))?
                 .unwrap_or_else(|| "null".to_string());
             // Detect the sealed envelope: a JSON object with a sole key
-            // `orpaead1` whose value is the base64-AEAD blob. Anything else
-            // is treated as legacy plaintext JSON (mixed-mode migration).
+            // `orpaead1` whose value is the base64-AEAD blob. Anything
+            // else is treated as legacy plaintext JSON (mixed-mode
+            // migration). `Malformed` errors (e.g. attacker writes
+            // `{"orpaead1": "garbage"}` to a *plaintext* row to poison
+            // the chain) fall through to plaintext too — only an
+            // authenticated `DecryptFailed` is fatal, which signals
+            // either a wrong key or actual ciphertext corruption.
             let details_str: String = match at_rest {
                 Some(key) => match try_unseal_envelope(&raw_details, key) {
                     Ok(Some(plain)) => plain,
-                    Ok(None) => raw_details,
+                    Ok(None) | Err(crate::AtRestError::Malformed) => raw_details,
                     Err(e) => return Err(AuditError::Database(format!("at-rest unseal: {e}"))),
                 },
                 None => raw_details,
@@ -657,6 +662,54 @@ mod tests {
             let recovered = rows[0].details.to_string();
             assert!(!recovered.contains("Sealed Boat"));
             assert!(!recovered.contains("secret_field"));
+        }
+    }
+
+    #[tokio::test]
+    async fn at_rest_envelope_misdetection_does_not_break_chain() {
+        // Attack-surface audit concern: an attacker who controls a
+        // `details` payload could write `{"orpaead1": "garbage"}` to a
+        // plaintext row to poison the chain (decrypt fails, replay
+        // returns Database error). After the fix `Malformed` falls
+        // through to plaintext; only an authenticated `DecryptFailed`
+        // (real ciphertext that mismatches the key) is fatal.
+        use crate::AtRestKey;
+
+        let signer = Arc::new(EventSigner::new());
+        let key = Arc::new(AtRestKey::from_bytes(&[3u8; 32]).unwrap());
+        let (_dir, path) = tmp_db();
+
+        // Write a plaintext row whose details JSON happens to look like
+        // the at-rest envelope shape. This goes through the unsealed
+        // INSERT path because the log was constructed without a key.
+        {
+            let log = PersistentAuditLog::open(&path, signer.clone()).unwrap();
+            log.record(
+                "user_data",
+                None,
+                None,
+                None,
+                serde_json::json!({"orpaead1": "this-is-user-data-not-base64!!"}),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Reopen WITH the at-rest key. read_all_with attempts to unseal
+        // the row, gets Malformed, falls back to plaintext — chain
+        // verifies cleanly.
+        {
+            let log = PersistentAuditLog::open(&path, signer.clone())
+                .unwrap()
+                .with_at_rest_key(key.clone());
+            let rows = log.replay(None).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].details["orpaead1"],
+                "this-is-user-data-not-base64!!"
+            );
+            let vk = VerifyKey::from_bytes(&signer.public_key_bytes()).unwrap();
+            log.verify_chain(&vk).await.unwrap();
         }
     }
 

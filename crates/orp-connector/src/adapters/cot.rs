@@ -713,12 +713,33 @@ impl Connector for CotConnector {
                                 let running_clone = running.clone();
                                 tokio::spawn(async move {
                                     use tokio::io::AsyncReadExt;
+                                    // Hard cap on the per-connection accumulator. Without
+                                    // this, a malicious peer streaming endless non-0xBF
+                                    // bytes (or any byte stream that never decodes a frame)
+                                    // would grow `accum` until the process OOMs — the
+                                    // resync path drains 1 byte per failed decode but
+                                    // can't keep up with even modest write rates. Cap at
+                                    // 2× MAX_PAYLOAD_BYTES so a legitimate worst-case
+                                    // frame plus a partial successor can coexist; reject
+                                    // (drop the connection) on overflow. Closes the
+                                    // BLOCKER from the v0.3.2 attack-surface audit.
+                                    const MAX_ACCUM: usize = 2 * orp_tak::MAX_PAYLOAD_BYTES;
                                     let mut accum: Vec<u8> = Vec::with_capacity(4096);
                                     let mut chunk = [0u8; 4096];
                                     while running_clone.load(Ordering::SeqCst) {
                                         match socket.read(&mut chunk).await {
                                             Ok(0) => break,
                                             Ok(n) => {
+                                                if accum.len().saturating_add(n) > MAX_ACCUM {
+                                                    tracing::warn!(
+                                                        accum_len = accum.len(),
+                                                        chunk = n,
+                                                        "TAK-stream accumulator cap exceeded; dropping peer"
+                                                    );
+                                                    errors_count_clone
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    break;
+                                                }
                                                 accum.extend_from_slice(&chunk[..n]);
                                                 // Drain every complete frame.
                                                 loop {
