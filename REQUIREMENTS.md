@@ -19,7 +19,7 @@ Phase 1 foundation is built: 12 crates, 4,570 lines, 25 tests, binary compiles. 
 
 ### Core Engine Hardening
 - Full DuckDB schema from spec (all tables, indexes, partitioning)
-- Kuzu graph engine integration (schema DDL, sync from DuckDB every 30s)
+- DuckDB graph projection (graph_nodes/graph_edges tables, adjacency rebuild every 30s — see ADR-001)
 - RocksDB-backed dedup window (persistent across restarts)
 - Entity resolution (structural MMSI/ICAO matching + canonical IDs)
 - Config system with env var substitution (`${env.SECRET}`)
@@ -35,7 +35,7 @@ Phase 1 foundation is built: 12 crates, 4,570 lines, 25 tests, binary compiles. 
 ### Query Engine Complete
 - Full ORP-QL v0.1 grammar (EBNF from spec)
 - Query planner with cost optimization
-- Hybrid executor (DuckDB for OLAP, Kuzu for graph)
+- Hybrid executor (DuckDB SQL for OLAP, in-memory BFS over the graph projection for traversal)
 - All aggregation functions (COUNT/SUM/AVG/MIN/MAX)
 - ORDER BY, LIMIT, graph traversal patterns
 

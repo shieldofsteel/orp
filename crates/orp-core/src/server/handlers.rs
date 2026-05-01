@@ -162,6 +162,7 @@ pub struct HealthResponse {
 #[derive(Serialize)]
 pub struct HealthComponents {
     database: ComponentHealth,
+    graph_engine: ComponentHealth,
     stream_processor: ComponentHealth,
     api_server: ComponentHealth,
     monitor_engine: ComponentHealth,
@@ -193,6 +194,14 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResp
             database: ComponentHealth {
                 status: db_status.to_string(),
                 latency_ms: Some(db_latency),
+            },
+            graph_engine: ComponentHealth {
+                // The graph engine is currently a DuckDB-backed projection
+                // (see crates/orp-storage/src/graph_engine.rs). Its health is
+                // gated on the underlying database; surface that explicitly so
+                // the openapi `graph_engine` component is always populated.
+                status: db_status.to_string(),
+                latency_ms: None,
             },
             stream_processor: ComponentHealth {
                 status: "healthy".to_string(),

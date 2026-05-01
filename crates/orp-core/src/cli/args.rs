@@ -67,6 +67,13 @@ pub enum Commands {
         /// Equivalent to --dev with ORP_DEV_MODE=true in the environment.
         #[arg(long)]
         no_auth: bool,
+
+        /// Use an in-memory DuckDB instance instead of persisting to disk.
+        /// Default is persistent (the configured `storage.duckdb.path`); pass
+        /// this for tests, demos, or short-lived CI runs where state should
+        /// vanish on shutdown.
+        #[arg(long)]
+        in_memory: bool,
     },
 
     /// Connect a data source in one command

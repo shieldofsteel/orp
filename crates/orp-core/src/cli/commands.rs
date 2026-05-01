@@ -261,6 +261,7 @@ pub async fn run_start(
     dev: bool,
     headless: bool,
     no_auth: bool,
+    in_memory: bool,
 ) -> Result<()> {
     // --no-auth implies --dev and sets ORP_DEV_MODE
     let dev = dev || no_auth;
@@ -301,12 +302,25 @@ pub async fn run_start(
 
     tracing::info!("Initializing ORP...");
 
-    // Initialize storage
-    tracing::info!("Initializing DuckDB storage...");
-    let storage: Arc<dyn Storage> = Arc::new(
-        DuckDbStorage::new_in_memory()
-            .map_err(|e| anyhow::anyhow!("Storage init failed: {}", e))?,
-    );
+    // Initialize storage. Persistent by default — that's the SQLite-style
+    // promise of "single binary, single file". Pass `--in-memory` for tests
+    // or demos where the state should vanish on shutdown.
+    let storage: Arc<dyn Storage> = if in_memory {
+        tracing::warn!(
+            "Initializing DuckDB storage (in-memory). All state is lost on shutdown."
+        );
+        Arc::new(
+            DuckDbStorage::new_in_memory()
+                .map_err(|e| anyhow::anyhow!("Storage init failed: {}", e))?,
+        )
+    } else {
+        let path = &config.storage.duckdb.path;
+        tracing::info!("Initializing DuckDB storage at {}", path);
+        Arc::new(
+            DuckDbStorage::new_with_path(path)
+                .map_err(|e| anyhow::anyhow!("Storage init failed at {}: {}", path, e))?,
+        )
+    };
 
     // Load demo data (ports)
     tracing::info!("Loading demo port data...");

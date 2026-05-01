@@ -28,8 +28,9 @@ async fn main() -> Result<()> {
             dev,
             headless,
             no_auth,
+            in_memory,
         } => {
-            cli::commands::run_start(config, template, port, dev, headless, no_auth).await?;
+            cli::commands::run_start(config, template, port, dev, headless, no_auth, in_memory).await?;
         }
 
         cli::args::Commands::Query {

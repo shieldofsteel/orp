@@ -37,7 +37,7 @@ use std::sync::Arc;
 //   </nffi>
 
 /// Force affiliation / identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NffiAffiliation {
     Friendly,
     Hostile,
@@ -260,7 +260,19 @@ pub fn parse_nffi_xml(xml_data: &str) -> Result<Vec<NffiTrack>, ConnectorError> 
                             let lon = longitude.unwrap_or(0.0);
 
                             if track_id.is_empty() {
-                                track_id = format!("track-{}", tracks.len());
+                                // No trackId in the source XML. Synthesise one from a
+                                // hash of the (name, lat, lon, affiliation) tuple so
+                                // two different unnamed tracks don't collide on
+                                // entity-resolution. Index-based fallback ("track-0",
+                                // "track-1") would merge unrelated tracks every load.
+                                use std::collections::hash_map::DefaultHasher;
+                                use std::hash::{Hash, Hasher};
+                                let mut h = DefaultHasher::new();
+                                name.hash(&mut h);
+                                ((lat * 1e7) as i64).hash(&mut h);
+                                ((lon * 1e7) as i64).hash(&mut h);
+                                affiliation.hash(&mut h);
+                                track_id = format!("nffi-anon-{:016x}", h.finish());
                             }
 
                             tracks.push(NffiTrack {

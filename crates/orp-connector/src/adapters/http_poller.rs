@@ -2,6 +2,7 @@ use crate::traits::{Connector, ConnectorConfig, ConnectorError, ConnectorStats, 
 use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -11,6 +12,111 @@ pub struct HttpPollerConnector {
     running: Arc<AtomicBool>,
     events_count: Arc<AtomicU64>,
     errors_count: Arc<AtomicU64>,
+}
+
+/// Reject URLs whose host resolves to an internal/private network or a known
+/// cloud-metadata endpoint. Operators can opt back in by setting the connector
+/// property `allow_private_targets = true`.
+///
+/// SSRF defence — without this an HTTP poller pointed at
+/// `http://169.254.169.254/latest/meta-data/` (AWS) or `http://localhost:6379`
+/// (Redis) would happily exfiltrate credentials or pivot into internal
+/// services.
+fn is_url_safe(url: &str, allow_private: bool) -> Result<(), String> {
+    if allow_private {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("scheme '{scheme}' not allowed (use http/https)"));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+
+    // Block known cloud-metadata hostnames before resolution.
+    let lowered = host.to_ascii_lowercase();
+    if matches!(
+        lowered.as_str(),
+        "metadata.google.internal" | "metadata" | "instance-data"
+    ) {
+        return Err(format!("host '{host}' is a cloud-metadata endpoint"));
+    }
+
+    // Resolve and check every IP. We do a synchronous resolve since this is
+    // called once per poll, at low frequency.
+    use std::net::ToSocketAddrs;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed: {e}"))?;
+    for addr in addrs {
+        let ip = addr.ip();
+        if is_internal_ip(&ip) {
+            return Err(format!(
+                "host '{host}' resolves to internal address {ip}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_internal_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_documentation()
+                // 169.254.169.254 covered by is_link_local; also cover the
+                // wider 169.254/16 range and 100.64/10 (CGNAT).
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                // fe80::/10 link-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::is_url_safe;
+    #[test]
+    fn allows_public_https() {
+        assert!(is_url_safe("https://example.com/api", false).is_ok());
+    }
+    #[test]
+    fn blocks_loopback() {
+        assert!(is_url_safe("http://127.0.0.1:8080/", false).is_err());
+        assert!(is_url_safe("http://localhost/", false).is_err());
+    }
+    #[test]
+    fn blocks_link_local_and_cloud_metadata() {
+        assert!(is_url_safe("http://169.254.169.254/latest/meta-data", false).is_err());
+        assert!(is_url_safe("http://metadata.google.internal/", false).is_err());
+    }
+    #[test]
+    fn blocks_rfc1918() {
+        assert!(is_url_safe("http://10.0.0.5/", false).is_err());
+        assert!(is_url_safe("http://192.168.1.1/", false).is_err());
+        assert!(is_url_safe("http://172.16.0.1/", false).is_err());
+    }
+    #[test]
+    fn rejects_non_http_schemes() {
+        assert!(is_url_safe("file:///etc/passwd", false).is_err());
+        assert!(is_url_safe("gopher://example.com/", false).is_err());
+    }
+    #[test]
+    fn allows_private_when_opted_in() {
+        assert!(is_url_safe("http://10.0.0.5/", true).is_ok());
+    }
 }
 
 impl HttpPollerConnector {
@@ -139,6 +245,21 @@ impl Connector for HttpPollerConnector {
                 interval.tick().await;
 
                 if let Some(ref url) = config.url {
+                    let allow_private = config
+                        .properties
+                        .get("allow_private_targets")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if let Err(reason) = is_url_safe(url, allow_private) {
+                        tracing::warn!(
+                            connector_id = %connector_id,
+                            url = %url,
+                            reason = %reason,
+                            "SSRF guard blocked HTTP poller request"
+                        );
+                        errors_count.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     // Try real HTTP request
                     match reqwest::get(url).await {
                         Ok(resp) => match resp.json::<serde_json::Value>().await {

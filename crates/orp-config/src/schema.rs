@@ -31,6 +31,7 @@ pub struct Config {
 // ── Server ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -56,14 +57,19 @@ impl Default for ServerConfig {
 // ── Storage ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StorageConfig {
     pub duckdb: DuckDbConfig,
+    /// Reserved for the future `kuzu-graph` Cargo feature; ignored when
+    /// the feature is not enabled. The graph capability is currently the
+    /// DuckDB projection in `crates/orp-storage/src/graph_engine.rs`.
     pub kuzu: KuzuConfig,
     pub rocksdb: RocksDbConfig,
     pub sqlite: SqliteConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DuckDbConfig {
     pub path: String,
     pub memory_limit_gb: u32,
@@ -81,6 +87,7 @@ impl Default for DuckDbConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct KuzuConfig {
     pub path: String,
     pub memory_limit_gb: u32,
@@ -98,6 +105,7 @@ impl Default for KuzuConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RocksDbConfig {
     pub path: String,
     pub cache_size_mb: u32,
@@ -113,6 +121,7 @@ impl Default for RocksDbConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SqliteConfig {
     pub path: String,
 }

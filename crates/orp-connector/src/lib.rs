@@ -19,6 +19,7 @@ pub use adapters::grib::GribConnector;
 pub use adapters::gtfs::GtfsConnector;
 pub use adapters::http_poller::HttpPollerConnector;
 pub use adapters::lorawan::LoRaWanConnector;
+pub use adapters::mavlink::MavlinkConnector;
 pub use adapters::metar::MetarConnector;
 pub use adapters::modbus::ModbusConnector;
 pub use adapters::mqtt::MqttConnector;

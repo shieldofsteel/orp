@@ -1,6 +1,6 @@
 # ORP-QL Query Language Guide
 
-ORP-QL is a purpose-built query language for reasoning about real-world entities. It combines SQL-style analytics with Cypher-style graph traversal, and is compiled to either DuckDB SQL or Kuzu Cypher by the query planner.
+ORP-QL is a purpose-built query language for reasoning about real-world entities. It combines SQL-style analytics with Cypher-style graph traversal. The planner compiles each query to DuckDB SQL (analytics path) or executes it against the in-memory graph projection (an adjacency list rebuilt every 30 s from the canonical relationships table — see ADR-001).
 
 ---
 
@@ -755,7 +755,7 @@ op              = "=" | "!=" | ">" | ">=" | "<" | "<=" ;
 
 **2. Graph queries max out at 3 hops in Phase 1.** Deep graph traversal (> 3 hops) requires the API's raw Cypher endpoint.
 
-**3. Geospatial functions are DuckDB-only.** If you combine `near()` with a graph pattern, the planner runs DuckDB first, then feeds entity IDs to Kuzu.
+**3. Geospatial functions are DuckDB-only.** If you combine `near()` with a graph pattern, the planner runs DuckDB first, then feeds entity IDs to the graph projection's BFS executor.
 
 **4. The `AT TIME` clause applies to the DuckDB events table.** Historical entity state is reconstructed from the event log. Queries over long time windows may be slower.
 

@@ -178,6 +178,10 @@ CREATE INDEX IF NOT EXISTS idx_monitor_rules_enabled     ON monitor_rules(enable
 pub struct DuckDbStorage {
     conn: Arc<Mutex<Connection>>,
     spatial_enabled: bool,
+    /// Lazily-initialised graph engine. Constructing one runs DROP/CREATE
+    /// VIEW for every graph view, so we keep it around for the life of the
+    /// storage handle instead of building it per query.
+    graph: std::sync::OnceLock<Arc<crate::graph_engine::GraphEngine>>,
 }
 
 impl DuckDbStorage {
@@ -188,9 +192,25 @@ impl DuckDbStorage {
         let mut s = Self {
             conn: Arc::new(Mutex::new(conn)),
             spatial_enabled: false,
+            graph: std::sync::OnceLock::new(),
         };
         s.initialize()?;
         Ok(s)
+    }
+
+    /// Return a shared graph engine, initialising it on first access.
+    /// Subsequent callers reuse the same `Arc<GraphEngine>` rather than
+    /// re-running graph schema setup per call.
+    fn graph_engine(&self) -> StorageResult<Arc<crate::graph_engine::GraphEngine>> {
+        if let Some(g) = self.graph.get() {
+            return Ok(Arc::clone(g));
+        }
+        let engine = Arc::new(crate::graph_engine::GraphEngine::new(Arc::clone(
+            &self.conn,
+        ))?);
+        // Race-tolerant: if two callers initialise concurrently the loser
+        // simply discards its copy and returns the winner's.
+        Ok(Arc::clone(self.graph.get_or_init(|| engine)))
     }
 
     /// Open a file-based DuckDB instance.
@@ -203,6 +223,7 @@ impl DuckDbStorage {
         let mut s = Self {
             conn: Arc::new(Mutex::new(conn)),
             spatial_enabled: false,
+            graph: std::sync::OnceLock::new(),
         };
         s.initialize()?;
         Ok(s)
@@ -1124,10 +1145,11 @@ impl Storage for DuckDbStorage {
         &self,
         query_str: &str,
     ) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
-        // Delegate to GraphEngine which maintains dedicated graph tables and
-        // supports Cypher-like syntax, raw SQL, and multi-hop traversal against
-        // graph_nodes / graph_edges views.
-        let graph = crate::graph_engine::GraphEngine::new(Arc::clone(&self.conn))?;
+        // Delegate to a cached GraphEngine. Constructing one re-runs ~19
+        // DROP/CREATE VIEW statements (init_schema is idempotent but not
+        // free); caching here means we pay that cost once per storage
+        // handle instead of once per query.
+        let graph = self.graph_engine()?;
         graph.cypher_query(query_str)
     }
     /// BFS path search up to `max_hops` using a recursive CTE over the relationships table.

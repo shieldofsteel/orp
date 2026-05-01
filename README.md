@@ -4,12 +4,12 @@
 
 ### A single binary that does what Palantir charges $50M for.
 
-[![Tests](https://img.shields.io/badge/tests-960%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
-[![Binary Size](https://img.shields.io/badge/binary-43MB-blue?style=flat-square)](https://github.com/shieldofsteel/orp/releases)
+[![Tests](https://img.shields.io/badge/tests-1113%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
+[![Binary Size](https://img.shields.io/badge/binary-45MB-blue?style=flat-square)](https://github.com/shieldofsteel/orp/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square)](https://www.rust-lang.org)
-[![Crates](https://img.shields.io/badge/crates-85%20Rust%20files-red?style=flat-square)](crates/)
-[![Lines](https://img.shields.io/badge/lines-51K%2B-lightgrey?style=flat-square)](crates/)
+[![Crates](https://img.shields.io/badge/crates-13%20workspace%20crates-red?style=flat-square)](crates/)
+[![Adapters](https://img.shields.io/badge/adapters-34-purple?style=flat-square)](crates/orp-connector/src/adapters/)
 
 </div>
 
@@ -35,11 +35,16 @@ What if the same thing ran on a laptop? Or a Raspberry Pi? For free?
 ## 30 Seconds to Live Data
 
 ```bash
-# Install
-curl -fsSL https://orp.dev/install | sh
+# Install (works after the first tagged release — see "Building from Source" until then)
+curl -fsSL https://raw.githubusercontent.com/shieldofsteel/orp/master/scripts/install.sh | sh
+
+# Or build from source:
+git clone https://github.com/shieldofsteel/orp && cd orp
+brew install protobuf  # or: apt install -y protobuf-compiler
+cargo build --release
 
 # Launch with the maritime template
-orp start --template maritime
+./target/release/orp start --template maritime
 
 # Ships appear on your screen in 30 seconds
 # Open http://localhost:9090
@@ -110,12 +115,17 @@ ORP speaks the languages your sensors already use.
 |----------|-------------|--------|
 | **ADS-B / Mode S** | Aircraft position, velocity, identity at 1090 MHz | ✅ Implemented |
 | **ASTERIX** | Eurocontrol ATC radar data exchange | ✅ Implemented |
-| **GRIB** | Gridded meteorological data (weather models) | ✅ Implemented |
+| **GRIB** | Gridded meteorological data (weather models, Section 7 data unpacking for DRT 5.0) | ✅ Implemented |
+
+### 🛸 Drone / Autonomy
+| Protocol | Description | Status |
+|----------|-------------|--------|
+| **MAVLink v2** | PX4, ArduPilot, Skydio, Auterion, ModalAI ground-station telemetry. Decodes HEARTBEAT, GLOBAL_POSITION_INT, VFR_HUD, ATTITUDE, GPS_RAW_INT, SYS_STATUS over UDP/TCP. | ✅ Implemented |
 
 ### 🪖 Military / Tactical
 | Protocol | Description | Status |
 |----------|-------------|--------|
-| **CoT (Cursor on Target)** | TAK/ATAK compatible track sharing | ✅ Implemented |
+| **CoT (Cursor on Target)** | TAK/ATAK compatible track sharing (consumer + producer) | ✅ Implemented |
 | **STIX/TAXII** | Threat intelligence exchange | ✅ Implemented |
 | **NFFI** | NATO Friendly Force Information | ✅ Implemented |
 | **CEF** | Common Event Format (security events) | ✅ Implemented |
@@ -180,7 +190,7 @@ ORP speaks the languages your sensors already use.
 │  │  ADS-B       │   │  Entity      │   │  (SQL + Graph hybrid)   │ │
 │  │  CoT / TAK   │   │  Resolution  │   │                         │ │
 │  │  OPC-UA      │   │              │   │  DuckDB (analytics)     │ │
-│  │  MQTT        │   │  Knowledge   │   │  Kuzu (graph traversal) │ │
+│  │  MQTT        │   │  Knowledge   │   │  Graph projection (DuckDB) │ │
 │  │  Modbus      │   │  Graph       │   │                         │ │
 │  │  Syslog      │   │              │   └─────────────────────────┘ │
 │  │  HTTP/WS     │   │  Anomaly     │                               │
@@ -201,8 +211,8 @@ ORP speaks the languages your sensors already use.
 │  │  DuckDB      │                      │  Search Panel           │ │
 │  │  (entities,  │                      │  Alert Feed             │ │
 │  │   history)   │                      │  Timeline Scrubber      │ │
-│  │  Kuzu        │                      └─────────────────────────┘ │
-│  │  (graph)     │                                                   │
+│  │  Graph proj. │                      └─────────────────────────┘ │
+│  │  (in-DuckDB) │                                                   │
 │  └──────────────┘                                                   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -212,7 +222,7 @@ ORP speaks the languages your sensors already use.
 ## Feature Checklist
 
 **Data Ingestion**
-- ✅ 32 protocol adapters (NMEA, AIS, NMEA 2000, ACARS, ADS-B, ASTERIX, GRIB, CoT, STIX, NFFI, CEF, OPC-UA, Modbus, MQTT, SparkplugB, DNP3, CAN/CANbus, BACnet, LoRaWAN, Syslog, PCAP, Zeek, NetFlow, METAR, CAP, GTFS-RT, HTTP, WebSocket, CSV, Database, GeoJSON, Generic API)
+- ✅ 34 protocol adapters (NMEA, AIS, AISStream, NMEA 2000, ACARS, ADS-B, ASTERIX, GRIB, CoT, STIX, NFFI, CEF, OPC-UA, Modbus, MQTT, SparkplugB, DNP3, CAN/CANbus, BACnet, LoRaWAN, MAVLink, Syslog, PCAP, Zeek, NetFlow, METAR, CAP, GTFS-RT, HTTP, WebSocket, CSV, Database, GeoJSON, Generic API)
 - ✅ Universal JSON ingest — `POST /api/v1/ingest` accepts anything
 - ✅ Serial port NMEA direct read (`serial:///dev/ttyUSB0`)
 - ✅ Connector hot-reload — add/remove sources without restart
@@ -254,13 +264,13 @@ ORP speaks the languages your sensors already use.
 - ✅ Headless mode — runs without UI for edge/embedded deployments
 - ✅ Docker support — single container, compose-ready
 - ✅ ARM cross-compilation — Raspberry Pi, Apple Silicon, AWS Graviton
-- ✅ 960+ tests, zero clippy warnings, zero panics on malformed input
+- ✅ 1,061 tests across the workspace; zero panics on malformed input. New code must pass `cargo clippy --all-targets -- -D warnings`; existing minor warnings are tracked as cleanup tasks.
 
 ---
 
 ## ORP-QL
 
-ORP-QL is SQL and Cypher combined into a single language for real-world entities. The query planner compiles it to DuckDB (for analytics) or Kuzu (for graph traversal) automatically.
+ORP-QL is SQL and Cypher combined into a single language for real-world entities. The query planner compiles it to DuckDB SQL for analytics, or executes against an in-memory graph projection (built from the DuckDB `relationships` table) for graph traversal.
 
 ### Find vessels moving too fast
 ```sql
@@ -478,23 +488,40 @@ ORP is written in Rust. These are design targets, not marketing numbers.
 
 ## Building from Source
 
+### Prerequisites
+
+| Dependency | Required | Version | Purpose |
+|------------|----------|---------|---------|
+| Rust toolchain | yes | 1.75+ (stable) | Compile core binary |
+| `protoc` | yes | 3.20+ | `orp-proto/build.rs` compiles protobuf event schemas |
+| Node.js | optional | 20+ | Build the React frontend (omit for `--headless` builds) |
+| Docker | optional | any | Containerized deploy via the provided `Dockerfile` |
+| `cmake`, `pkg-config` | yes (Linux) | system | Native deps for `duckdb`, `rocksdb`, `rustls` |
+
+### Build
+
 ```bash
-# Prerequisites: Rust 1.75+
+# 1. Install protoc + native deps
+#    macOS:        brew install protobuf
+#    Debian/Ubuntu: sudo apt install -y protobuf-compiler cmake pkg-config libssl-dev
+#    Fedora:       sudo dnf install -y protobuf-compiler cmake openssl-devel
+#    Arch:         sudo pacman -S protobuf cmake pkgconf openssl
+
+# 2. Install Rust 1.75+ (skip if already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# 3. Clone and build
 git clone https://github.com/shieldofsteel/orp
 cd orp
+cargo test --workspace            # 1,061 tests
+cargo build --release             # target/release/orp (~43 MB, statically linked)
 
-# Run all tests
-cargo test
-
-# Build release binary
-cargo build --release
-# Binary: target/release/orp (43MB, statically linked)
-
-# Cross-compile for Raspberry Pi (ARM64)
+# 4. Cross-compile for Raspberry Pi (ARM64)
 rustup target add aarch64-unknown-linux-gnu
 cargo build --release --target aarch64-unknown-linux-gnu
 
-# Docker
+# 5. Docker
 docker build -t orp .
 docker run -p 9090:9090 orp start --template maritime
 ```
@@ -524,8 +551,8 @@ docker run -p 9090:9090 orp start --template maritime
 ORP is early. The protocol universe is large. Help is welcome.
 
 **Highest-impact contributions:**
-1. **New protocol adapters** — See [docs/CONNECTOR_GUIDE.md](docs/CONNECTOR_GUIDE.md) — a basic adapter is ~50 lines of Rust.
-2. **Test coverage** — 960 tests is a start. More protocol parsing tests, more edge cases.
+1. **New protocol adapters** — See [docs/CONNECTOR_GUIDE.md](docs/CONNECTOR_GUIDE.md) — a basic adapter is ~50 lines of Rust. Wishlist: MAVLink, ROS 2 / DDS, IEC 61850, MISB ST 0601 KLV, Apache Kafka, ARINC 429, CCSDS, HL7/FHIR, SAE J2735.
+2. **Test coverage** — 1,061 tests is a start. More protocol parsing tests, more edge cases.
 3. **Frontend features** — React/TypeScript. See [frontend/src/components/](frontend/src/components/).
 4. **Documentation** — real-world deployment guides, integration recipes.
 5. **Performance** — benchmarks, profiling, optimization.

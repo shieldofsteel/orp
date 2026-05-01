@@ -4,6 +4,7 @@ use chrono::Utc;
 use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -387,6 +388,188 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+// ---------------------------------------------------------------------------
+// CoT producer (ORP → ATAK/WinTAK/iTAK)
+// ---------------------------------------------------------------------------
+
+/// Default UDP multicast group / port used by ATAK/WinTAK/iTAK clients.
+pub const DEFAULT_COT_MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 2, 3, 1);
+pub const DEFAULT_COT_PORT: u16 = 6969;
+
+/// Configuration for [`spawn_cot_producer`] — emits ORP `SourceEvent`s as
+/// CoT XML packets via UDP for TAK-family clients on the same network.
+#[derive(Clone, Debug)]
+pub struct CotProducerConfig {
+    /// Local socket bind address.  Default `0.0.0.0:6969`.
+    pub bind_addr: SocketAddr,
+    /// Multicast group; `None` means unicast-only via `ORP_COT_PEERS`.
+    pub multicast_group: Option<IpAddr>,
+    /// Stale interval (seconds) added to every emitted CoT event.
+    pub stale_seconds: u64,
+    /// CoT type when the source event does not carry one in `properties`.
+    pub cot_type: String,
+}
+
+impl Default for CotProducerConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_COT_PORT),
+            multicast_group: Some(IpAddr::V4(DEFAULT_COT_MULTICAST)),
+            stale_seconds: 60,
+            cot_type: "a-f-G".to_string(),
+        }
+    }
+}
+
+/// Parse a producer URL into a [`CotProducerConfig`].
+///
+/// Schemes:
+///   * `cot-out://<group>:<port>` — UDP multicast/unicast
+///   * `cot-out-tcp://<host>:<port>` — TCP target (recorded as the dial
+///     destination; runtime falls back to UDP unicast via `ORP_COT_PEERS`).
+pub fn cot_producer_url_to_config(url: &str) -> Result<CotProducerConfig, ConnectorError> {
+    let mut cfg = CotProducerConfig::default();
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| {
+        ConnectorError::ConfigError(format!("CoT producer URL missing scheme: {url}"))
+    })?;
+    let (host, port_str) = rest.rsplit_once(':').ok_or_else(|| {
+        ConnectorError::ConfigError(format!("CoT producer URL missing port: {url}"))
+    })?;
+    let port: u16 = port_str.parse().map_err(|_| {
+        ConnectorError::ConfigError(format!("CoT producer invalid port in {url}"))
+    })?;
+    cfg.bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+
+    match scheme {
+        "cot-out" => {
+            let ip: IpAddr = host.parse().map_err(|_| {
+                ConnectorError::ConfigError(format!("CoT producer invalid IP in {url}"))
+            })?;
+            cfg.multicast_group = if is_multicast(&ip) { Some(ip) } else { None };
+            Ok(cfg)
+        }
+        "cot-out-tcp" => {
+            // No DNS lookup here — only literal IPs are recorded.
+            cfg.multicast_group = host.parse::<IpAddr>().ok();
+            Ok(cfg)
+        }
+        _ => Err(ConnectorError::ConfigError(format!(
+            "CoT producer unsupported scheme: {scheme}"
+        ))),
+    }
+}
+
+fn is_multicast(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_multicast(),
+        IpAddr::V6(v6) => v6.is_multicast(),
+    }
+}
+
+/// Build a `CotEvent` from a `SourceEvent` using the producer config.
+/// Honours `properties.cot_type`; otherwise specialises by entity_type.
+pub fn source_event_to_cot(ev: &SourceEvent, cfg: &CotProducerConfig) -> CotEvent {
+    let stale = (Utc::now() + chrono::Duration::seconds(cfg.stale_seconds as i64))
+        .to_rfc3339();
+    let event_type = ev
+        .properties
+        .get("cot_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| match ev.entity_type.as_str() {
+            "aircraft" | "sar_aircraft" => "a-f-A".to_string(),
+            "ship" | "vessel" => "a-f-S".to_string(),
+            "submarine" => "a-f-U".to_string(),
+            _ => cfg.cot_type.clone(),
+        });
+    let callsign = ev
+        .properties
+        .get("callsign")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| Some(ev.entity_id.clone()));
+    CotEvent {
+        uid: ev.entity_id.clone(),
+        event_type,
+        how: "m-g".to_string(),
+        time: ev.timestamp.to_rfc3339(),
+        start: ev.timestamp.to_rfc3339(),
+        stale,
+        lat: ev.latitude.unwrap_or(0.0),
+        lon: ev.longitude.unwrap_or(0.0),
+        hae: 0.0,
+        ce: 9999999.0,
+        le: 9999999.0,
+        callsign,
+        remarks: None,
+        detail_fields: HashMap::new(),
+    }
+}
+
+/// Read the `ORP_COT_PEERS` env var into a list of unicast peers.
+fn read_unicast_peers() -> Vec<SocketAddr> {
+    std::env::var("ORP_COT_PEERS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse::<SocketAddr>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Spawn a background task that consumes `SourceEvent`s and emits CoT
+/// XML packets via UDP to the configured multicast group and any unicast
+/// peers from `ORP_COT_PEERS`.  Send failures are logged but never panic.
+pub fn spawn_cot_producer(
+    config: CotProducerConfig,
+    mut rx: tokio::sync::mpsc::Receiver<SourceEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let socket = match tokio::net::UdpSocket::bind(config.bind_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(bind = %config.bind_addr, error = %e,
+                    "CoT producer cannot bind — task exiting");
+                return;
+            }
+        };
+        if let Some(IpAddr::V4(g)) = config.multicast_group {
+            if g.is_multicast() {
+                if let Err(e) = socket.join_multicast_v4(g, Ipv4Addr::UNSPECIFIED) {
+                    tracing::warn!(group = %g, error = %e, "CoT producer mcast join failed");
+                }
+            }
+        }
+        let _ = socket.set_multicast_loop_v4(true);
+        let peers = read_unicast_peers();
+        let mut fails: u64 = 0;
+        let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(config.bind_addr.port());
+        tracing::info!(bind = %config.bind_addr, multicast = ?config.multicast_group,
+            peers = ?peers, "CoT producer started");
+        while let Some(ev) = rx.recv().await {
+            let xml = emit_cot_xml(&source_event_to_cot(&ev, &config));
+            let bytes = xml.as_bytes();
+            if let Some(g) = config.multicast_group {
+                let dst = SocketAddr::new(g, local_port);
+                if let Err(e) = socket.send_to(bytes, dst).await {
+                    fails = fails.saturating_add(1);
+                    tracing::warn!(target = %dst, error = %e, fails, "CoT mcast send failed");
+                }
+            }
+            for peer in &peers {
+                if let Err(e) = socket.send_to(bytes, peer).await {
+                    fails = fails.saturating_add(1);
+                    tracing::warn!(target = %peer, error = %e, fails, "CoT unicast send failed");
+                }
+            }
+        }
+        tracing::info!(fails, "CoT producer channel closed");
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -808,5 +991,124 @@ mod tests {
     #[test]
     fn test_parse_invalid_xml() {
         assert!(parse_cot_xml("<not valid xml>>>").is_err());
+    }
+
+    // ── Producer (ORP → TAK) ─────────────────────────────────────────────
+
+    fn make_event(et: &str, lat: f64, lon: f64) -> SourceEvent {
+        SourceEvent {
+            connector_id: "t".into(),
+            entity_id: format!("{}:1", et),
+            entity_type: et.into(),
+            properties: HashMap::new(),
+            timestamp: Utc::now(),
+            latitude: Some(lat),
+            longitude: Some(lon),
+        }
+    }
+
+    #[test]
+    fn test_cot_producer_config_defaults() {
+        let cfg = CotProducerConfig::default();
+        assert_eq!(cfg.bind_addr.port(), 6969);
+        assert_eq!(cfg.bind_addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(cfg.multicast_group, Some(IpAddr::V4(Ipv4Addr::new(239, 2, 3, 1))));
+        assert_eq!(cfg.stale_seconds, 60);
+        assert_eq!(cfg.cot_type, "a-f-G");
+    }
+
+    #[test]
+    fn test_cot_producer_url_parsing() {
+        let mc = cot_producer_url_to_config("cot-out://239.2.3.1:6969").unwrap();
+        assert_eq!(mc.bind_addr.port(), 6969);
+        assert_eq!(mc.multicast_group, Some(IpAddr::V4(Ipv4Addr::new(239, 2, 3, 1))));
+
+        let alt = cot_producer_url_to_config("cot-out://224.0.0.1:18999").unwrap();
+        assert_eq!(alt.bind_addr.port(), 18999);
+
+        // Non-multicast IP clears the group
+        let uc = cot_producer_url_to_config("cot-out://10.0.0.1:6969").unwrap();
+        assert!(uc.multicast_group.is_none());
+
+        let tcp = cot_producer_url_to_config("cot-out-tcp://127.0.0.1:8089").unwrap();
+        assert_eq!(tcp.bind_addr.port(), 8089);
+        assert_eq!(tcp.multicast_group, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+
+        assert!(cot_producer_url_to_config("foo://bar").is_err());
+        assert!(cot_producer_url_to_config("no-scheme").is_err());
+        assert!(cot_producer_url_to_config("cot-out://no-port").is_err());
+    }
+
+    #[test]
+    fn test_source_event_to_cot_ship_and_aircraft() {
+        let cfg = CotProducerConfig::default();
+
+        // Ship with explicit callsign
+        let mut ship_props: HashMap<String, serde_json::Value> = HashMap::new();
+        ship_props.insert("callsign".into(), serde_json::json!("Black Pearl"));
+        let mut ship = make_event("ship", 36.123, -121.456);
+        ship.properties = ship_props;
+        let cot_s = source_event_to_cot(&ship, &cfg);
+        assert_eq!(cot_s.event_type, "a-f-S");
+        assert_eq!(cot_s.callsign.as_deref(), Some("Black Pearl"));
+        let xml_s = emit_cot_xml(&cot_s);
+        assert!(xml_s.contains("type=\"a-f-S\""));
+        assert!(xml_s.contains("lat=\"36.123\""));
+        assert!(xml_s.contains("lon=\"-121.456\""));
+
+        // Aircraft falls back to entity_id as callsign and "a-f-A" type
+        let air = make_event("aircraft", 51.5, -0.1);
+        let cot_a = source_event_to_cot(&air, &cfg);
+        assert_eq!(cot_a.event_type, "a-f-A");
+        assert!(emit_cot_xml(&cot_a).contains("type=\"a-f-A\""));
+
+        // Property override beats entity_type defaults
+        let mut over_props: HashMap<String, serde_json::Value> = HashMap::new();
+        over_props.insert("cot_type".into(), serde_json::json!("a-h-A"));
+        let mut over = make_event("ship", 0.0, 0.0);
+        over.properties = over_props;
+        assert_eq!(source_event_to_cot(&over, &cfg).event_type, "a-h-A");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_cot_producer_unicast_round_trip() {
+        // Bind a receiver on an ephemeral port; instruct the producer to
+        // send unicast there via ORP_COT_PEERS.  Multicast is disabled in
+        // the config to keep the test deterministic.
+        let recv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        // SAFETY: env mutation is global; this test runs with default
+        // cargo test threading and clears the var on exit.
+        unsafe { std::env::set_var("ORP_COT_PEERS", recv_addr.to_string()); }
+
+        let cfg = CotProducerConfig {
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            multicast_group: None,
+            ..CotProducerConfig::default()
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<SourceEvent>(4);
+        let handle = spawn_cot_producer(cfg, rx);
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        tx.send(make_event("sar_aircraft", 45.0, -90.0)).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _src) = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            recv.recv_from(&mut buf),
+        )
+        .await
+        .expect("CoT packet timeout")
+        .expect("recv_from failed");
+        let xml = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(xml.contains("<event "));
+        assert!(xml.contains("type=\"a-f-A\""));
+        assert!(xml.contains("lat=\"45\""));
+        assert!(xml.contains("lon=\"-90\""));
+
+        drop(tx);
+        let _ = handle.await;
+        unsafe { std::env::remove_var("ORP_COT_PEERS"); }
     }
 }

@@ -693,8 +693,20 @@ pub struct AnalyticsEngine {
 }
 
 impl AnalyticsEngine {
+    /// Default analytics engine.
+    ///
+    /// `track_len` defaults to 50 (down from a previous 500). At 500 the
+    /// engine held ~2.4 GB of in-memory track buffers at 100K entities,
+    /// which broke the Pi-class edge target. Operators that need deeper
+    /// history can opt back in via `with_config` or by setting the env var
+    /// `ORP_TRACK_LEN`.
     pub fn new() -> Self {
-        Self::with_config(500, 30.0, 50.0, 30.0, 0.5, 20.0)
+        let track_len = std::env::var("ORP_TRACK_LEN")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(50);
+        Self::with_config(track_len, 30.0, 50.0, 30.0, 0.5, 20.0)
     }
 
     pub fn with_config(

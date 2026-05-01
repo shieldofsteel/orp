@@ -7,6 +7,7 @@ pub mod canbus;
 pub mod cap;
 pub mod cef;
 pub mod nmea;
+pub mod mavlink;
 pub mod cot;
 pub mod csv_watcher;
 pub mod database;

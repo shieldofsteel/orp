@@ -23,7 +23,11 @@ impl CsvWatcherConnector {
         }
     }
 
-    /// Parse a CSV file with headers, returning SourceEvents
+    /// Parse a CSV file with headers, returning SourceEvents.
+    ///
+    /// Uses the `csv` crate so quoted fields containing commas
+    /// (e.g. `"Doe, John",51.5,-0.1`) parse correctly. The previous
+    /// `line.split(',')` approach silently dropped or corrupted such rows.
     pub fn parse_csv_with_headers(
         content: &str,
         entity_type: &str,
@@ -32,25 +36,27 @@ impl CsvWatcherConnector {
         lat_column: &str,
         lon_column: &str,
     ) -> Vec<SourceEvent> {
-        let mut lines = content.lines();
-        let headers: Vec<&str> = match lines.next() {
-            Some(header_line) => header_line.split(',').map(|h| h.trim()).collect(),
-            None => return vec![],
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .trim(csv::Trim::All)
+            .flexible(true) // tolerate ragged rows; we'll filter in-loop.
+            .from_reader(content.as_bytes());
+
+        let headers: Vec<String> = match reader.headers() {
+            Ok(h) => h.iter().map(|s| s.to_string()).collect(),
+            Err(_) => return vec![],
         };
 
-        let id_idx = headers.iter().position(|h| *h == id_column);
-        let lat_idx = headers.iter().position(|h| *h == lat_column);
-        let lon_idx = headers.iter().position(|h| *h == lon_column);
+        let id_idx = headers.iter().position(|h| h == id_column);
+        let lat_idx = headers.iter().position(|h| h == lat_column);
+        let lon_idx = headers.iter().position(|h| h == lon_column);
 
-        lines
-            .filter_map(|line| {
-                let fields: Vec<&str> = line.split(',').map(|f| f.trim()).collect();
-                if fields.len() < headers.len() {
-                    return None;
-                }
-
+        reader
+            .records()
+            .filter_map(Result::ok)
+            .filter_map(|record| {
                 let entity_id = id_idx
-                    .and_then(|i| fields.get(i))
+                    .and_then(|i| record.get(i))
                     .map(|s| s.to_string())
                     .unwrap_or_default();
                 if entity_id.is_empty() {
@@ -58,24 +64,23 @@ impl CsvWatcherConnector {
                 }
 
                 let latitude = lat_idx
-                    .and_then(|i| fields.get(i))
+                    .and_then(|i| record.get(i))
                     .and_then(|s| s.parse::<f64>().ok());
                 let longitude = lon_idx
-                    .and_then(|i| fields.get(i))
+                    .and_then(|i| record.get(i))
                     .and_then(|s| s.parse::<f64>().ok());
 
                 let mut properties = HashMap::new();
                 for (i, header) in headers.iter().enumerate() {
                     if Some(i) != id_idx && Some(i) != lat_idx && Some(i) != lon_idx {
-                        if let Some(value) = fields.get(i) {
-                            // Try to parse as number, else string
+                        if let Some(value) = record.get(i) {
+                            // Try number → bool → fall back to string.
                             if let Ok(n) = value.parse::<f64>() {
-                                properties.insert(header.to_string(), serde_json::json!(n));
+                                properties.insert(header.clone(), serde_json::json!(n));
                             } else if let Ok(b) = value.parse::<bool>() {
-                                properties.insert(header.to_string(), serde_json::json!(b));
+                                properties.insert(header.clone(), serde_json::json!(b));
                             } else {
-                                properties
-                                    .insert(header.to_string(), serde_json::json!(value));
+                                properties.insert(header.clone(), serde_json::json!(value));
                             }
                         }
                     }

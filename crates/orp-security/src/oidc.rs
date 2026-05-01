@@ -165,8 +165,12 @@ pub struct RefreshRequest {
 pub struct OidcClient {
     pub config: OidcConfig,
     http: Client,
-    /// Cached discovery document
-    discovery: Option<OidcDiscovery>,
+    /// Cached discovery document with the timestamp of the last successful
+    /// fetch. The cache is honoured up to `discovery_ttl`; beyond that we
+    /// re-fetch so identity-provider key/endpoint rotations are picked up
+    /// without a server restart.
+    discovery: Option<(OidcDiscovery, std::time::Instant)>,
+    discovery_ttl: std::time::Duration,
     /// Optional local JWT service — if set, we issue our own JWTs wrapping provider claims
     jwt_service: Option<Arc<JwtService>>,
 }
@@ -178,8 +182,21 @@ impl OidcClient {
             config,
             http: Client::new(),
             discovery: None,
+            // Default 1 hour. Override via `with_discovery_ttl` or via the
+            // `ORP_OIDC_DISCOVERY_TTL_SECS` env var (read in `new`).
+            discovery_ttl: std::env::var("ORP_OIDC_DISCOVERY_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(std::time::Duration::from_secs)
+                .unwrap_or_else(|| std::time::Duration::from_secs(3600)),
             jwt_service: None,
         }
+    }
+
+    /// Override the discovery cache TTL (mostly for tests).
+    pub fn with_discovery_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.discovery_ttl = ttl;
+        self
     }
 
     /// Create with an attached JWT service for local token issuance.
@@ -190,9 +207,19 @@ impl OidcClient {
     }
 
     /// Fetch and cache the OIDC discovery document.
+    ///
+    /// Honours the cache while it's within `discovery_ttl`. After the TTL
+    /// expires we re-fetch; on fetch failure we fall back to the (still
+    /// cached) document and log a warning rather than failing closed.
     pub async fn discover(&mut self) -> Result<OidcDiscovery, OidcError> {
         if !self.config.enabled {
             return Err(OidcError::NotConfigured);
+        }
+
+        if let Some((doc, fetched_at)) = &self.discovery {
+            if fetched_at.elapsed() < self.discovery_ttl {
+                return Ok(doc.clone());
+            }
         }
 
         let url = format!(
@@ -200,18 +227,34 @@ impl OidcClient {
             self.config.provider_url.trim_end_matches('/')
         );
 
-        let discovery: OidcDiscovery = self
+        match self
             .http
             .get(&url)
             .send()
             .await
-            .map_err(|e| OidcError::DiscoveryFailed(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| OidcError::DiscoveryFailed(e.to_string()))?;
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(resp) => match resp.json::<OidcDiscovery>().await {
+                Ok(discovery) => {
+                    self.discovery = Some((discovery.clone(), std::time::Instant::now()));
+                    Ok(discovery)
+                }
+                Err(e) => self.fall_back_or_fail(OidcError::DiscoveryFailed(e.to_string())),
+            },
+            Err(e) => self.fall_back_or_fail(OidcError::DiscoveryFailed(e.to_string())),
+        }
+    }
 
-        self.discovery = Some(discovery.clone());
-        Ok(discovery)
+    /// On refresh failure, return the still-cached discovery doc (with a
+    /// warning) rather than failing closed. If nothing is cached, surface
+    /// the original error.
+    fn fall_back_or_fail(&self, err: OidcError) -> Result<OidcDiscovery, OidcError> {
+        if let Some((doc, _)) = &self.discovery {
+            tracing::warn!(error = %err, "OIDC discovery refresh failed; using cached document");
+            Ok(doc.clone())
+        } else {
+            Err(err)
+        }
     }
 
     /// Get the authorization redirect URL to send the browser to.
@@ -223,6 +266,7 @@ impl OidcClient {
         let discovery = self
             .discovery
             .as_ref()
+            .map(|(doc, _)| doc)
             .ok_or_else(|| OidcError::DiscoveryFailed("Discovery not loaded".into()))?;
 
         let mut scopes = vec!["openid", "profile", "email"];
@@ -248,6 +292,7 @@ impl OidcClient {
         let discovery = self
             .discovery
             .as_ref()
+            .map(|(doc, _)| doc)
             .ok_or_else(|| OidcError::DiscoveryFailed("Discovery not loaded".into()))?;
 
         let params = [
@@ -283,6 +328,7 @@ impl OidcClient {
         let discovery = self
             .discovery
             .as_ref()
+            .map(|(doc, _)| doc)
             .ok_or_else(|| OidcError::DiscoveryFailed("Discovery not loaded".into()))?;
 
         let params = [
@@ -328,11 +374,13 @@ impl OidcClient {
 
         if !self.config.enabled {
             // Permissive dev mode
+            let now = Utc::now().timestamp();
             Ok(Claims {
                 sub: "anonymous".to_string(),
                 email: None,
                 name: Some("Anonymous User (dev mode)".to_string()),
-                iat: Utc::now().timestamp(),
+                iat: now,
+                nbf: Some(now),
                 exp: (Utc::now() + Duration::hours(1)).timestamp(),
                 iss: self.config.jwt_issuer.clone(),
                 aud: "orp-client".to_string(),

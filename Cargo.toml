@@ -13,6 +13,7 @@ members = [
     "crates/orp-geospatial",
     "crates/orp-security",
     "crates/orp-testbed",
+    "crates/orp-ml",
 ]
 
 [workspace.package]

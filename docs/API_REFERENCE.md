@@ -446,7 +446,7 @@ curl -X POST http://localhost:9090/api/v1/query/natural \
 
 ### POST /graph — Execute Cypher Query
 
-Execute a raw Kuzu Cypher query for advanced graph traversal.
+Execute a Cypher-style graph query against the DuckDB graph projection for advanced traversal.
 
 ```bash
 curl -X POST http://localhost:9090/api/v1/graph \

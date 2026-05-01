@@ -109,7 +109,7 @@ ORP v0.1.0 starting...
 ✓ Config loaded: maritime template
 ✓ Storage initialized at ~/.orp/data/
   - DuckDB: ready (0 entities)
-  - Kuzu: ready (0 nodes)
+  - Graph projection: ready (0 nodes, 0 edges)
   - RocksDB: ready (clean state)
 ✓ Security: Ed25519 signing enabled
 ✓ Audit log: initialized (seq 0)

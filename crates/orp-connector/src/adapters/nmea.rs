@@ -409,6 +409,105 @@ pub mod ais_decoder {
             lat: decode_lat(lat_raw),
         })
     }
+
+    /// Decoded Base Station Report (message type 4, 168 bits).
+    /// Layout: type(6) repeat(2) mmsi(30) year(14) month(4) day(5)
+    /// hour(5) min(6) sec(6) pos_acc(1) lon(28s) lat(27s) fix_type(4)
+    /// spare(10) raim(1) comm_state(19).
+    #[derive(Debug, Clone)]
+    pub struct AisType4 {
+        pub mmsi: u32,
+        pub year: u16, pub month: u8, pub day: u8,
+        pub hour: u8, pub minute: u8, pub second: u8,
+        pub position_accuracy: bool,
+        pub lat: f64, pub lon: f64,
+        pub fix_type: u8, pub raim: bool,
+    }
+
+    /// Decode message type 4 from a packed bit buffer.
+    pub fn decode_type_4(buf: &BitBuffer<'_>) -> Option<AisType4> {
+        if buf.total_bits < 168 { return None; }
+        if buf.get_bits(0, 6)? as u8 != 4 { return None; }
+        Some(AisType4 {
+            mmsi: buf.get_bits(8, 30)? as u32,
+            year: buf.get_bits(38, 14)? as u16,
+            month: buf.get_bits(52, 4)? as u8,
+            day: buf.get_bits(56, 5)? as u8,
+            hour: buf.get_bits(61, 5)? as u8,
+            minute: buf.get_bits(66, 6)? as u8,
+            second: buf.get_bits(72, 6)? as u8,
+            position_accuracy: buf.get_bits(78, 1)? == 1,
+            lon: decode_lon(buf.get_signed(79, 28)?),
+            lat: decode_lat(buf.get_signed(107, 27)?),
+            fix_type: buf.get_bits(134, 4)? as u8,
+            raim: buf.get_bits(148, 1)? == 1,
+        })
+    }
+
+    /// Decoded SAR Aircraft Position Report (message type 9, 168 bits).
+    /// Layout: type(6) repeat(2) mmsi(30) alt_m(12, 4095=N/A)
+    /// sog_kts(10, 1023=N/A) pos_acc(1) lon(28s) lat(27s) cog(12, 1/10 deg)
+    /// ts(6) regional(8) dte(1) spare(3) assigned(1) raim(1) radio(20).
+    #[derive(Debug, Clone)]
+    pub struct AisType9 {
+        pub mmsi: u32,
+        pub altitude_m: u16,
+        pub sog: u16,
+        pub position_accuracy: bool,
+        pub lat: f64, pub lon: f64,
+        pub cog: f32, pub time_stamp: u8, pub raim: bool,
+    }
+
+    /// Decode message type 9 from a packed bit buffer.
+    pub fn decode_type_9(buf: &BitBuffer<'_>) -> Option<AisType9> {
+        if buf.total_bits < 168 { return None; }
+        if buf.get_bits(0, 6)? as u8 != 9 { return None; }
+        // RAIM at bit 147 (after regional 8 + dte 1 + spare 3 + assigned 1).
+        Some(AisType9 {
+            mmsi: buf.get_bits(8, 30)? as u32,
+            altitude_m: buf.get_bits(38, 12)? as u16,
+            sog: buf.get_bits(50, 10)? as u16,
+            position_accuracy: buf.get_bits(60, 1)? == 1,
+            lon: decode_lon(buf.get_signed(61, 28)?),
+            lat: decode_lat(buf.get_signed(89, 27)?),
+            cog: buf.get_bits(116, 12)? as f32 / 10.0,
+            time_stamp: buf.get_bits(128, 6)? as u8,
+            raim: buf.get_bits(147, 1)? == 1,
+        })
+    }
+
+    /// Decoded Long-range AIS broadcast (message type 27, 96 bits — LOW
+    /// precision: lat 17-bit / lon 18-bit, both 1/10 minute scaling).
+    /// Layout: type(6) repeat(2) mmsi(30) pos_acc(1) raim(1) nav(4)
+    /// lon(18s) lat(17s) sog(6,63=N/A) cog(9,511=N/A) gnss(1) spare(1).
+    #[derive(Debug, Clone)]
+    pub struct AisType27 {
+        pub mmsi: u32,
+        pub position_accuracy: bool, pub raim: bool, pub nav_status: u8,
+        pub lat: f64, pub lon: f64,
+        pub sog: u8, pub cog: u16, pub gnss_status: bool,
+    }
+
+    /// Type 27 lon/lat scaling: 1/10 minute = 1/600 deg.  17-bit lat,
+    /// 18-bit lon, both signed.
+    fn decode_t27_coord(raw: i64) -> f64 { raw as f64 / 600.0 }
+
+    /// Decode message type 27 from a packed bit buffer.
+    pub fn decode_type_27(buf: &BitBuffer<'_>) -> Option<AisType27> {
+        if buf.total_bits < 96 { return None; }
+        if buf.get_bits(0, 6)? as u8 != 27 { return None; }
+        Some(AisType27 {
+            mmsi: buf.get_bits(8, 30)? as u32,
+            position_accuracy: buf.get_bits(38, 1)? == 1,
+            raim: buf.get_bits(39, 1)? == 1,
+            nav_status: buf.get_bits(40, 4)? as u8,
+            lon: decode_t27_coord(buf.get_signed(44, 18)?),
+            lat: decode_t27_coord(buf.get_signed(62, 17)?),
+            sog: buf.get_bits(79, 6)? as u8,
+            cog: buf.get_bits(85, 9)? as u16,
+            gnss_status: buf.get_bits(94, 1)? == 1,
+        })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -482,6 +581,25 @@ pub enum NmeaData {
         name: String,
         lat: f64,
         lon: f64,
+    },
+    /// `!AIVDM` / `!AIVDO` — Base station report (type 4)
+    AisBaseStation {
+        mmsi: u32, lat: f64, lon: f64,
+        utc_year: u16, utc_month: u8, utc_day: u8,
+        utc_hour: u8, utc_minute: u8, utc_second: u8,
+        fix_type: u8, raim: bool, position_accuracy: bool,
+    },
+    /// `!AIVDM` / `!AIVDO` — Standard SAR aircraft position (type 9)
+    AisSarAircraft {
+        mmsi: u32, lat: f64, lon: f64,
+        altitude_m: u16, sog: u16, cog: f32, time_stamp: u8,
+        raim: bool, position_accuracy: bool,
+    },
+    /// `!AIVDM` / `!AIVDO` — Long-range broadcast (type 27)
+    AisLongRange {
+        mmsi: u32, lat: f64, lon: f64,
+        sog: u8, cog: u16, nav_status: u8,
+        raim: bool, position_accuracy: bool, gnss_status: bool,
     },
     /// `$SDDBT` / `$SDDBS` — Depth
     Depth {
@@ -824,6 +942,37 @@ fn decode_ais(payload: &str, fill_bits: u8, own_vessel: bool) -> Option<NmeaData
                 lon: d.lon,
             })
         }
+        4 => {
+            let d = ais_decoder::decode_type_4(&buf)?;
+            if !ais_position_available(d.lat, d.lon) { return None; }
+            Some(NmeaData::AisBaseStation {
+                mmsi: d.mmsi, lat: d.lat, lon: d.lon,
+                utc_year: d.year, utc_month: d.month, utc_day: d.day,
+                utc_hour: d.hour, utc_minute: d.minute, utc_second: d.second,
+                fix_type: d.fix_type, raim: d.raim,
+                position_accuracy: d.position_accuracy,
+            })
+        }
+        9 => {
+            let d = ais_decoder::decode_type_9(&buf)?;
+            if !ais_position_available(d.lat, d.lon) { return None; }
+            Some(NmeaData::AisSarAircraft {
+                mmsi: d.mmsi, lat: d.lat, lon: d.lon,
+                altitude_m: d.altitude_m, sog: d.sog, cog: d.cog,
+                time_stamp: d.time_stamp, raim: d.raim,
+                position_accuracy: d.position_accuracy,
+            })
+        }
+        27 => {
+            let d = ais_decoder::decode_type_27(&buf)?;
+            if !ais_position_available(d.lat, d.lon) { return None; }
+            Some(NmeaData::AisLongRange {
+                mmsi: d.mmsi, lat: d.lat, lon: d.lon,
+                sog: d.sog, cog: d.cog, nav_status: d.nav_status,
+                raim: d.raim, position_accuracy: d.position_accuracy,
+                gnss_status: d.gnss_status,
+            })
+        }
         _ => None,
     }
 }
@@ -1120,6 +1269,78 @@ impl NmeaData {
                     timestamp: Utc::now(),
                     latitude: None,
                     longitude: None,
+                }
+            }
+            NmeaData::AisBaseStation {
+                mmsi, lat, lon,
+                utc_year, utc_month, utc_day, utc_hour, utc_minute, utc_second,
+                fix_type, raim, position_accuracy,
+            } => {
+                let props: HashMap<String, Json> = [
+                    ("mmsi", Json::from(*mmsi)),
+                    ("utc_year", Json::from(*utc_year)),
+                    ("utc_month", Json::from(*utc_month)),
+                    ("utc_day", Json::from(*utc_day)),
+                    ("utc_hour", Json::from(*utc_hour)),
+                    ("utc_minute", Json::from(*utc_minute)),
+                    ("utc_second", Json::from(*utc_second)),
+                    ("fix_type", Json::from(*fix_type)),
+                    ("raim", Json::from(*raim)),
+                    ("position_accuracy", Json::from(*position_accuracy)),
+                ].into_iter().map(|(k, v)| (k.into(), v)).collect();
+                SourceEvent {
+                    connector_id: connector_id.into(),
+                    entity_id: format!("ais_base:{mmsi}"),
+                    entity_type: "ais_base_station".into(),
+                    properties: props,
+                    timestamp: Utc::now(),
+                    latitude: Some(*lat),
+                    longitude: Some(*lon),
+                }
+            }
+            NmeaData::AisSarAircraft {
+                mmsi, lat, lon, altitude_m, sog, cog, time_stamp, raim, position_accuracy,
+            } => {
+                let props: HashMap<String, Json> = [
+                    ("mmsi", Json::from(*mmsi)),
+                    ("altitude_m", Json::from(*altitude_m)),
+                    ("sog", Json::from(*sog)),
+                    ("cog", Json::from(*cog)),
+                    ("time_stamp", Json::from(*time_stamp)),
+                    ("raim", Json::from(*raim)),
+                    ("position_accuracy", Json::from(*position_accuracy)),
+                ].into_iter().map(|(k, v)| (k.into(), v)).collect();
+                SourceEvent {
+                    connector_id: connector_id.into(),
+                    entity_id: format!("mmsi:{mmsi}"),
+                    entity_type: "sar_aircraft".into(),
+                    properties: props,
+                    timestamp: Utc::now(),
+                    latitude: Some(*lat),
+                    longitude: Some(*lon),
+                }
+            }
+            NmeaData::AisLongRange {
+                mmsi, lat, lon, sog, cog, nav_status, raim, position_accuracy, gnss_status,
+            } => {
+                let props: HashMap<String, Json> = [
+                    ("mmsi", Json::from(*mmsi)),
+                    ("sog", Json::from(*sog)),
+                    ("cog", Json::from(*cog)),
+                    ("nav_status", Json::from(*nav_status)),
+                    ("raim", Json::from(*raim)),
+                    ("position_accuracy", Json::from(*position_accuracy)),
+                    ("gnss_status", Json::from(*gnss_status)),
+                    ("long_range", Json::from(true)),
+                ].into_iter().map(|(k, v)| (k.into(), v)).collect();
+                SourceEvent {
+                    connector_id: connector_id.into(),
+                    entity_id: format!("mmsi:{mmsi}"),
+                    entity_type: "ship".into(),
+                    properties: props,
+                    timestamp: Utc::now(),
+                    latitude: Some(*lat),
+                    longitude: Some(*lon),
                 }
             }
         }
@@ -1984,5 +2205,181 @@ mod tests {
             assert!(own_vessel);
         }
         // If parse failed (bad payload for this talker), that's OK — no panic
+    }
+
+    // ── AIS types 4, 9, 27 ────────────────────────────────────────────────────
+
+    /// Pack `(value, bits)` fields MSB-first into an AIVDM 6-bit payload.
+    /// Used to hand-craft AIS payloads whose layout is documented inline.
+    fn pack_to_aivdm_payload(fields: &[(u64, usize)]) -> (String, u8) {
+        let mut bits: Vec<bool> = Vec::new();
+        for (val, w) in fields {
+            for shift in (0..*w).rev() { bits.push((val >> shift) & 1 == 1); }
+        }
+        let total = bits.len();
+        let pad = (6 - (total % 6)) % 6;
+        let mut s = String::with_capacity((total + pad) / 6);
+        for chunk in 0..(total + pad) / 6 {
+            let mut v = 0u8;
+            for j in 0..6 {
+                let i = chunk * 6 + j;
+                v = (v << 1) | (if i < total && bits[i] { 1 } else { 0 });
+            }
+            s.push(if v < 40 { (v + 48) as char } else { (v + 56) as char });
+        }
+        (s, pad as u8)
+    }
+
+    fn aivdm_sentence(fields: &[(u64, usize)]) -> String {
+        let (payload, fill) = pack_to_aivdm_payload(fields);
+        let body = format!("AIVDM,1,1,,A,{},{}", payload, fill);
+        format!("!{}*{:02X}", body, compute_checksum(&body))
+    }
+
+    fn signed_mask(value: i64, bits: usize) -> u64 {
+        (value as u64) & ((1u64 << bits) - 1)
+    }
+
+    #[test]
+    fn test_ais_type4_decode_and_to_source_event() {
+        // Type 4 base station: MMSI 003660057 (US Coast Guard),
+        // 2024-03-15 12:34:56 UTC, lat 37.5°N, lon -122.5°W, fix=GPS.
+        // 1/10000-min scaling: 37.5×600000 = 22_500_000; -122.5×600000 = -73_500_000.
+        // Layout (168): type(6) rep(2) mmsi(30) year(14) mon(4) day(5) hr(5)
+        //   min(6) sec(6) acc(1) lon(28s) lat(27s) fix(4) spare(10) raim(1) comm(19)
+        let s = aivdm_sentence(&[
+            (4, 6), (0, 2), (3_660_057, 30),
+            (2024, 14), (3, 4), (15, 5), (12, 5), (34, 6), (56, 6),
+            (1, 1), (signed_mask(-73_500_000, 28), 28),
+            (signed_mask(22_500_000, 27), 27),
+            (1, 4), (0, 10), (0, 1), (0, 19),
+        ]);
+        let mut asm = AisAssembler::default();
+        let data = parse_sentence(&s, &mut asm).expect("type 4 parses");
+        match &data {
+            NmeaData::AisBaseStation { mmsi, lat, lon, utc_year, utc_month, fix_type, .. } => {
+                assert_eq!(*mmsi, 3_660_057);
+                assert_eq!(*utc_year, 2024);
+                assert_eq!(*utc_month, 3);
+                assert!((*lat - 37.5).abs() < 1e-4);
+                assert!((*lon - (-122.5)).abs() < 1e-4);
+                assert_eq!(*fix_type, 1);
+            }
+            other => panic!("expected AisBaseStation, got {:?}", other),
+        }
+        let ev = data.to_source_event("nmea-bs");
+        assert_eq!(ev.entity_type, "ais_base_station");
+        assert_eq!(ev.entity_id, "ais_base:3660057");
+    }
+
+    #[test]
+    fn test_ais_type4_decode_direct_buffer() {
+        // Same fixture exercised through the raw bit-buffer decoder.
+        let (payload, fill) = pack_to_aivdm_payload(&[
+            (4, 6), (0, 2), (3_660_057, 30),
+            (2024, 14), (3, 4), (15, 5), (12, 5), (34, 6), (56, 6),
+            (1, 1), (signed_mask(-73_500_000, 28), 28),
+            (signed_mask(22_500_000, 27), 27),
+            (1, 4), (0, 10), (1, 1), (0, 19),
+        ]);
+        let bytes = ais_decoder::decode_payload(&payload, fill).unwrap();
+        let buf = ais_decoder::make_buffer(&bytes, payload.len() * 6 - fill as usize);
+        let d = ais_decoder::decode_type_4(&buf).unwrap();
+        assert_eq!((d.day, d.hour, d.minute, d.second), (15, 12, 34, 56));
+        assert!(d.raim && d.position_accuracy);
+    }
+
+    #[test]
+    fn test_ais_type9_decode_and_to_source_event() {
+        // SAR aircraft over the English Channel: MMSI 111222333,
+        // lat 50.5°N (30_300_000), lon 1.0°E (600_000), alt 800 m, sog 200 kts,
+        // cog 270.0°, ts 30, raim=1.
+        // Layout (168): type(6) rep(2) mmsi(30) alt(12) sog(10) acc(1)
+        //   lon(28s) lat(27s) cog(12) ts(6) regional(8) dte(1) spare(3)
+        //   assigned(1) raim(1) radio(20)
+        let s = aivdm_sentence(&[
+            (9, 6), (0, 2), (111_222_333, 30),
+            (800, 12), (200, 10), (1, 1),
+            (signed_mask(600_000, 28), 28),
+            (signed_mask(30_300_000, 27), 27),
+            (2700, 12), (30, 6),
+            (0, 8), (0, 1), (0, 3), (0, 1), (1, 1), (0, 20),
+        ]);
+        let mut asm = AisAssembler::default();
+        let data = parse_sentence(&s, &mut asm).expect("type 9 parses");
+        match &data {
+            NmeaData::AisSarAircraft { mmsi, altitude_m, sog, lat, lon, cog, raim, .. } => {
+                assert_eq!((*mmsi, *altitude_m, *sog), (111_222_333, 800, 200));
+                assert!((*lat - 50.5).abs() < 1e-4);
+                assert!((*lon - 1.0).abs() < 1e-4);
+                assert!((*cog - 270.0).abs() < 0.01);
+                assert!(*raim);
+            }
+            other => panic!("expected AisSarAircraft, got {:?}", other),
+        }
+        let ev = data.to_source_event("nmea-sar");
+        assert_eq!(ev.entity_type, "sar_aircraft");
+        assert_eq!(ev.entity_id, "mmsi:111222333");
+    }
+
+    #[test]
+    fn test_ais_type9_decode_direct_buffer() {
+        // Probe N/A sentinels: alt=4095, sog=1023.
+        let (payload, fill) = pack_to_aivdm_payload(&[
+            (9, 6), (0, 2), (111_222_333, 30),
+            (4095, 12), (1023, 10), (0, 1),
+            (signed_mask(600_000, 28), 28),
+            (signed_mask(30_300_000, 27), 27),
+            (3600, 12), (60, 6),
+            (0, 8), (0, 1), (0, 3), (0, 1), (0, 1), (0, 20),
+        ]);
+        let bytes = ais_decoder::decode_payload(&payload, fill).unwrap();
+        let buf = ais_decoder::make_buffer(&bytes, payload.len() * 6 - fill as usize);
+        let d = ais_decoder::decode_type_9(&buf).unwrap();
+        assert_eq!((d.altitude_m, d.sog), (4095, 1023));
+        assert!(!d.raim);
+    }
+
+    #[test]
+    fn test_ais_type27_decode_and_to_source_event() {
+        // Long-range coastal broadcast (LOWER precision: lat 17 / lon 18 bits,
+        // 1/10-minute scaling).  60.0×600 = 36_000;  -30.0×600 = -18_000.
+        // Layout (96): type(6) rep(2) mmsi(30) acc(1) raim(1) nav(4)
+        //   lon(18s) lat(17s) sog(6) cog(9) gnss(1) spare(1)
+        let s = aivdm_sentence(&[
+            (27, 6), (0, 2), (244_123_456, 30),
+            (1, 1), (0, 1), (0, 4),
+            (signed_mask(-18_000, 18), 18), (signed_mask(36_000, 17), 17),
+            (12, 6), (90, 9), (0, 1), (0, 1),
+        ]);
+        let mut asm = AisAssembler::default();
+        let data = parse_sentence(&s, &mut asm).expect("type 27 parses");
+        match &data {
+            NmeaData::AisLongRange { mmsi, lat, lon, sog, cog, .. } => {
+                assert_eq!(*mmsi, 244_123_456);
+                assert!((*lat - 60.0).abs() < 1e-3);
+                assert!((*lon - (-30.0)).abs() < 1e-3);
+                assert_eq!((*sog, *cog), (12, 90));
+            }
+            other => panic!("expected AisLongRange, got {:?}", other),
+        }
+        let ev = data.to_source_event("nmea-lr");
+        assert_eq!(ev.entity_type, "ship");
+        assert_eq!(ev.entity_id, "mmsi:244123456");
+        assert_eq!(ev.properties.get("long_range").unwrap(), &Json::from(true));
+    }
+
+    #[test]
+    fn test_ais_type27_rejects_sentinel_position() {
+        // 91.0×600 = 54_600 fits in 17 unsigned bits — must be rejected
+        // as the M.1371 "not available" sentinel by the dispatcher.
+        let s = aivdm_sentence(&[
+            (27, 6), (0, 2), (244_999_999, 30),
+            (0, 1), (0, 1), (15, 4),
+            (signed_mask(108_600, 18), 18), (signed_mask(54_600, 17), 17),
+            (63, 6), (511, 9), (1, 1), (0, 1),
+        ]);
+        let mut asm = AisAssembler::default();
+        assert!(parse_sentence(&s, &mut asm).is_none());
     }
 }

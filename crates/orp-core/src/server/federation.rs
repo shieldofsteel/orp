@@ -525,7 +525,25 @@ async fn upsert_federated_entity(
 /// ```
 pub fn spawn_federation_sync(state: Arc<AppState>) {
     tokio::spawn(async move {
-        let interval = std::time::Duration::from_secs(30);
+        // Per-peer adaptive backoff state. On success we reset to the base
+        // interval; on failure we double the wait (capped) so a flapping
+        // satellite/4G uplink doesn't burn bandwidth and CPU.
+        use std::collections::HashMap;
+        let base_interval = std::time::Duration::from_secs(
+            std::env::var("ORP_FED_BASE_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
+        );
+        let max_interval = std::time::Duration::from_secs(
+            std::env::var("ORP_FED_MAX_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(600),
+        );
+        let mut next_run_at: HashMap<String, tokio::time::Instant> = HashMap::new();
+        let mut backoff: HashMap<String, std::time::Duration> = HashMap::new();
+
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(25))
             .user_agent(concat!("ORP-federation/", env!("CARGO_PKG_VERSION")))
@@ -533,7 +551,9 @@ pub fn spawn_federation_sync(state: Arc<AppState>) {
             .unwrap_or_default();
 
         loop {
-            tokio::time::sleep(interval).await;
+            // Wake every 5 s and check who's due. This keeps the loop cheap
+            // and gives sub-base_interval responsiveness when a peer recovers.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
             let registry = match &state.federation_registry {
                 Some(r) => r.clone(),
@@ -545,8 +565,16 @@ pub fn spawn_federation_sync(state: Arc<AppState>) {
                 continue;
             }
 
+            let now = tokio::time::Instant::now();
             for peer in peers {
                 if !peer.sync_enabled {
+                    continue;
+                }
+                let due = next_run_at
+                    .get(&peer.id)
+                    .map(|t| now >= *t)
+                    .unwrap_or(true);
+                if !due {
                     continue;
                 }
 
@@ -558,9 +586,23 @@ pub fn spawn_federation_sync(state: Arc<AppState>) {
                             "Federation sync completed"
                         );
                         registry.update_last_seen(&peer.id).await;
+                        backoff.insert(peer.id.clone(), base_interval);
+                        next_run_at.insert(peer.id.clone(), now + base_interval);
                     }
                     Err(e) => {
-                        warn!(peer_id = %peer.id, error = %e, "Federation sync failed");
+                        let prev = backoff
+                            .get(&peer.id)
+                            .copied()
+                            .unwrap_or(base_interval);
+                        let next = (prev.saturating_mul(2)).min(max_interval);
+                        warn!(
+                            peer_id = %peer.id,
+                            error = %e,
+                            backoff_secs = next.as_secs(),
+                            "Federation sync failed; backing off"
+                        );
+                        backoff.insert(peer.id.clone(), next);
+                        next_run_at.insert(peer.id.clone(), now + next);
                     }
                 }
             }

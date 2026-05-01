@@ -1,7 +1,7 @@
 {
   "name": "@orp/client",
   "version": "0.1.0",
-  "description": "Official JavaScript/TypeScript SDK for ORP (Open Relationship Protocol)",
+  "description": "Official JavaScript/TypeScript SDK for ORP (Open Reality Protocol)",
   "main": "dist/index.js",
   "module": "dist/index.esm.js",
   "types": "dist/index.d.ts",
@@ -18,14 +18,14 @@
   },
   "keywords": [
     "orp",
-    "open-relationship-protocol",
+    "open-reality-protocol",
     "knowledge-graph",
     "entities",
     "relationships",
     "federation"
   ],
-  "author": "",
-  "license": "MIT",
+  "author": "Shield of Steel <sentinel@shieldofsteel.com>",
+  "license": "Apache-2.0",
   "devDependencies": {
     "typescript": "^5.4.0"
   },

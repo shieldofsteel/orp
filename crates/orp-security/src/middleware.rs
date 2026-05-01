@@ -150,10 +150,38 @@ impl AuthState {
     }
 
     /// Development mode — permissive only when ORP_DEV_MODE=true.
+    ///
+    /// **Production safety belt.** The permissive flag also requires
+    /// `ORP_ENV=development` (or `--dev` already having set
+    /// `ORP_DEV_MODE`). If `ORP_ENV` is anything else, an attempt to enable
+    /// permissive mode emits a loud warning and is *ignored* — so leaking
+    /// `ORP_DEV_MODE=true` into prod env doesn't open the front door.
     pub fn dev() -> Self {
-        let permissive = std::env::var("ORP_DEV_MODE")
+        let env = std::env::var("ORP_ENV").unwrap_or_default();
+        let env_ok = env.is_empty()
+            || env == "development"
+            || env == "dev"
+            || env == "test"
+            || env == "ci";
+        let raw_permissive = std::env::var("ORP_DEV_MODE")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
+        let permissive = raw_permissive && env_ok;
+        if raw_permissive && !env_ok {
+            tracing::error!(
+                env = %env,
+                "ORP_DEV_MODE=true but ORP_ENV='{}' — refusing permissive auth. \
+                 Permissive auth is only allowed when ORP_ENV is unset, 'development', 'dev', \
+                 'test', or 'ci'.",
+                env
+            );
+        }
+        if permissive {
+            tracing::warn!(
+                "Permissive auth ENABLED — every request is treated as anonymous admin. \
+                 NEVER set ORP_DEV_MODE=true in production."
+            );
+        }
         Self {
             jwt_service: None,
             api_key_service: None,
@@ -414,6 +442,7 @@ mod tests {
             email: Some("bob@test.com".into()),
             name: Some("Bob".into()),
             iat: 0,
+            nbf: Some(0),
             exp: 9999999999,
             iss: "http://localhost:9090/auth".into(),
             aud: "orp-client".into(),

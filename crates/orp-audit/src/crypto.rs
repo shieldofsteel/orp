@@ -1,5 +1,5 @@
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use rand::RngCore;
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 /// Compute SHA-256 hash of data, returned as hex string
@@ -15,9 +15,13 @@ pub struct EventSigner {
 }
 
 impl EventSigner {
-    /// Generate a new random keypair
+    /// Generate a new random keypair using the OS CSPRNG.
+    ///
+    /// Uses `OsRng` (not `thread_rng`) because the secret material backs
+    /// audit-log signatures — a non-cryptographic RNG would let an attacker
+    /// who can observe one signature predict future ones.
     pub fn new() -> Self {
-        let mut csprng = rand::thread_rng();
+        let mut csprng = OsRng;
         let mut secret_key_bytes = [0u8; 32];
         csprng.fill_bytes(&mut secret_key_bytes);
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);

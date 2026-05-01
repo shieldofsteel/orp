@@ -588,7 +588,7 @@ mod tests {
     #[test]
     fn test_parse_lorawan_frame_data_up() {
         // Unconfirmed Data Up: MHDR(0x40) + DevAddr(4) + FCtrl(1) + FCnt(2) + MIC(4)
-        let mut frame = vec![
+        let frame = vec![
             0x40, // MHDR: UnconfirmedDataUp
             0x04, 0x03, 0x02, 0x01, // DevAddr (LE)
             0x00, // FCtrl: no flags, fopts_len=0
@@ -596,7 +596,6 @@ mod tests {
             // MIC (4 bytes)
             0xAA, 0xBB, 0xCC, 0xDD,
         ];
-        let _ = frame.len();
 
         let parsed = parse_lorawan_frame(&frame).unwrap();
         assert_eq!(parsed.mhdr.mtype, LoRaWanMType::UnconfirmedDataUp);

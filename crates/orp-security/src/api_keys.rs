@@ -3,7 +3,6 @@
 //! Keys follow the format: `orpk_prod_<random-hex>` as specified in the ORP API spec.
 
 use chrono::{DateTime, Duration, Utc};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -291,10 +290,16 @@ impl Default for ApiKeyService {
     }
 }
 
-/// Generate a new API key with the `orpk_prod_` prefix followed by 32 random hex bytes.
+/// Generate a new API key with the `orpk_prod_` prefix followed by 24 random bytes
+/// (48 hex chars ≈ 192 bits of entropy) drawn from the OS CSPRNG.
+///
+/// `OsRng` (not `thread_rng`) is required: API keys grant scoped access to the
+/// API surface, and a non-cryptographic RNG would let an attacker enumerate
+/// valid keys after observing a few.
 fn generate_api_key() -> String {
-    let mut rng = rand::thread_rng();
-    let bytes: Vec<u8> = (0..24).map(|_| rng.gen::<u8>()).collect();
+    use rand::{rngs::OsRng, RngCore};
+    let mut bytes = [0u8; 24];
+    OsRng.fill_bytes(&mut bytes);
     format!("orpk_prod_{}", hex::encode(bytes))
 }
 

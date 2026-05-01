@@ -8,13 +8,20 @@ use crate::dedup::{DedupError, RocksDbDedupWindow};
 use crate::dlq::DeadLetterQueue;
 use async_trait::async_trait;
 use orp_audit::crypto::EventSigner;
+use orp_ml::{features::extract_kinematic_features, AnomalyScorer, NullScorer};
 use orp_proto::{Entity, Event, EventPayload, GeoPoint, OrpEvent};
 use orp_storage::traits::{Storage, StorageError};
 use serde_json::json;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Mutex;
+
+/// Per-entity history retained for ML feature extraction. This is intentionally
+/// independent of `AnalyticsEngine::tracks` so the ML seam works even when no
+/// analytics engine is attached.
+const ML_HISTORY_LEN: usize = 32;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -89,6 +96,12 @@ pub struct DefaultStreamProcessor {
     latency_count: Mutex<u64>,
     /// Optional analytics engine — fed on every position update for CPA / anomaly / threat scoring.
     analytics: Option<Arc<AnalyticsEngine>>,
+    /// Pluggable ML anomaly scorer. Defaults to a [`NullScorer`] that
+    /// returns 0 — augments (does not replace) the rule-based score.
+    anomaly_scorer: Arc<dyn AnomalyScorer>,
+    /// Per-entity rolling history of `(timestamp_secs, lat, lon, speed)`
+    /// kept just for ML feature extraction. Bounded at `ML_HISTORY_LEN`.
+    ml_history: Mutex<HashMap<String, VecDeque<(f64, f64, f64, f64)>>>,
 }
 
 impl DefaultStreamProcessor {
@@ -125,6 +138,8 @@ impl DefaultStreamProcessor {
             latency_sum_ms: Mutex::new(0.0),
             latency_count: Mutex::new(0),
             analytics: None,
+            anomaly_scorer: Arc::new(NullScorer),
+            ml_history: Mutex::new(HashMap::new()),
         }
     }
 
@@ -139,6 +154,19 @@ impl DefaultStreamProcessor {
     /// Get a reference to the analytics engine, if attached.
     pub fn analytics(&self) -> Option<&Arc<AnalyticsEngine>> {
         self.analytics.as_ref()
+    }
+
+    /// Attach a custom ML anomaly scorer. Replaces the default
+    /// [`NullScorer`]. The scorer augments the rule-based anomaly score
+    /// emitted by [`crate::analytics`]; it does not replace it.
+    pub fn with_anomaly_scorer(mut self, scorer: Arc<dyn AnomalyScorer>) -> Self {
+        self.anomaly_scorer = scorer;
+        self
+    }
+
+    /// Identifier of the currently attached ML model, for logs / metrics.
+    pub fn anomaly_model_id(&self) -> &str {
+        self.anomaly_scorer.model_id()
     }
 
     /// Expose the signer's public key so callers can register it for verification.
@@ -215,10 +243,6 @@ impl DefaultStreamProcessor {
             _ => {}
         }
 
-        entity.last_updated = event.timestamp;
-        entity.confidence = event.confidence;
-        self.storage.insert_entity(&entity).await?;
-
         // Feed position updates into the analytics engine (non-blocking).
         if let (Some(analytics), EventPayload::PositionUpdate { latitude, longitude, speed_knots, course_degrees, .. }) =
             (&self.analytics, &event.payload)
@@ -231,6 +255,56 @@ impl DefaultStreamProcessor {
                 .ingest(&event.entity_id, position, speed, course, event.timestamp, &[])
                 .await;
         }
+
+        // ML scoring — augments (does not replace) the rule-based anomaly
+        // score. Fire-and-forget: a failed extract or feature-dim mismatch
+        // simply skips ML scoring for this event.
+        if let EventPayload::PositionUpdate {
+            latitude,
+            longitude,
+            speed_knots,
+            ..
+        } = &event.payload
+        {
+            let speed = speed_knots.unwrap_or(0.0);
+            let history_snapshot: Vec<(f64, f64, f64, f64)> = {
+                let mut hist = self.ml_history.lock().await;
+                let buf = hist
+                    .entry(event.entity_id.clone())
+                    .or_insert_with(|| VecDeque::with_capacity(ML_HISTORY_LEN));
+                if buf.len() == ML_HISTORY_LEN {
+                    buf.pop_front();
+                }
+                buf.push_back((event.timestamp.timestamp() as f64, *latitude, *longitude, speed));
+                buf.iter().copied().collect()
+            };
+            if let Some(features) = extract_kinematic_features(&event.entity_id, &history_snapshot) {
+                if features.len() == self.anomaly_scorer.feature_dim()
+                    || self.anomaly_scorer.feature_dim() == 0
+                {
+                    let ml_score = self.anomaly_scorer.score(&features);
+                    entity
+                        .properties
+                        .insert("ml_anomaly_score".into(), json!(ml_score));
+                    entity.properties.insert(
+                        "ml_model_id".into(),
+                        json!(self.anomaly_scorer.model_id()),
+                    );
+                } else {
+                    tracing::debug!(
+                        entity_id = %event.entity_id,
+                        model = self.anomaly_scorer.model_id(),
+                        expected = self.anomaly_scorer.feature_dim(),
+                        got = features.len(),
+                        "Skipping ML scoring: feature dim mismatch",
+                    );
+                }
+            }
+        }
+
+        entity.last_updated = event.timestamp;
+        entity.confidence = event.confidence;
+        self.storage.insert_entity(&entity).await?;
 
         Ok(())
     }
@@ -591,5 +665,75 @@ mod tests {
             entity.properties.get("destination"),
             Some(&serde_json::json!("Rotterdam"))
         );
+    }
+
+    /// Custom scorer used by the ML-injection integration test below.
+    struct FixedScorer {
+        value: f32,
+    }
+    impl orp_ml::AnomalyScorer for FixedScorer {
+        fn score(&self, _features: &[f32]) -> f32 {
+            self.value
+        }
+        fn model_id(&self) -> &str {
+            "fixed-test-v1"
+        }
+        fn feature_dim(&self) -> usize {
+            // Match orp_ml::features::KINEMATIC_FEATURE_DIM (6).
+            6
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ml_anomaly_scorer_lands_on_entity() {
+        let dedup_dir = TempDir::new().unwrap();
+        let storage = Arc::new(DuckDbStorage::new_in_memory().unwrap());
+        let dedup = Arc::new(RocksDbDedupWindow::open(dedup_dir.path(), 60).unwrap());
+        let scorer = Arc::new(FixedScorer { value: 73.5 });
+        let p = DefaultStreamProcessor::new(storage.clone(), dedup, None, 1)
+            .with_anomaly_scorer(scorer);
+
+        // Feature extraction needs >= 5 samples — feed 6 distinct events.
+        let base_ts = chrono::Utc::now();
+        for i in 0..6 {
+            let mut ev = OrpEvent::new(
+                "ml-ship".to_string(),
+                "ship".to_string(),
+                EventPayload::PositionUpdate {
+                    latitude: 51.92 + (i as f64) * 0.001,
+                    longitude: 4.47 + (i as f64) * 0.001,
+                    altitude: None,
+                    accuracy_meters: None,
+                    speed_knots: Some(10.0 + i as f64),
+                    heading_degrees: Some(180.0),
+                    course_degrees: Some(180.0),
+                },
+                "ais".to_string(),
+                0.95,
+            );
+            ev.id = uuid::Uuid::now_v7();
+            ev.timestamp = base_ts + chrono::Duration::seconds(60 * i);
+            p.process_event(make_ctx(ev, 1)).await.unwrap();
+        }
+
+        let entity = storage.get_entity("ml-ship").await.unwrap().unwrap();
+        let ml_score = entity
+            .properties
+            .get("ml_anomaly_score")
+            .and_then(|v| v.as_f64())
+            .expect("ml_anomaly_score should be present");
+        assert!(
+            (ml_score - 73.5).abs() < 1e-3,
+            "ml score {} should match injected scorer value 73.5",
+            ml_score
+        );
+        assert_eq!(
+            entity
+                .properties
+                .get("ml_model_id")
+                .and_then(|v| v.as_str()),
+            Some("fixed-test-v1"),
+        );
+        assert_eq!(p.anomaly_model_id(), "fixed-test-v1");
     }
 }

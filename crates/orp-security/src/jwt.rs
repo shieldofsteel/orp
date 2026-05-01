@@ -63,6 +63,11 @@ pub struct Claims {
     pub iat: i64,
     /// Expiration (Unix timestamp)
     pub exp: i64,
+    /// Not-before (Unix timestamp). Tokens presented before `nbf` are
+    /// rejected. Issued by ORP equal to `iat`; a generous client clock
+    /// skew is tolerated via `JwtConfig::leeway_seconds`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nbf: Option<i64>,
     /// Issuer
     pub iss: String,
     /// Audience
@@ -119,6 +124,11 @@ pub struct JwtConfig {
     pub expiration_seconds: i64,
     /// Refresh token lifetime in seconds
     pub refresh_expiration_seconds: i64,
+    /// Allowed clock skew in seconds when validating `exp`/`nbf`/`iat`.
+    /// Default: 60 s, which is the OAuth 2.0 recommendation. Configurable
+    /// because federated peers and edge nodes routinely drift more than
+    /// the typical strict bound.
+    pub leeway_seconds: u64,
 }
 
 impl Default for JwtConfig {
@@ -133,6 +143,7 @@ impl Default for JwtConfig {
             audience: "orp-client".to_string(),
             expiration_seconds: 3600,
             refresh_expiration_seconds: 86400,
+            leeway_seconds: 60,
         }
     }
 }
@@ -191,6 +202,7 @@ impl JwtService {
             email: email.map(|s| s.to_string()),
             name: name.map(|s| s.to_string()),
             iat: now,
+            nbf: Some(now),
             exp: now + self.config.expiration_seconds,
             iss: self.config.issuer.clone(),
             aud: self.config.audience.clone(),
@@ -210,6 +222,7 @@ impl JwtService {
             email: None,
             name: None,
             iat: now,
+            nbf: Some(now),
             exp: now + self.config.refresh_expiration_seconds,
             iss: self.config.issuer.clone(),
             aud: format!("{}-refresh", self.config.audience),
@@ -227,11 +240,25 @@ impl JwtService {
         encode(&header, claims, &key).map_err(|e| JwtError::EncodingFailed(e.to_string()))
     }
 
+    /// Build the strictest validation profile we accept:
+    /// - algorithm pinned (no `none`, no alg-confusion)
+    /// - `exp`, `nbf`, `iss`, `aud`, `sub` are required claims
+    /// - configurable `leeway` for clock skew
+    /// - `nbf` validation is on by default (jsonwebtoken's `validate_nbf`)
+    fn base_validation(&self) -> Validation {
+        let mut validation = Validation::new(self.algorithm());
+        validation.set_issuer(&[&self.config.issuer]);
+        validation.leeway = self.config.leeway_seconds;
+        validation.validate_nbf = true;
+        validation.validate_exp = true;
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        validation
+    }
+
     /// Validate a token string and return the decoded claims.
     pub fn validate_token(&self, token: &str) -> Result<Claims, JwtError> {
         let key = self.decoding_key()?;
-        let mut validation = Validation::new(self.algorithm());
-        validation.set_issuer(&[&self.config.issuer]);
+        let mut validation = self.base_validation();
         validation.set_audience(&[&self.config.audience]);
 
         let data: TokenData<Claims> = decode(token, &key, &validation)?;
@@ -241,8 +268,7 @@ impl JwtService {
     /// Validate a refresh token — checks signature and issuer, uses refresh audience.
     pub fn validate_refresh_token(&self, token: &str) -> Result<Claims, JwtError> {
         let key = self.decoding_key()?;
-        let mut validation = Validation::new(self.algorithm());
-        validation.set_issuer(&[&self.config.issuer]);
+        let mut validation = self.base_validation();
         validation.set_audience(&[format!("{}-refresh", self.config.audience)]);
         let data: TokenData<Claims> = decode(token, &key, &validation)?;
         Ok(data.claims)

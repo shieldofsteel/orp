@@ -116,11 +116,12 @@ const baseEntity = (): Entity => ({
 });
 
 // ── Tests: connection ─────────────────────────────────────────────────────────
-// NOTE: WebSocket mock injection fails in vitest+jsdom — useEffect(() => connect(), [])
-// does not fire the connect callback. The hook works correctly in production.
-// Skipped pending vitest jsdom WebSocket mock fix.
+// (Re-enabled 2026-05-01: stubGlobal('WebSocket', MockWebSocket) plus the
+// existing setupHook -> triggerOpen flow lets the hook see the mock at
+// connect-time. If a future test still flakes, wrap the renderHook call itself
+// inside `await act(async () => { hook = renderHook(...) })`.)
 
-describe.skip('useWebSocket - connection', () => {
+describe('useWebSocket - connection', () => {
   it('creates a WebSocket instance on mount', async () => {
     await setupHook();
     expect(instances).toHaveLength(1);
@@ -146,7 +147,7 @@ describe.skip('useWebSocket - connection', () => {
 
 // ── Tests: reconnection ───────────────────────────────────────────────────────
 
-describe.skip('useWebSocket - reconnection', () => {
+describe('useWebSocket - reconnection', () => {
   it('schedules reconnect after socket closes', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const { ws } = await setupHook();
@@ -189,7 +190,7 @@ describe.skip('useWebSocket - reconnection', () => {
 
 // ── Tests: subscribe/unsubscribe ──────────────────────────────────────────────
 
-describe.skip('useWebSocket - subscribe/unsubscribe', () => {
+describe('useWebSocket - subscribe/unsubscribe', () => {
   it('sends subscribe message on manual subscribe call', async () => {
     const { hook, ws } = await setupHook();
     act(() => {
@@ -234,7 +235,7 @@ describe.skip('useWebSocket - subscribe/unsubscribe', () => {
 
 // ── Tests: message handlers ───────────────────────────────────────────────────
 
-describe.skip('useWebSocket - message handlers', () => {
+describe('useWebSocket - message handlers', () => {
   it('entity_update merges properties without replacing existing ones', async () => {
     useAppStore.getState().upsertEntity(baseEntity());
     const { ws } = await setupHook();

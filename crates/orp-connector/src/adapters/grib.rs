@@ -146,6 +146,11 @@ pub struct GribMessage {
     pub grid_definition: Option<GribGridDefinition>,
     pub product_definition: Option<GribProductDefinition>,
     pub data_representation: Option<GribDataRepresentation>,
+    /// Section 5 template number (0 = simple packing). 0xFFFF when no S5 parsed.
+    pub data_template: u16,
+    /// Unpacked Section 7 values. `None` ⇒ S7 absent or template unsupported
+    /// (a `tracing::warn!` is emitted in that case).
+    pub data_values: Option<Vec<f64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +475,71 @@ pub fn parse_grib_data_representation(data: &[u8]) -> Result<GribDataRepresentat
     })
 }
 
+// Section 7 unpacking — DRT 5.0: Y = (R + X * 2^E) / 10^D, where R/E/D come
+// from Section 5 and X is the i-th nbits-bit big-endian unsigned integer.
+// nbits == 0 is a legal "constant field": every grid point = R / 10^D.
+
+/// Read `nbits` bits from `buf` at `bit_offset` (MSB-first stream).
+/// Returns `None` on out-of-range or `nbits > 64`. `nbits == 0` ⇒ `Some(0)`.
+pub fn read_bits(buf: &[u8], bit_offset: usize, nbits: usize) -> Option<u64> {
+    if nbits == 0 { return Some(0); }
+    if nbits > 64 { return None; }
+    let end_bit = bit_offset.checked_add(nbits)?;
+    if (end_bit - 1) / 8 >= buf.len() { return None; }
+    let mut value: u64 = 0;
+    let mut bits_remaining = nbits;
+    let mut bit_pos = bit_offset;
+    while bits_remaining > 0 {
+        let bit_in_byte = bit_pos % 8;
+        let avail = 8 - bit_in_byte;
+        let take = avail.min(bits_remaining);
+        let byte = *buf.get(bit_pos / 8)?;
+        let chunk = ((byte as u64) >> (avail - take)) & ((1u64 << take) - 1);
+        value = (value << take) | chunk;
+        bit_pos += take;
+        bits_remaining -= take;
+    }
+    Some(value)
+}
+
+/// Unpack Section 7 using DRT 5.0 (simple packing). Bounds-checks the bit
+/// stream; returns `ParseError` on truncation, never panics.
+pub fn unpack_template_5_0(
+    section5: &GribDataRepresentation,
+    section7_data: &[u8],
+    num_data_points: usize,
+) -> Result<Vec<f64>, ConnectorError> {
+    let nbits = section5.bits_per_value as usize;
+    let r = section5.reference_value as f64;
+    let e = section5.binary_scale_factor as i32;
+    let d = section5.decimal_scale_factor as i32;
+    let dec_div = 10f64.powi(d);
+    if nbits == 0 {
+        return Ok(vec![r / dec_div; num_data_points]);
+    }
+    let total_bits = num_data_points
+        .checked_mul(nbits)
+        .ok_or_else(|| ConnectorError::ParseError(
+            "GRIB: Section 7 bit count overflow".into(),
+        ))?;
+    let needed_bytes = (total_bits + 7) / 8;
+    if section7_data.len() < needed_bytes {
+        return Err(ConnectorError::ParseError(format!(
+            "GRIB: Section 7 truncated (need {} bytes, have {})",
+            needed_bytes, section7_data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_data_points);
+    let two_e = 2f64.powi(e); // 2^E (1/2^|E| for negative E)
+    for i in 0..num_data_points {
+        let x = read_bits(section7_data, i * nbits, nbits).ok_or_else(|| {
+            ConnectorError::ParseError(format!("GRIB: Section 7 bit read failed at point {}", i))
+        })?;
+        out.push((r + (x as f64) * two_e) / dec_div);
+    }
+    Ok(out)
+}
+
 /// Look up parameter name from discipline, category, and number.
 pub fn lookup_parameter(discipline: u8, category: u8, number: u8) -> GribParameterInfo {
     match (discipline, category, number) {
@@ -615,6 +685,78 @@ pub fn lookup_parameter(discipline: u8, category: u8, number: u8) -> GribParamet
     }
 }
 
+fn empty_identification() -> GribIdentification {
+    GribIdentification {
+        center_id: 0, subcenter_id: 0, master_tables_version: 0, local_tables_version: 0,
+        significance_of_ref_time: 0, year: 0, month: 0, day: 0, hour: 0, minute: 0,
+        second: 0, production_status: 0, data_type: 0,
+    }
+}
+
+/// Parse a complete GRIB2 message. `data` MUST start at the "GRIB" magic.
+/// Walks all sections and unpacks Section 7 when Template 5.0 is present.
+pub fn parse_grib_message(data: &[u8]) -> Result<GribMessage, ConnectorError> {
+    let indicator = parse_grib_indicator(data)?;
+    let total_len = (indicator.total_length as usize).max(16).min(data.len());
+    let body = data.get(16..total_len).ok_or_else(|| {
+        ConnectorError::ParseError("GRIB: message body slice out of range".into())
+    })?;
+
+    let mut identification: Option<GribIdentification> = None;
+    let mut grid_definition: Option<GribGridDefinition> = None;
+    let mut product_definition: Option<GribProductDefinition> = None;
+    let mut data_representation: Option<GribDataRepresentation> = None;
+    let mut data_template: u16 = 0xFFFF;
+    let mut data_values: Option<Vec<f64>> = None;
+
+    // Each section after S0: 4-byte BE length, 1-byte section number, payload.
+    // Stop on Section 8 marker "7777" or buffer end.
+    let mut cur = 0usize;
+    while cur + 5 <= body.len() {
+        if body.get(cur..cur + 4) == Some(b"7777") { break; }
+        let lb = match body.get(cur..cur + 4) { Some(b) => b, None => break };
+        let sec_len = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+        if sec_len < 5 || cur + sec_len > body.len() { break; }
+        let sec_num = body[cur + 4];
+        let sec = &body[cur..cur + sec_len];
+        match sec_num {
+            1 => identification = parse_grib_identification(sec).ok(),
+            3 => grid_definition = parse_grib_grid_definition(sec).ok(),
+            4 => product_definition = parse_grib_product_definition(sec).ok(),
+            5 => if let Ok(d) = parse_grib_data_representation(sec) {
+                data_template = d.template_number;
+                data_representation = Some(d);
+            },
+            7 => if let Some(ref drep) = data_representation {
+                let payload = sec.get(5..).unwrap_or(&[]);
+                let n = drep.num_data_points as usize;
+                match drep.template_number {
+                    0 => match unpack_template_5_0(drep, payload, n) {
+                        Ok(v) => data_values = Some(v),
+                        Err(e) => tracing::warn!("GRIB Section 7 unpack failed: {}", e),
+                    },
+                    other => tracing::warn!(
+                        "GRIB Section 5 template {} not yet supported, returning metadata only",
+                        other
+                    ),
+                }
+            },
+            _ => {}
+        }
+        cur += sec_len;
+    }
+
+    Ok(GribMessage {
+        indicator,
+        identification: identification.unwrap_or_else(empty_identification),
+        grid_definition,
+        product_definition,
+        data_representation,
+        data_template,
+        data_values,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // GRIB → SourceEvent
 // ---------------------------------------------------------------------------
@@ -686,6 +828,25 @@ pub fn grib_to_source_event(
         );
     }
 
+    properties.insert("data_template".into(), json!(msg.data_template));
+    properties.insert("data_values_present".into(), json!(msg.data_values.is_some()));
+    if let Some(ref values) = msg.data_values {
+        if !values.is_empty() {
+            let (mut min, mut max, mut sum) = (f64::INFINITY, f64::NEG_INFINITY, 0f64);
+            for &v in values.iter() {
+                if v.is_finite() {
+                    if v < min { min = v; }
+                    if v > max { max = v; }
+                    sum += v;
+                }
+            }
+            properties.insert("data_min".into(), json!(min));
+            properties.insert("data_max".into(), json!(max));
+            properties.insert("data_mean".into(), json!(sum / values.len() as f64));
+            properties.insert("data_count".into(), json!(values.len()));
+        }
+    }
+
     let ref_time = msg.identification.reference_time_string();
     let entity_id = format!(
         "grib:{}:{}:{}",
@@ -708,6 +869,51 @@ pub fn grib_to_source_event(
 // ---------------------------------------------------------------------------
 // Connector
 // ---------------------------------------------------------------------------
+
+/// Emit one SourceEvent per visited grid cell, using `stride` to subsample.
+async fn emit_cells(
+    tx: &tokio::sync::mpsc::Sender<SourceEvent>,
+    msg: &GribMessage, grid: &GribGridDefinition, values: &[f64],
+    connector_id: &str, events_processed: &Arc<AtomicU64>, stride: u32,
+) {
+    let ni = grid.ni.max(1);
+    let nj = grid.nj.max(1);
+    let stride = stride.max(1) as usize;
+    let param = msg.product_definition.as_ref().map(|p| {
+        lookup_parameter(msg.indicator.discipline, p.parameter_category, p.parameter_number)
+    });
+    let ref_time = msg.identification.reference_time_string();
+    let lat_sign = if grid.lat_last < grid.lat_first { -1.0 } else { 1.0 };
+    let pname = param.as_ref().map(|p| p.name).unwrap_or("unknown")
+        .to_lowercase().replace(' ', "_");
+    for j in (0..nj).step_by(stride) {
+        for i in (0..ni).step_by(stride) {
+            let v = match values.get((j as usize) * (ni as usize) + i as usize) {
+                Some(v) => *v, None => continue,
+            };
+            let mut props = HashMap::new();
+            props.insert("value".into(), json!(v));
+            props.insert("i".into(), json!(i));
+            props.insert("j".into(), json!(j));
+            if let Some(ref p) = param {
+                props.insert("parameter_name".into(), json!(p.name));
+                props.insert("parameter_unit".into(), json!(p.unit));
+            }
+            let evt = SourceEvent {
+                connector_id: connector_id.to_string(),
+                entity_id: format!("grib:{}:{}:{}:{}x{}",
+                    msg.identification.center_id, pname, ref_time, i, j),
+                entity_type: "weather_grid_cell".to_string(),
+                properties: props,
+                timestamp: Utc::now(),
+                latitude: Some(grid.lat_first + (j as f64) * grid.dj * lat_sign),
+                longitude: Some(grid.lon_first + (i as f64) * grid.di),
+            };
+            if tx.send(evt).await.is_err() { return; }
+            events_processed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 pub struct GribConnector {
     config: ConnectorConfig,
@@ -755,60 +961,37 @@ impl Connector for GribConnector {
         let errors = Arc::clone(&self.errors);
         let running = Arc::clone(&self.running);
 
-        // Scan for GRIB messages (each starts with "GRIB")
+        // Scan for GRIB messages (each starts with "GRIB").
         let mut offset = 0;
         while offset + 16 <= data.len() && running.load(Ordering::Relaxed) {
-            if &data[offset..offset + 4] == b"GRIB" {
-                match parse_grib_indicator(&data[offset..]) {
-                    Ok(indicator) => {
-                        let msg_len = indicator.total_length as usize;
-                        let msg_end = (offset + msg_len).min(data.len());
-                        let msg_data = &data[offset..msg_end];
-
-                        // Parse remaining sections
-                        let identification = if msg_data.len() > 16 + 21 {
-                            parse_grib_identification(&msg_data[16..]).ok()
-                        } else {
-                            None
-                        };
-
-                        let grib_msg = GribMessage {
-                            indicator,
-                            identification: identification.unwrap_or(GribIdentification {
-                                center_id: 0,
-                                subcenter_id: 0,
-                                master_tables_version: 0,
-                                local_tables_version: 0,
-                                significance_of_ref_time: 0,
-                                year: 0,
-                                month: 0,
-                                day: 0,
-                                hour: 0,
-                                minute: 0,
-                                second: 0,
-                                production_status: 0,
-                                data_type: 0,
-                            }),
-                            grid_definition: None,
-                            product_definition: None,
-                            data_representation: None,
-                        };
-
-                        let event = grib_to_source_event(&grib_msg, &connector_id);
-                        if tx.send(event).await.is_err() {
-                            break;
-                        }
-                        events_processed.fetch_add(1, Ordering::Relaxed);
-
-                        offset += msg_len.max(16);
-                    }
-                    Err(_) => {
-                        errors.fetch_add(1, Ordering::Relaxed);
-                        offset += 1;
-                    }
-                }
-            } else {
+            if &data[offset..offset + 4] != b"GRIB" {
                 offset += 1;
+                continue;
+            }
+            match parse_grib_message(&data[offset..]) {
+                Ok(grib_msg) => {
+                    let msg_len = (grib_msg.indicator.total_length as usize).max(16);
+                    // Summary event (carries min/max/mean when values present).
+                    if tx.send(grib_to_source_event(&grib_msg, &connector_id)).await.is_err() {
+                        break;
+                    }
+                    events_processed.fetch_add(1, Ordering::Relaxed);
+                    // Per-cell events: full grid up to 1000 cells, else 10x stride.
+                    if let (Some(ref values), Some(ref grid)) =
+                        (&grib_msg.data_values, &grib_msg.grid_definition)
+                    {
+                        let stride = if values.len() > 1000 { 10 } else { 1 };
+                        if !values.is_empty() {
+                            emit_cells(&tx, &grib_msg, grid, values,
+                                &connector_id, &events_processed, stride).await;
+                        }
+                    }
+                    offset += msg_len;
+                }
+                Err(_) => {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    offset += 1;
+                }
             }
         }
 
@@ -1075,6 +1258,8 @@ mod tests {
                 surface_value: 50000,
             }),
             data_representation: None,
+            data_template: 0xFFFF,
+            data_values: None,
         };
 
         let event = grib_to_source_event(&msg, "grib-test");
@@ -1112,6 +1297,8 @@ mod tests {
             grid_definition: None,
             product_definition: None,
             data_representation: None,
+            data_template: 0xFFFF,
+            data_values: None,
         };
         let event = grib_to_source_event(&msg, "test");
         assert_eq!(event.entity_type, "weather_grid");
@@ -1164,5 +1351,127 @@ mod tests {
             };
             assert_eq!(ind.discipline_name(), name);
         }
+    }
+
+    // -------- Section 7 unpacking ---------------------------------------
+
+    fn drep(nbits: u8, r: f32, e: i16, d: i16, n: u32) -> GribDataRepresentation {
+        GribDataRepresentation {
+            num_data_points: n,
+            template_number: 0,
+            reference_value: r,
+            binary_scale_factor: e,
+            decimal_scale_factor: d,
+            bits_per_value: nbits,
+        }
+    }
+
+    #[test]
+    fn test_read_bits_basic() {
+        // 0xB2=10110010, 0x59=01011001.
+        let buf = [0xB2u8, 0x59u8];
+        assert_eq!(read_bits(&buf, 0, 4), Some(0b1011));      // first nibble
+        assert_eq!(read_bits(&buf, 4, 4), Some(0b0010));      // second nibble
+        assert_eq!(read_bits(&buf, 6, 8), Some(0b10010110));  // cross-byte 8 bits
+        assert_eq!(read_bits(&buf, 0, 0), Some(0));           // nbits=0
+        assert_eq!(read_bits(&buf, 12, 8), None);             // out of range
+        assert_eq!(read_bits(&buf, 0, 65), None);             // nbits > 64
+    }
+
+    #[test]
+    fn test_unpack_constant_field_nbits_zero() {
+        // nbits=0 ⇒ every value is R / 10^D, no per-point data needed.
+        let out = unpack_template_5_0(&drep(0, 100.0, 0, 0, 5), &[], 5).unwrap();
+        assert_eq!(out.len(), 5);
+        assert!(out.iter().all(|v| (v - 100.0).abs() < 1e-9));
+        let out2 = unpack_template_5_0(&drep(0, 100.0, 0, 2, 3), &[], 3).unwrap();
+        assert!(out2.iter().all(|v| (v - 1.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn test_unpack_simple_known_case() {
+        // nbits=8, R=273.15, E=0, D=2, single 0xFF byte → X=255
+        // Y = (273.15 + 255 * 1) / 100 = 528.15/100 = 5.2815
+        let s5 = drep(8, 273.15, 0, 2, 1);
+        let out = unpack_template_5_0(&s5, &[0xFF], 1).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!((out[0] - 5.2815).abs() < 1e-6, "got {}", out[0]);
+    }
+
+    #[test]
+    fn test_unpack_truncated_buffer_errors() {
+        // nbits=16, 4 values needs 8 bytes; only 4 supplied → ParseError.
+        let s5 = drep(16, 0.0, 0, 0, 4);
+        match unpack_template_5_0(&s5, &[0, 0, 0, 0], 4) {
+            Err(ConnectorError::ParseError(m)) => {
+                assert!(m.contains("Section 7"), "msg: {}", m);
+            }
+            other => panic!("expected ParseError, got Ok or non-ParseError: {:?}", other.is_err()),
+        }
+    }
+
+    #[test]
+    fn test_unpack_multibyte_bit_aligned_extraction() {
+        // Two 12-bit values 0x123, 0x456 → MSB-first stream 0x12 0x34 0x56.
+        // R=0, E=0, D=0 ⇒ Y = X.
+        let s5 = drep(12, 0.0, 0, 0, 2);
+        let out = unpack_template_5_0(&s5, &[0x12, 0x34, 0x56], 2).unwrap();
+        assert!((out[0] - 0x123 as f64).abs() < 1e-9, "got {}", out[0]);
+        assert!((out[1] - 0x456 as f64).abs() < 1e-9, "got {}", out[1]);
+    }
+
+    #[test]
+    fn test_parse_grib_message_unsupported_template_returns_none() {
+        // Synthetic GRIB2: indicator + Section 5 (template 200) + Section 7 + "7777".
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"GRIB");
+        msg.extend_from_slice(&[0, 0, 0, 2]); // reserved, reserved, discipline, edition
+        let len_pos = msg.len();
+        msg.extend_from_slice(&[0u8; 8]); // total length placeholder
+        // Section 5 (length 21)
+        msg.extend_from_slice(&21u32.to_be_bytes());
+        msg.push(5);
+        msg.extend_from_slice(&4u32.to_be_bytes());
+        msg.extend_from_slice(&200u16.to_be_bytes());
+        msg.extend_from_slice(&0f32.to_be_bytes());
+        msg.extend_from_slice(&0i16.to_be_bytes());
+        msg.extend_from_slice(&0i16.to_be_bytes());
+        msg.push(8);
+        msg.extend_from_slice(&[0u8; 1]); // pad to length 21
+        // Section 7
+        msg.extend_from_slice(&9u32.to_be_bytes());
+        msg.push(7);
+        msg.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        msg.extend_from_slice(b"7777");
+        let total_len = msg.len() as u64;
+        msg[len_pos..len_pos + 8].copy_from_slice(&total_len.to_be_bytes());
+
+        let parsed = parse_grib_message(&msg).expect("parse should not fail");
+        assert_eq!(parsed.data_template, 200);
+        assert!(parsed.data_values.is_none(), "values should be None for template 200");
+    }
+
+    #[test]
+    fn test_unpack_round_trip_10_elements() {
+        // Pack 10 known values with simple packing (R=0, E=0, D=2, nbits=16),
+        // then run unpacker and verify ≤ 1e-6 deviation per element.
+        let values: Vec<f64> = vec![1.23, 4.56, 7.89, 0.01, 2.50, 99.99, 50.00, 33.33, 12.34, 0.00];
+        let mut packed: Vec<u8> = Vec::new();
+        for v in &values {
+            packed.extend_from_slice(&((v * 100.0).round() as u16).to_be_bytes());
+        }
+        let s5 = drep(16, 0.0, 0, 2, values.len() as u32);
+        let out = unpack_template_5_0(&s5, &packed, values.len()).unwrap();
+        for (orig, rec) in values.iter().zip(out.iter()) {
+            assert!((orig - rec).abs() <= 1e-6, "round-trip mismatch: {} vs {}", orig, rec);
+        }
+    }
+
+    #[test]
+    fn test_unpack_no_panic_on_malformed_inputs() {
+        let s5 = drep(8, 0.0, 0, 0, 4);
+        assert!(unpack_template_5_0(&s5, &[], 4).is_err());
+        let s5b = drep(8, 0.0, 0, 0, 0);
+        assert!(unpack_template_5_0(&s5b, &[], 0).unwrap().is_empty());
     }
 }
