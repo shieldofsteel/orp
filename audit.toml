@@ -1,0 +1,30 @@
+# cargo-audit configuration.
+#
+# Picked up automatically by `cargo audit` when invoked from the workspace
+# root. CI runs `cargo audit` with no arguments, so this file is the only
+# place ignores live — keep it in sync with the comment block below.
+
+[advisories]
+# Each entry MUST have a comment explaining (1) why the advisory cannot be
+# resolved by a version bump, and (2) the exit ramp. Treat this list as
+# technical debt with an owner.
+ignore = [
+    # bincode is unmaintained: the upstream team announced permanent cessation
+    # of development after a doxxing/harassment incident (2025-12-16). The
+    # advisory is `informational = "unmaintained"` — NOT a security CVE — and
+    # `patched = []`, so no version of bincode (1.x, 2.x, or the placeholder
+    # 3.0.0 stub on crates.io which is literally `compile_error!`) can clear
+    # it. A version bump cannot resolve this advisory.
+    #
+    # We use bincode 2.x via `bincode::serde::encode_to_vec` /
+    # `decode_from_slice` (call sites in orp-ml and orp-stream/dlq.rs).
+    # v0.3.0 retired bincode 1.3 with a wire-format break; the federation
+    # outbox carries an explicit version marker so future migrations off
+    # bincode can repeat the same drain-with-old-binary mechanic. See
+    # docs/upgrades/v0.3.0.md.
+    #
+    # Exit ramp: replace bincode with `postcard` (no_std friendly, actively
+    # maintained, similar wire compactness) workspace-wide. Tracked in the
+    # v0.4 hardening backlog.
+    "RUSTSEC-2025-0141",
+]

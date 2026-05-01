@@ -28,7 +28,8 @@
 //!   rolling 2048-sample window. Fast, dependency-free, useful as a baseline.
 //! - [`IsolationForestScorer`] — small in-house Isolation Forest. Models
 //!   are trained offline (or via `IsolationForestModel::fit`) and serialised
-//!   with `bincode`, so the runtime can `include_bytes!` a pre-trained model.
+//!   with `bincode` (v2, via the `serde` shim), so the runtime can
+//!   `include_bytes!` a pre-trained model.
 //! - [`features`] — feature extractors that turn an entity track into a
 //!   fixed-length `Vec<f32>` suitable for any of the scorers above.
 
@@ -66,7 +67,12 @@ pub type MlResult<T> = Result<T, MlError>;
 /// [`IfNode`] also requires a bump because bincode encodes the discriminant.
 /// When you bump it, also extend [`IsolationForestScorer::from_bytes`] to
 /// either accept the old version (with migration) or reject it cleanly.
-pub const ISOLATION_FOREST_SCHEMA_VERSION: u16 = 1;
+///
+/// History:
+/// - `1`: bincode 1.3 fixed-int little-endian wire format (ORP v0.1–v0.2).
+/// - `2`: bincode 2.x `config::standard()` wire format (variable-int,
+///   little-endian) via `bincode::serde`. Wire-incompatible with `1`.
+pub const ISOLATION_FOREST_SCHEMA_VERSION: u16 = 2;
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
@@ -374,7 +380,8 @@ pub enum IfNode {
 /// Serializable Isolation Forest model.
 ///
 /// Train offline via [`IsolationForestModel::fit`] then serialize with
-/// `bincode`. The runtime loads with [`IsolationForestScorer::from_bytes`].
+/// `bincode` (v2, via the `serde` adapter). The runtime loads with
+/// [`IsolationForestScorer::from_bytes`].
 ///
 /// The `schema_version` field is the first field by design: bincode encodes
 /// fields in declaration order, so it's the first thing the loader sees and
@@ -443,8 +450,13 @@ impl IsolationForestModel {
     }
 
     /// Serialize to bytes for embedding via `include_bytes!`.
+    ///
+    /// Uses bincode 2 with `config::standard()`. Note: this wire format is
+    /// **not** compatible with the bincode 1.3 bytes ORP shipped through v0.2.
+    /// [`ISOLATION_FOREST_SCHEMA_VERSION`] guards against silent mis-decode.
     pub fn to_bytes(&self) -> MlResult<Vec<u8>> {
-        bincode::serialize(self).map_err(|e| MlError::Serialize(e.to_string()))
+        bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(|e| MlError::Serialize(e.to_string()))
     }
 }
 
@@ -463,9 +475,13 @@ impl IsolationForestScorer {
     /// Rejects blobs whose `schema_version` does not match
     /// [`ISOLATION_FOREST_SCHEMA_VERSION`] — silently mis-decoding a stale
     /// model is worse than refusing to load it.
+    ///
+    /// Wire format is bincode 2 with `config::standard()`. v0.2-era models
+    /// (bincode 1.3) must be retrained — they will fail to decode here.
     pub fn from_bytes(model_id: &str, bytes: &[u8], feature_dim: usize) -> MlResult<Self> {
-        let model: IsolationForestModel =
-            bincode::deserialize(bytes).map_err(|e| MlError::Deserialize(e.to_string()))?;
+        let (model, _read): (IsolationForestModel, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| MlError::Deserialize(e.to_string()))?;
         if model.schema_version != ISOLATION_FOREST_SCHEMA_VERSION {
             return Err(MlError::ModelVersionMismatch {
                 got: model.schema_version,
@@ -798,13 +814,13 @@ mod tests {
         let mut model = IsolationForestModel::fit(&data, 8, 16, 0).unwrap();
         assert_eq!(model.schema_version, ISOLATION_FOREST_SCHEMA_VERSION);
         model.schema_version = 999;
-        let bytes = bincode::serialize(&model).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&model, bincode::config::standard()).unwrap();
         let err = IsolationForestScorer::from_bytes("if", &bytes, 2).unwrap_err();
         assert!(matches!(
             err,
             MlError::ModelVersionMismatch {
                 got: 999,
-                expected: 1,
+                expected: ISOLATION_FOREST_SCHEMA_VERSION,
             }
         ));
     }

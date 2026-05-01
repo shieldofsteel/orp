@@ -18,7 +18,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 rocksdb = { version = "0.22", features = ["lz4"] }
-bincode = "1.3"
+bincode = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

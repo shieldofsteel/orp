@@ -19,7 +19,7 @@ use orp_connector::Connector;
 use orp_query::QueryExecutor;
 use orp_security::{AbacEngine, ApiKeyService, AuthState};
 use orp_storage::traits::Storage;
-use orp_stream::{FederationOutbox, MonitorEngine, StreamProcessor};
+use orp_stream::{DlqError, FederationOutbox, MonitorEngine, StreamProcessor};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -330,6 +330,17 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
             Ok(o) => {
                 tracing::info!(path = %path.display(), "Federation outbox opened");
                 Some(Arc::new(o))
+            }
+            Err(e @ DlqError::IncompatibleOutboxVersion { .. }) => {
+                // Wire-format incompatibility (v0.2.x → v0.3.0 bincode change).
+                // Refuse to start instead of silently dropping queued events.
+                // Operators must drain the outbox with the v0.2.x binary first.
+                // See docs/upgrades/v0.3.0.md.
+                return Err(anyhow::anyhow!(
+                    "Refusing to start: {e}. Drain the outbox with the v0.2.x \
+                     binary before upgrading, or remove ORP_FED_OUTBOX_PATH \
+                     to disable federation buffering for this session."
+                ));
             }
             Err(e) => {
                 tracing::warn!(
