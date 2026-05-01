@@ -133,7 +133,9 @@ struct JsonSanctionsFile {
 
 struct SanctionsIndex {
     entries: Vec<SdnEntry>,
-    /// Normalised name → entry indices
+    /// Normalised name → entry indices. Built at load time; reserved for
+    /// the planned fuzzy-name matcher (currently MMSI/IMO lookups only).
+    #[allow(dead_code)]
     name_index: HashMap<String, Vec<usize>>,
     /// MMSI → entry index
     mmsi_index: HashMap<String, usize>,

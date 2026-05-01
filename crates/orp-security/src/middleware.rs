@@ -202,7 +202,7 @@ impl AuthState {
     /// in any production-bound code path.
     #[doc(hidden)]
     pub fn dev_or_broken() -> Self {
-        Self::dev().unwrap_or_else(|_| Self {
+        Self::dev().unwrap_or(Self {
             jwt_service: None,
             api_key_service: None,
             permissive_mode: false,

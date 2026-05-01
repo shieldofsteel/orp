@@ -184,7 +184,7 @@ pub fn parse_hl7(body: &[u8]) -> Result<Hl7Message, ConnectorError> {
     };
 
     let segments: Vec<Segment> = text
-        .split(|c: char| c == '\r' || c == '\n')
+        .split(['\r', '\n'])
         .filter(|s| !s.is_empty())
         .map(|seg_str| split_segment(seg_str, &encoding))
         .collect::<Result<Vec<_>, _>>()?;

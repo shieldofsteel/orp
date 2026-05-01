@@ -323,7 +323,7 @@ impl AbacEngine {
             .map_err(|e| AbacError::Storage(e.to_string()))?;
         policies.push(policy);
         // Keep sorted by priority (descending) for evaluation order
-        policies.sort_by(|a, b| b.priority.cmp(&a.priority));
+        policies.sort_by_key(|p| std::cmp::Reverse(p.priority));
         Ok(())
     }
 

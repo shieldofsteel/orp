@@ -631,6 +631,11 @@ pub(crate) fn evict_stale_peer_state<V1, V2>(
 /// Buffer an outbound entity for `peer_id` in the disk-backed outbox so it
 /// survives process restarts and peer-link outages. No-op when the outbox is
 /// not configured (federation disabled or open() failed).
+///
+/// Public outbox-pump entry; the federation send path that drives it lands
+/// in a follow-up commit. `dead_code` is allowed locally so the staged API
+/// doesn't fight clippy on master.
+#[allow(dead_code)]
 pub fn enqueue_outbound(
     outbox: &FederationOutbox,
     peer_id: &str,

@@ -1,3 +1,9 @@
+// The notification engine module is fully scaffolded but not yet wired into
+// the server router (see server/handlers.rs — `notification_router` is
+// intentionally unused on master). Allow dead_code at the module level so
+// clippy doesn't fight the staged rollout; the wire-up lands in a follow-up.
+#![allow(dead_code)]
+
 //! Multi-channel alert notification engine.
 //!
 //! When a threat or monitor alert fires, this engine fans out notifications to

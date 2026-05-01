@@ -42,6 +42,12 @@ pub enum Role {
 
 impl Role {
     /// Parse a role from its canonical string name.
+    ///
+    /// Returns `None` if the input is unrecognised. Kept as an inherent
+    /// method (rather than `impl FromStr`) so callers can use `Option`
+    /// pattern matching without importing the trait; the
+    /// clippy::should_implement_trait lint is intentionally allowed.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "guest" => Some(Self::Guest),

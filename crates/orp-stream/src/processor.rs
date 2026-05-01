@@ -23,6 +23,10 @@ use tokio::sync::Mutex;
 /// analytics engine is attached.
 const ML_HISTORY_LEN: usize = 32;
 
+/// Per-entity rolling history of `(timestamp_secs, lat, lon, speed)` tuples,
+/// keyed by entity id and bounded at `ML_HISTORY_LEN`.
+type MlHistoryMap = HashMap<String, VecDeque<(f64, f64, f64, f64)>>;
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -101,7 +105,7 @@ pub struct DefaultStreamProcessor {
     anomaly_scorer: Arc<dyn AnomalyScorer>,
     /// Per-entity rolling history of `(timestamp_secs, lat, lon, speed)`
     /// kept just for ML feature extraction. Bounded at `ML_HISTORY_LEN`.
-    ml_history: Mutex<HashMap<String, VecDeque<(f64, f64, f64, f64)>>>,
+    ml_history: Mutex<MlHistoryMap>,
 }
 
 impl DefaultStreamProcessor {

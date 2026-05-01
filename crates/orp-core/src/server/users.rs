@@ -1,3 +1,9 @@
+// The user-management module is fully scaffolded but not yet wired into the
+// server router (see server/handlers.rs — `users_router` is intentionally
+// unused on master). Allow dead_code at the module level so clippy doesn't
+// fight the staged rollout; the wire-up lands in a follow-up PR.
+#![allow(dead_code)]
+
 //! Multi-user management for ORP operations rooms.
 //!
 //! Provides a user registry backed by DuckDB, REST endpoints for CRUD,

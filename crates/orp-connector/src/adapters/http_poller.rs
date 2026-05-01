@@ -237,7 +237,7 @@ impl reqwest::dns::Resolve for SsrfDnsResolver {
             })
             .await
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
-            let addrs = res.map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+            let addrs = res.map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
             let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
             Ok(iter)
         })

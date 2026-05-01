@@ -528,7 +528,7 @@ pub fn unpack_template_5_0(
     let total_bits = num_data_points
         .checked_mul(nbits)
         .ok_or_else(|| ConnectorError::ParseError("GRIB: Section 7 bit count overflow".into()))?;
-    let needed_bytes = (total_bits + 7) / 8;
+    let needed_bytes = total_bits.div_ceil(8);
     if section7_data.len() < needed_bytes {
         return Err(ConnectorError::ParseError(format!(
             "GRIB: Section 7 truncated (need {} bytes, have {})",
