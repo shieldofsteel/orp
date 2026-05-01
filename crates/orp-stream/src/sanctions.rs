@@ -142,7 +142,6 @@ struct SanctionsIndex {
     entries: Vec<SdnEntry>,
     /// Normalised name → entry indices. Built at load time; serves exact-name
     /// fast paths and is kept alongside the trigram index for diagnostics.
-    #[allow(dead_code)]
     name_index: HashMap<String, Vec<usize>>,
     /// 3-char trigram → set of entry indices whose primary name OR any alias
     /// contains that trigram (after normalisation). Used by `check_entity` to
@@ -411,6 +410,56 @@ impl SanctionsDatabase {
         if let Some(name) = &query.name {
             let norm_query = normalise(name);
             if !norm_query.is_empty() {
+                let mut exact_name_matched = false;
+                if let Some(indices) = index.name_index.get(&norm_query) {
+                    exact_name_matched = true;
+                    for &i in indices {
+                        let Some(entry) = index.entries.get(i) else {
+                            continue;
+                        };
+                        let already_id_matched = matches
+                            .iter()
+                            .any(|m| m.sdn_name == entry.name && m.id_match);
+                        if already_id_matched {
+                            continue;
+                        }
+
+                        let matched_alias = if normalise(&entry.name) == norm_query {
+                            None
+                        } else {
+                            entry
+                                .aliases
+                                .iter()
+                                .find(|alias| normalise(alias) == norm_query)
+                                .cloned()
+                        };
+
+                        matches.push(SanctionsMatch {
+                            sdn_name: entry.name.clone(),
+                            sdn_type: entry.sdn_type.clone(),
+                            programs: entry.programs.clone(),
+                            score: 100,
+                            id_match: false,
+                            matched_alias,
+                        });
+                    }
+                }
+
+                if exact_name_matched {
+                    // Exact name/alias hits are already ConfirmedHit quality.
+                    // Avoid the expensive fuzzy pass over broad trigram
+                    // candidates such as "VESSEL CORP 00001".
+                    matches.sort_by(|a, b| b.id_match.cmp(&a.id_match).then(b.score.cmp(&a.score)));
+                    matches.dedup_by(|a, b| a.sdn_name == b.sdn_name && b.id_match);
+                    let risk_level = compute_risk(&matches);
+                    return SanctionsResult {
+                        matched: true,
+                        matches,
+                        risk_level,
+                        checked_at: Utc::now(),
+                    };
+                }
+
                 let threshold = self.name_match_threshold;
                 let candidates = candidate_indices(
                     &index.trigram_index,

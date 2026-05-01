@@ -3,6 +3,7 @@ use crate::server::federation_tls::{FederationTlsConfig, LocalSigner, OutboundSe
 use crate::server::handlers;
 use crate::server::ingest;
 use crate::server::layers;
+use crate::server::media::MediaRegistry;
 use crate::server::websocket;
 use anyhow::{Context, Result};
 use axum::{
@@ -68,6 +69,12 @@ pub struct AppState {
     /// existing processor flow — connectors push events to the processor; this
     /// registry is purely for observability.
     pub connectors: Arc<Mutex<Vec<Arc<dyn Connector>>>>,
+    /// In-process media stream registry. This is ORP's Rust-native media
+    /// control plane: it tracks camera/video sources, validates risky LAN
+    /// URLs explicitly, redacts credentials in API responses, and projects
+    /// streams into the entity graph. The actual packet relay/transcode data
+    /// plane is intentionally separate work.
+    pub media_registry: Arc<MediaRegistry>,
     /// This node's stable identifier as the federation **sender** in signed
     /// envelopes. Defaults to a process-local UUID; operators set
     /// `ORP_NODE_ID` in production so peers can pin one ID per cluster.
@@ -389,6 +396,7 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         federation_registry: config.federation_registry.clone(),
         federation_outbox,
         connectors: Arc::new(Mutex::new(Vec::new())),
+        media_registry: Arc::new(MediaRegistry::new()),
         local_node_id,
         federation_signer,
         federation_seq,
@@ -448,6 +456,29 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         .route(
             "/api/v1/connectors/{id}",
             delete(handlers::delete_connector),
+        )
+        // Media streams
+        .route("/api/v1/media/streams", get(handlers::list_media_streams))
+        .route("/api/v1/media/streams", post(handlers::create_media_stream))
+        .route(
+            "/api/v1/media/streams/{id}",
+            get(handlers::get_media_stream),
+        )
+        .route(
+            "/api/v1/media/streams/{id}",
+            delete(handlers::delete_media_stream),
+        )
+        .route(
+            "/api/v1/media/streams/{id}/relay",
+            get(handlers::relay_media_stream),
+        )
+        .route(
+            "/api/v1/media/streams/{id}/playlist.m3u8",
+            get(handlers::relay_hls_playlist),
+        )
+        .route(
+            "/api/v1/media/streams/{id}/hls/fetch",
+            get(handlers::relay_hls_asset),
         )
         // Monitors
         .route("/api/v1/monitors", get(handlers::list_monitors))

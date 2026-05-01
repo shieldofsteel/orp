@@ -615,10 +615,25 @@ impl GraphEngine {
         let stripped = strip_quoted_regions(q);
         let upper = stripped.to_uppercase();
         const FORBIDDEN_SUBSTRINGS: &[&str] = &[
-            ";", "--", "/*", "*/",
-            " DROP ", " ATTACH ", " INSTALL ", " LOAD ", " COPY ", " PRAGMA ",
-            " DELETE ", " INSERT ", " UPDATE ", " CREATE ", " ALTER ", " EXPORT ",
-            " IMPORT ", " GRANT ", " REVOKE ",
+            ";",
+            "--",
+            "/*",
+            "*/",
+            " DROP ",
+            " ATTACH ",
+            " INSTALL ",
+            " LOAD ",
+            " COPY ",
+            " PRAGMA ",
+            " DELETE ",
+            " INSERT ",
+            " UPDATE ",
+            " CREATE ",
+            " ALTER ",
+            " EXPORT ",
+            " IMPORT ",
+            " GRANT ",
+            " REVOKE ",
         ];
         for token in FORBIDDEN_SUBSTRINGS {
             // Add a leading + trailing space so a match at the start/end of
@@ -660,8 +675,7 @@ impl GraphEngine {
             .map_err(|e| StorageError::QueryError(format!("prepare: {e}")))?;
 
         // Collect bound parameters as `&dyn ToSql` references.
-        let bind_refs: Vec<&dyn duckdb::types::ToSql> =
-            bind.iter().map(|b| b.as_ref()).collect();
+        let bind_refs: Vec<&dyn duckdb::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
 
         // Collect all row data first (positional), then map column names.
         let mut raw_rows: Vec<Vec<JsonValue>> = Vec::new();
@@ -1139,7 +1153,10 @@ fn parse_simple_eq(s: &str) -> Option<ParsedEq> {
         return None;
     }
     // Column must look like an identifier or `alias.identifier`.
-    if !column.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+    if !column
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    {
         return None;
     }
 
@@ -1148,7 +1165,11 @@ fn parse_simple_eq(s: &str) -> Option<ParsedEq> {
     let value = if let Some(after) = rhs.strip_prefix('\'') {
         let end = after.find('\'')?;
         after[..end].to_string()
-    } else if rhs.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '-') {
+    } else if rhs
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || c == '-')
+    {
         // numeric literal; let DuckDB cast at bind time
         rhs.split_whitespace().next()?.to_string()
     } else {
@@ -1565,8 +1586,7 @@ mod tests {
         assert!(result.is_err(), "expected query to be rejected: {q}");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("Unsupported cypher query")
-                || err_msg.contains("MATCH/RETURN"),
+            err_msg.contains("Unsupported cypher query") || err_msg.contains("MATCH/RETURN"),
             "error should mention unsupported cypher; got: {err_msg}"
         );
 
@@ -1585,10 +1605,7 @@ mod tests {
 
         // Other obvious raw-SQL injections must also fail.
         let engine = make_engine();
-        assert_cypher_rejected_and_no_sql_executed(
-            &engine,
-            "DROP TABLE entities;",
-        );
+        assert_cypher_rejected_and_no_sql_executed(&engine, "DROP TABLE entities;");
 
         let engine = make_engine();
         assert_cypher_rejected_and_no_sql_executed(
@@ -1660,10 +1677,8 @@ mod tests {
         // cap.  We test via a translator-level invariant.
 
         // Translate the user query and inspect the bound LIMIT param.
-        let translated = super::try_translate_cypher(
-            "MATCH (n:ship) RETURN n LIMIT 1000000000",
-        )
-        .expect("query should translate");
+        let translated = super::try_translate_cypher("MATCH (n:ship) RETURN n LIMIT 1000000000")
+            .expect("query should translate");
 
         // Last param is the LIMIT we bind; ensure it fits inside the cap.
         // We can't read it back from the trait object directly, so we go

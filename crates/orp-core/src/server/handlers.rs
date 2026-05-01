@@ -1,12 +1,19 @@
 use crate::server::http::AppState;
+use crate::server::media::{
+    rewrite_hls_playlist, validate_relay_target, CreateMediaStreamInput, MediaProtocol,
+    MediaRegistryError, MediaStream,
+};
 use crate::server::websocket::BroadcastEvent;
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{header, StatusCode},
+    response::{IntoResponse, Json, Response},
 };
+use futures_util::TryStreamExt;
 use orp_proto::{Entity, GeoPoint, Relationship};
 use orp_security::middleware::AuthContext;
+use orp_security::url_safety::build_safe_client;
 use orp_security::{AbacEngine, EvaluationContext, EvaluationResult, Resource, Subject};
 use orp_stream::monitor::{
     AlertSeverity, GeofenceTrigger, MonitorAction, MonitorCondition, MonitorRule, ThresholdOp,
@@ -1261,8 +1268,7 @@ pub async fn graph_query(
         // QueryError = unsupported / malformed cypher (caller's fault, 400).
         // Anything else is a backend failure (500).
         Err(e @ orp_storage::StorageError::QueryError(_)) => {
-            error_response("INVALID_QUERY", StatusCode::BAD_REQUEST, &e.to_string())
-                .into_response()
+            error_response("INVALID_QUERY", StatusCode::BAD_REQUEST, &e.to_string()).into_response()
         }
         Err(e) => error_response(
             "INTERNAL_ERROR",
@@ -1482,6 +1488,333 @@ pub async fn delete_connector(
             &e.to_string(),
         )
         .into_response(),
+    }
+}
+
+// ---- Media streams ----
+
+fn media_registry_error(err: MediaRegistryError) -> (StatusCode, Json<ErrorResponse>) {
+    match err {
+        MediaRegistryError::Validation(msg) => {
+            error_response("VALIDATION_ERROR", StatusCode::BAD_REQUEST, &msg)
+        }
+        MediaRegistryError::Conflict(msg) => error_response("CONFLICT", StatusCode::CONFLICT, &msg),
+        MediaRegistryError::NotFound(msg) => {
+            error_response("MEDIA_STREAM_NOT_FOUND", StatusCode::NOT_FOUND, &msg)
+        }
+    }
+}
+
+fn media_stream_entity(stream: &MediaStream) -> Entity {
+    Entity {
+        entity_id: stream.entity_id(),
+        entity_type: "media_stream".to_string(),
+        name: Some(stream.name.clone()),
+        properties: stream.entity_properties(),
+        confidence: 0.95,
+        ..Entity::default()
+    }
+}
+
+pub async fn list_media_streams(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "media", "*") {
+        return resp.into_response();
+    }
+
+    let streams = state.media_registry.list().await;
+    Json(serde_json::json!({
+        "data": streams,
+        "count": streams.len(),
+    }))
+    .into_response()
+}
+
+pub async fn create_media_stream(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateMediaStreamInput>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:write", "media", "*") {
+        return resp.into_response();
+    }
+
+    let stream = match state.media_registry.create(body).await {
+        Ok(stream) => stream,
+        Err(err) => return media_registry_error(err).into_response(),
+    };
+
+    let entity = media_stream_entity(&stream);
+    if let Err(e) = state.storage.insert_entity(&entity).await {
+        let _ = state.media_registry.delete(&stream.id).await;
+        return error_response(
+            "INTERNAL_ERROR",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )
+        .into_response();
+    }
+
+    audit_log(
+        state.as_ref(),
+        "media_stream_created",
+        Some("media_stream"),
+        Some(&stream.entity_id()),
+        &auth.subject,
+        serde_json::json!({
+            "stream_id": stream.id.clone(),
+            "protocol": stream.protocol.as_str(),
+            "source_url": stream.source_url_redacted.clone(),
+        }),
+    )
+    .await;
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "data": stream })),
+    )
+        .into_response()
+}
+
+pub async fn get_media_stream(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "media", &id) {
+        return resp.into_response();
+    }
+
+    match state.media_registry.get(&id).await {
+        Some(stream) => Json(serde_json::json!({ "data": stream })).into_response(),
+        None => media_registry_error(MediaRegistryError::NotFound(format!(
+            "media stream '{id}' not found"
+        )))
+        .into_response(),
+    }
+}
+
+async fn fetch_media_stream_response(
+    stream: &MediaStream,
+    target_url: &str,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    validate_relay_target(stream, target_url).map_err(media_relay_error)?;
+    let (client, _) = build_safe_client(target_url, stream.allow_private_network)
+        .map_err(|e| error_response("MEDIA_RELAY_BLOCKED", StatusCode::BAD_REQUEST, &e))?;
+    let upstream = client.get(target_url).send().await.map_err(|e| {
+        error_response(
+            "MEDIA_RELAY_UPSTREAM",
+            StatusCode::BAD_GATEWAY,
+            &format!("media upstream request failed: {e}"),
+        )
+    })?;
+    let status = upstream.status();
+    if !status.is_success() {
+        return Err(error_response(
+            "MEDIA_RELAY_UPSTREAM",
+            StatusCode::BAD_GATEWAY,
+            &format!("media upstream returned HTTP {}", status.as_u16()),
+        ));
+    }
+
+    let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+    let cache_control = upstream.headers().get(header::CACHE_CONTROL).cloned();
+    let body = Body::from_stream(
+        upstream
+            .bytes_stream()
+            .map_err(|e| std::io::Error::other(format!("media upstream stream failed: {e}"))),
+    );
+
+    let mut builder = Response::builder().status(status);
+    if let Some(value) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, value);
+    }
+    if let Some(value) = cache_control {
+        builder = builder.header(header::CACHE_CONTROL, value);
+    }
+    builder.body(body).map_err(|e| {
+        error_response(
+            "MEDIA_RELAY_ERROR",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to build media relay response: {e}"),
+        )
+    })
+}
+
+async fn fetch_media_text(
+    stream: &MediaStream,
+    target_url: &str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    validate_relay_target(stream, target_url).map_err(media_relay_error)?;
+    let (client, _) = build_safe_client(target_url, stream.allow_private_network)
+        .map_err(|e| error_response("MEDIA_RELAY_BLOCKED", StatusCode::BAD_REQUEST, &e))?;
+    let upstream = client.get(target_url).send().await.map_err(|e| {
+        error_response(
+            "MEDIA_RELAY_UPSTREAM",
+            StatusCode::BAD_GATEWAY,
+            &format!("media upstream request failed: {e}"),
+        )
+    })?;
+    let status = upstream.status();
+    if !status.is_success() {
+        return Err(error_response(
+            "MEDIA_RELAY_UPSTREAM",
+            StatusCode::BAD_GATEWAY,
+            &format!("media upstream returned HTTP {}", status.as_u16()),
+        ));
+    }
+    upstream.text().await.map_err(|e| {
+        error_response(
+            "MEDIA_RELAY_UPSTREAM",
+            StatusCode::BAD_GATEWAY,
+            &format!("media upstream text decode failed: {e}"),
+        )
+    })
+}
+
+fn media_relay_error(err: MediaRegistryError) -> (StatusCode, Json<ErrorResponse>) {
+    match err {
+        MediaRegistryError::Validation(msg) if msg.contains("not implemented yet") => {
+            error_response("MEDIA_RELAY_UNSUPPORTED", StatusCode::NOT_IMPLEMENTED, &msg)
+        }
+        MediaRegistryError::Validation(msg) => {
+            error_response("MEDIA_RELAY_BLOCKED", StatusCode::BAD_REQUEST, &msg)
+        }
+        other => media_registry_error(other),
+    }
+}
+
+pub async fn relay_media_stream(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "media", &id) {
+        return resp.into_response();
+    }
+
+    let Some(stream) = state.media_registry.get(&id).await else {
+        return media_registry_error(MediaRegistryError::NotFound(format!(
+            "media stream '{id}' not found"
+        )))
+        .into_response();
+    };
+
+    if stream.protocol == MediaProtocol::Hls {
+        return relay_hls_playlist_for_stream(&stream).await.into_response();
+    }
+
+    match fetch_media_stream_response(&stream, stream.source_url()).await {
+        Ok(resp) => resp.into_response(),
+        Err(resp) => resp.into_response(),
+    }
+}
+
+async fn relay_hls_playlist_for_stream(stream: &MediaStream) -> Response {
+    match fetch_media_text(stream, stream.source_url())
+        .await
+        .and_then(|text| {
+            rewrite_hls_playlist(&stream.id, stream.source_url(), &text).map_err(media_relay_error)
+        }) {
+        Ok(playlist) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+            playlist,
+        )
+            .into_response(),
+        Err(resp) => resp.into_response(),
+    }
+}
+
+pub async fn relay_hls_playlist(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "media", &id) {
+        return resp.into_response();
+    }
+
+    let Some(stream) = state.media_registry.get(&id).await else {
+        return media_registry_error(MediaRegistryError::NotFound(format!(
+            "media stream '{id}' not found"
+        )))
+        .into_response();
+    };
+
+    if stream.protocol != MediaProtocol::Hls {
+        return error_response(
+            "MEDIA_RELAY_UNSUPPORTED",
+            StatusCode::BAD_REQUEST,
+            "playlist relay is only available for HLS media streams",
+        )
+        .into_response();
+    }
+
+    relay_hls_playlist_for_stream(&stream).await.into_response()
+}
+
+#[derive(Deserialize)]
+pub struct HlsFetchParams {
+    url: String,
+}
+
+pub async fn relay_hls_asset(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<HlsFetchParams>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "media", &id) {
+        return resp.into_response();
+    }
+
+    let Some(stream) = state.media_registry.get(&id).await else {
+        return media_registry_error(MediaRegistryError::NotFound(format!(
+            "media stream '{id}' not found"
+        )))
+        .into_response();
+    };
+
+    match fetch_media_stream_response(&stream, &params.url).await {
+        Ok(resp) => resp.into_response(),
+        Err(resp) => resp.into_response(),
+    }
+}
+
+pub async fn delete_media_stream(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:write", "media", &id) {
+        return resp.into_response();
+    }
+
+    match state.media_registry.delete(&id).await {
+        Ok(stream) => {
+            if let Err(e) = state.storage.delete_entity(&stream.entity_id()).await {
+                return error_response(
+                    "INTERNAL_ERROR",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                )
+                .into_response();
+            }
+            audit_log(
+                state.as_ref(),
+                "media_stream_deleted",
+                Some("media_stream"),
+                Some(&stream.entity_id()),
+                &auth.subject,
+                serde_json::json!({"stream_id": stream.id}),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err) => media_registry_error(err).into_response(),
     }
 }
 
@@ -1962,6 +2295,7 @@ mod tests {
             federation_registry: None,
             federation_outbox: None,
             connectors: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            media_registry: Arc::new(crate::server::media::MediaRegistry::new()),
             local_node_id: "test-node".to_string(),
             federation_signer: Arc::new(crate::server::federation_tls::LocalSigner::ephemeral()),
             federation_seq: crate::server::federation_tls::OutboundSeq::new(),
@@ -1996,6 +2330,16 @@ mod tests {
             .route("/api/v1/connectors", post(create_connector))
             .route("/api/v1/connectors/:id", put(update_connector))
             .route("/api/v1/connectors/:id", delete(delete_connector))
+            .route("/api/v1/media/streams", get(list_media_streams))
+            .route("/api/v1/media/streams", post(create_media_stream))
+            .route("/api/v1/media/streams/:id", get(get_media_stream))
+            .route("/api/v1/media/streams/:id", delete(delete_media_stream))
+            .route("/api/v1/media/streams/:id/relay", get(relay_media_stream))
+            .route(
+                "/api/v1/media/streams/:id/playlist.m3u8",
+                get(relay_hls_playlist),
+            )
+            .route("/api/v1/media/streams/:id/hls/fetch", get(relay_hls_asset))
             .route("/api/v1/monitors", get(list_monitors))
             .route("/api/v1/monitors", post(create_monitor))
             .route("/api/v1/monitors/:id", get(get_monitor))
@@ -2035,6 +2379,40 @@ mod tests {
 
     fn json_body(body: serde_json::Value) -> Body {
         Body::from(serde_json::to_string(&body).unwrap())
+    }
+
+    async fn spawn_media_origin() -> String {
+        async fn snapshot() -> impl IntoResponse {
+            (
+                [(header::CONTENT_TYPE, "image/jpeg")],
+                vec![0xff, 0xd8, 0xff, 0xd9],
+            )
+        }
+
+        async fn playlist() -> impl IntoResponse {
+            (
+                [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+                "#EXTM3U\n#EXTINF:2.0,\nseg-1.ts\n".to_string(),
+            )
+        }
+
+        async fn segment() -> impl IntoResponse {
+            (
+                [(header::CONTENT_TYPE, "video/mp2t")],
+                vec![0x47, 0x40, 0x00, 0x10],
+            )
+        }
+
+        let app = Router::new()
+            .route("/snapshot.jpg", get(snapshot))
+            .route("/index.m3u8", get(playlist))
+            .route("/seg-1.ts", get(segment));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
     }
 
     // ── Health Endpoint ──────────────────────────────────────────────────────
@@ -2616,6 +2994,240 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Media streams ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_media_stream_redacts_credentials_and_projects_entity() {
+        let (app, state) = make_test_app().await;
+        let body = serde_json::json!({
+            "id": "gate-cam",
+            "name": "Gate Camera",
+            "source_url": "rtsp://admin:secret@10.0.0.5:554/main",
+            "allow_private_network": true,
+            "expected_codec": "h264",
+            "klv_metadata": true,
+            "labels": ["perimeter"]
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/media/streams")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["protocol"], "rtsp");
+        assert_eq!(
+            json["data"]["source_url_redacted"],
+            "rtsp://<redacted>@10.0.0.5:554/main"
+        );
+        assert!(json["data"].get("source_url").is_none());
+
+        let entity = state
+            .storage
+            .get_entity("media:gate-cam")
+            .await
+            .unwrap()
+            .expect("media stream entity");
+        assert_eq!(entity.entity_type, "media_stream");
+        assert_eq!(
+            entity.properties["source_url"],
+            "rtsp://<redacted>@10.0.0.5:554/main"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_media_stream_private_ip_requires_opt_in() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "id": "lan-cam",
+            "name": "LAN Camera",
+            "source_url": "rtsp://192.168.1.20/live"
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/media/streams")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_delete_media_stream_removes_graph_entity() {
+        let (app, state) = make_test_app().await;
+        let body = serde_json::json!({
+            "id": "yard-cam",
+            "name": "Yard Camera",
+            "source_url": "rtsp://203.0.113.20/live"
+        });
+        let create = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/media/streams")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let delete = app
+            .oneshot(
+                Request::delete("/api/v1/media/streams/yard-cam")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+        let entity = state
+            .storage
+            .get_entity("media:yard-cam")
+            .await
+            .unwrap()
+            .expect("soft-deleted media stream entity remains addressable");
+        assert!(!entity.is_active);
+    }
+
+    #[tokio::test]
+    async fn test_media_relay_proxies_jpeg_bytes() {
+        let origin = spawn_media_origin().await;
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "id": "snapshot-cam",
+            "name": "Snapshot Camera",
+            "source_url": format!("{origin}/snapshot.jpg"),
+            "allow_private_network": true
+        });
+        let create = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/media/streams")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/media/streams/snapshot-cam/relay")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jpeg"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], &[0xff, 0xd8, 0xff, 0xd9]);
+    }
+
+    #[tokio::test]
+    async fn test_hls_playlist_relay_rewrites_segments() {
+        let origin = spawn_media_origin().await;
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "id": "hls-cam",
+            "name": "HLS Camera",
+            "source_url": format!("{origin}/index.m3u8"),
+            "allow_private_network": true
+        });
+        let create = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/media/streams")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let playlist = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/media/streams/hls-cam/playlist.m3u8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(playlist.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(playlist.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("/api/v1/media/streams/hls-cam/hls/fetch?url="));
+        assert!(text.contains("%2Fseg-1.ts"));
+
+        let segment = app
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/media/streams/hls-cam/hls/fetch?url={origin}/seg-1.ts"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(segment.status(), StatusCode::OK);
+        assert_eq!(
+            segment.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp2t"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtsp_relay_reports_not_implemented() {
+        let (app, _) = make_test_app().await;
+        let body = serde_json::json!({
+            "id": "rtsp-cam",
+            "name": "RTSP Camera",
+            "source_url": "rtsp://203.0.113.20/live"
+        });
+        let create = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/media/streams")
+                    .header("content-type", "application/json")
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/media/streams/rtsp-cam/relay")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     // ── Monitors ─────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@
 
 ### A single Rust binary that fuses 39+ protocols into one cryptographically-signed real-time picture.
 
-[![Tests](https://img.shields.io/badge/tests-1362%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
+[![Tests](https://img.shields.io/badge/tests-1383%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
 [![Binary Size](https://img.shields.io/badge/binary-45MB-blue?style=flat-square)](https://github.com/shieldofsteel/orp/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square)](https://www.rust-lang.org)
@@ -108,6 +108,8 @@ For copy-paste recipes (AIS, ADS-B, MAVLink, Modbus, Zeek, audit-log export, fed
 
 **Builds a live knowledge graph** — every entity (ship, aircraft, vehicle, sensor, threat) becomes a node. Relationships auto-form. The graph updates in real time.
 
+**Relays real-time media sources** — register RTSP/RTMP/HLS/MJPEG/WebRTC/SRT/ONVIF/KLV camera streams, relay HTTP/JPEG/MJPEG/HLS streams in-binary, validate risky LAN URLs explicitly, redact embedded credentials, and project every stream into the graph as a `media_stream`. See [docs/MEDIA.md](docs/MEDIA.md).
+
 **Renders a military-grade COP** — a full-featured map with 4 tile layers, directional arrows, course vectors, lasso select, and a timeline scrubber. Not a dashboard — an operational picture.
 
 **Lets you query anything** — ORP-QL is a purpose-built query language combining SQL analytics with Cypher-style graph traversal. Query across sensors, entities, and time.
@@ -163,6 +165,7 @@ ORP speaks the languages your sensors already use. **39 protocol adapters** acro
 - **Drone autonomy** — MAVLink v2 (heartbeat, global_position_int, attitude, status_text, battery, GPS_RAW)
 - **Space** — CCSDS + SGP4 (TLE-based orbit propagation)
 - **Military / tactical / ISR** — CoT (bidirectional, TAK Server compatible), STIX/TAXII, NFFI (STANAG 5527), CEF, MISB ST 0601 KLV (tags 1–25, video metadata)
+- **Real-time media relay** — in-binary HTTP/JPEG/MJPEG/HLS relay plus stream registration for RTSP, RTMP, WebRTC/WHEP, SRT, ONVIF, V4L2/USB, file, raw KLV, and KLV-in-MPEG-TS
 - **Industrial / IoT** — OPC-UA, Modbus TCP/RTU, MQTT, SparkplugB, DNP3, CAN/J1939, BACnet, LoRaWAN
 - **Cyber / network** — Syslog (RFC 3164/5424), PCAP, Zeek, NetFlow / IPFIX
 - **Streaming / messaging** — Apache Kafka (feature-gated), NATS / JetStream (feature-gated)
