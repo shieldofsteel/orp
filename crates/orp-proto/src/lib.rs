@@ -301,11 +301,8 @@ impl OrpEvent {
         use prost_types::Timestamp;
 
         let from_ts = |ts: Option<Timestamp>| -> DateTime<Utc> {
-            ts.map(|t| {
-                DateTime::from_timestamp(t.seconds, t.nanos as u32)
-                    .unwrap_or_else(Utc::now)
-            })
-            .unwrap_or_else(Utc::now)
+            ts.map(|t| DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or_else(Utc::now))
+                .unwrap_or_else(Utc::now)
         };
 
         let geo = proto.geo.map(|g| GeoPoint {
@@ -333,15 +330,15 @@ impl OrpEvent {
                 operation_id: uuid::Uuid::now_v7().to_string(),
             });
 
-        let payload = proto
-            .payload
-            .map(Self::parse_proto_payload)
-            .unwrap_or(EventPayload::Custom {
-                data: JsonValue::Null,
-            });
+        let payload =
+            proto
+                .payload
+                .map(Self::parse_proto_payload)
+                .unwrap_or(EventPayload::Custom {
+                    data: JsonValue::Null,
+                });
 
-        let id = uuid::Uuid::parse_str(&proto.event_id)
-            .unwrap_or_else(|_| uuid::Uuid::now_v7());
+        let id = uuid::Uuid::parse_str(&proto.event_id).unwrap_or_else(|_| uuid::Uuid::now_v7());
 
         let sig = if proto.signature.is_empty() {
             None
@@ -452,11 +449,9 @@ impl OrpEvent {
                 })
             }
 
-            EventPayload::Custom { data } => {
-                Variant::Custom(protos::CustomData {
-                    data: Some(json_value_to_prost_struct(data)),
-                })
-            }
+            EventPayload::Custom { data } => Variant::Custom(protos::CustomData {
+                data: Some(json_value_to_prost_struct(data)),
+            }),
         };
 
         protos::EventPayload {
@@ -468,7 +463,9 @@ impl OrpEvent {
         use protos::event_payload::Variant;
 
         match proto.variant {
-            None => EventPayload::Custom { data: JsonValue::Null },
+            None => EventPayload::Custom {
+                data: JsonValue::Null,
+            },
 
             Some(Variant::PositionUpdate(p)) => EventPayload::PositionUpdate {
                 latitude: p.latitude,
@@ -507,9 +504,7 @@ impl OrpEvent {
                     properties: p
                         .properties
                         .into_iter()
-                        .map(|(k, v)| {
-                            (k, serde_json::from_str(&v).unwrap_or(JsonValue::String(v)))
-                        })
+                        .map(|(k, v)| (k, serde_json::from_str(&v).unwrap_or(JsonValue::String(v))))
                         .collect(),
                 }
             }
@@ -684,15 +679,16 @@ fn prost_value_to_json_value(v: prost_types::Value) -> JsonValue {
         None => JsonValue::Null,
         Some(Kind::NullValue(_)) => JsonValue::Null,
         Some(Kind::BoolValue(b)) => JsonValue::Bool(b),
-        Some(Kind::NumberValue(n)) => {
-            serde_json::Number::from_f64(n)
-                .map(JsonValue::Number)
-                .unwrap_or(JsonValue::Null)
-        }
+        Some(Kind::NumberValue(n)) => serde_json::Number::from_f64(n)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
         Some(Kind::StringValue(s)) => JsonValue::String(s),
-        Some(Kind::ListValue(list)) => {
-            JsonValue::Array(list.values.into_iter().map(prost_value_to_json_value).collect())
-        }
+        Some(Kind::ListValue(list)) => JsonValue::Array(
+            list.values
+                .into_iter()
+                .map(prost_value_to_json_value)
+                .collect(),
+        ),
         Some(Kind::StructValue(s)) => prost_struct_to_json_value(s),
     }
 }
@@ -791,7 +787,12 @@ mod tests {
         );
         let json = event.to_json().unwrap();
         let back: OrpEvent = serde_json::from_str(&json).unwrap();
-        if let EventPayload::StateTransition { from_state, to_state, .. } = &back.payload {
+        if let EventPayload::StateTransition {
+            from_state,
+            to_state,
+            ..
+        } = &back.payload
+        {
             assert_eq!(from_state, "underway");
             assert_eq!(to_state, "moored");
         } else {
@@ -819,7 +820,12 @@ mod tests {
         );
         let json = event.to_json().unwrap();
         let back: OrpEvent = serde_json::from_str(&json).unwrap();
-        if let EventPayload::RelationshipChange { action, target_entity_id, .. } = &back.payload {
+        if let EventPayload::RelationshipChange {
+            action,
+            target_entity_id,
+            ..
+        } = &back.payload
+        {
             assert_eq!(*action, RelationshipAction::Created);
             assert_eq!(target_entity_id, "port-rotterdam");
         } else {
@@ -846,7 +852,10 @@ mod tests {
 
         let json = event.to_json().unwrap();
         let back: OrpEvent = serde_json::from_str(&json).unwrap();
-        if let EventPayload::AlertTriggered { severity, evidence, .. } = &back.payload {
+        if let EventPayload::AlertTriggered {
+            severity, evidence, ..
+        } = &back.payload
+        {
             assert_eq!(*severity, AlertSeverity::Critical);
             assert_eq!(evidence["deviation_deg"], json!(52));
         } else {
@@ -1018,8 +1027,11 @@ mod tests {
     // ── 17. With methods builder pattern ─────────────────────────────────────
     #[test]
     fn test_with_geo_builder() {
-        let event = make_position_event()
-            .with_geo(GeoPoint { lat: 1.0, lon: 2.0, alt: Some(3.0) });
+        let event = make_position_event().with_geo(GeoPoint {
+            lat: 1.0,
+            lon: 2.0,
+            alt: Some(3.0),
+        });
         assert!(event.geo.is_some());
         let geo = event.geo.unwrap();
         assert!((geo.lat - 1.0).abs() < 0.01);
@@ -1058,7 +1070,10 @@ mod tests {
         );
         let bytes = event.to_protobuf().unwrap();
         let back = OrpEvent::from_protobuf(&bytes).unwrap();
-        if let EventPayload::PropertyChange { key, is_derived, .. } = &back.payload {
+        if let EventPayload::PropertyChange {
+            key, is_derived, ..
+        } = &back.payload
+        {
             assert_eq!(key, "speed");
             assert!(is_derived);
         } else {
@@ -1082,7 +1097,12 @@ mod tests {
         );
         let bytes = event.to_protobuf().unwrap();
         let back = OrpEvent::from_protobuf(&bytes).unwrap();
-        if let EventPayload::StateTransition { from_state, to_state, .. } = &back.payload {
+        if let EventPayload::StateTransition {
+            from_state,
+            to_state,
+            ..
+        } = &back.payload
+        {
             assert_eq!(from_state, "underway");
             assert_eq!(to_state, "moored");
         } else {
@@ -1122,7 +1142,9 @@ mod tests {
         let event = OrpEvent::new(
             "s1".to_string(),
             "sensor".to_string(),
-            EventPayload::Custom { data: json!({"temp": 22.5}) },
+            EventPayload::Custom {
+                data: json!({"temp": 22.5}),
+            },
             "mqtt".to_string(),
             0.7,
         );

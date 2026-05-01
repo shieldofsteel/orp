@@ -96,9 +96,7 @@ impl DatabaseConfig {
         let query = props
             .get("query")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ConnectorError::ConfigError("Missing 'query' property".to_string())
-            })?
+            .ok_or_else(|| ConnectorError::ConfigError("Missing 'query' property".to_string()))?
             .to_string();
 
         let poll_interval_secs = props
@@ -272,10 +270,29 @@ impl DbDriver {
 
 /// Abstraction over a SQL query executor.
 /// Implement this trait to swap in real database backends.
+///
+/// # Safety contract — read this before implementing
+///
+/// `query` is the operator-supplied SQL template loaded from connector
+/// configuration. `watermark` is the latest seen high-watermark value
+/// (timestamp / monotonic id) for incremental ingestion.
+///
+/// Implementations **must** bind `watermark` via the database driver's
+/// parameter API (e.g. sqlx's `query.bind(...)`, postgres' `$1`, mysql's
+/// `?`). Implementations **must not** interpolate `watermark` into the
+/// SQL string with `format!`, `replace`, or any string concatenation —
+/// even for "trusted" sources, because the watermark value originates
+/// in external data and an attacker that controls a feed row can
+/// otherwise pivot to arbitrary SQL execution.
+///
+/// `query` itself comes from configuration. Operators are responsible
+/// for the templates they configure; this trait does not validate
+/// `query` content beyond rejecting clearly unsafe placeholders at
+/// connector start (see `DatabaseConnector::validate_query_template`).
 #[async_trait]
 pub trait QueryExecutor: Send + Sync {
-    /// Execute `query` with an optional `$1` parameter (watermark value).
-    /// Returns rows as `Vec<HashMap<String, JsonValue>>`.
+    /// Execute `query` with an optional `$1` (or driver-equivalent) parameter
+    /// bound to `watermark`. Returns rows as `Vec<HashMap<String, JsonValue>>`.
     async fn execute(
         &self,
         query: &str,
@@ -349,10 +366,40 @@ impl DatabaseConnector {
         }
     }
 
+    /// Cheap structural check on the operator-supplied query template.
+    /// Rejects anything that looks like a string-format placeholder
+    /// (`{ ... }` outside of single-quoted SQL strings, `${...}`,
+    /// `%(...)s`, `%s`, or `<watermark>`). The intent is not to be a
+    /// SQL parser — it's to make accidental `format!`-style watermark
+    /// substitution fail loudly at connector start instead of silently
+    /// allowing SQL injection via incremental-load values.
+    ///
+    /// Implementations must use the driver's `bind` / `$1` API; see
+    /// the `QueryExecutor` trait safety contract.
+    pub(crate) fn validate_query_template(query: &str) -> Result<(), ConnectorError> {
+        const FORBIDDEN_MARKERS: &[&str] = &[
+            "${watermark}",
+            "{watermark}",
+            "%(watermark)s",
+            "<watermark>",
+        ];
+        for marker in FORBIDDEN_MARKERS {
+            if query.contains(marker) {
+                return Err(ConnectorError::ConfigError(format!(
+                    "database connector query contains forbidden placeholder '{marker}'. \
+                     Use the driver's parameter binding ($1, ?, :name) and let the executor \
+                     bind the watermark value — never interpolate it into the SQL string."
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Build from `ConnectorConfig::properties` using the `NoopExecutor`.
     /// Replace the executor with a real one via `with_executor`.
     pub fn from_connector_config(config: ConnectorConfig) -> Result<Self, ConnectorError> {
         let db_config = DatabaseConfig::from_properties(&config.properties)?;
+        Self::validate_query_template(&db_config.query)?;
         Ok(Self::new(config, db_config, Arc::new(NoopExecutor)))
     }
 
@@ -434,7 +481,8 @@ impl Connector for DatabaseConnector {
 
                         // Update watermark
                         if let Some(ref wf) = config_clone.watermark_field {
-                            let mut lock = watermark_clone.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut lock =
+                                watermark_clone.lock().unwrap_or_else(|e| e.into_inner());
                             for row in &rows {
                                 if let Some(v) = row.get(wf) {
                                     let s = if let Some(str_val) = v.as_str() {
@@ -723,8 +771,7 @@ mod tests {
         let config = make_config("postgres://localhost/db");
         let mut db_config = DatabaseConfig::from_properties(&config.properties).unwrap();
         db_config.watermark_field = Some("updated_at".to_string());
-        let connector =
-            DatabaseConnector::new(config, db_config.clone(), Arc::new(NoopExecutor));
+        let connector = DatabaseConnector::new(config, db_config.clone(), Arc::new(NoopExecutor));
 
         let mut row = HashMap::new();
         row.insert("updated_at".to_string(), json!("2024-06-01T00:00:00Z"));

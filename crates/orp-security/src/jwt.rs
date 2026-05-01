@@ -63,6 +63,11 @@ pub struct Claims {
     pub iat: i64,
     /// Expiration (Unix timestamp)
     pub exp: i64,
+    /// Not-before (Unix timestamp). Tokens presented before `nbf` are
+    /// rejected. Issued by ORP equal to `iat`; a generous client clock
+    /// skew is tolerated via `JwtConfig::leeway_seconds`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nbf: Option<i64>,
     /// Issuer
     pub iss: String,
     /// Audience
@@ -84,8 +89,7 @@ impl Claims {
 
     /// Returns true if the claims contain the given permission string.
     pub fn has_permission(&self, perm: &str) -> bool {
-        self.permissions.iter().any(|p| p == perm)
-            || self.permissions.iter().any(|p| p == "admin")
+        self.permissions.iter().any(|p| p == perm) || self.permissions.iter().any(|p| p == "admin")
     }
 
     /// Returns the list of scopes parsed from the scope string.
@@ -119,6 +123,11 @@ pub struct JwtConfig {
     pub expiration_seconds: i64,
     /// Refresh token lifetime in seconds
     pub refresh_expiration_seconds: i64,
+    /// Allowed clock skew in seconds when validating `exp`/`nbf`/`iat`.
+    /// Default: 60 s, which is the OAuth 2.0 recommendation. Configurable
+    /// because federated peers and edge nodes routinely drift more than
+    /// the typical strict bound.
+    pub leeway_seconds: u64,
 }
 
 impl Default for JwtConfig {
@@ -133,6 +142,7 @@ impl Default for JwtConfig {
             audience: "orp-client".to_string(),
             expiration_seconds: 3600,
             refresh_expiration_seconds: 86400,
+            leeway_seconds: 60,
         }
     }
 }
@@ -153,9 +163,7 @@ impl JwtService {
                 }
             }
             JwtAlgorithm::RS256 => {
-                if config.rs256_private_key_pem.is_none()
-                    && config.rs256_public_key_pem.is_none()
-                {
+                if config.rs256_private_key_pem.is_none() && config.rs256_public_key_pem.is_none() {
                     return Err(JwtError::Config(
                         "RS256 requires at least one of private or public key".into(),
                     ));
@@ -191,6 +199,7 @@ impl JwtService {
             email: email.map(|s| s.to_string()),
             name: name.map(|s| s.to_string()),
             iat: now,
+            nbf: Some(now),
             exp: now + self.config.expiration_seconds,
             iss: self.config.issuer.clone(),
             aud: self.config.audience.clone(),
@@ -210,6 +219,7 @@ impl JwtService {
             email: None,
             name: None,
             iat: now,
+            nbf: Some(now),
             exp: now + self.config.refresh_expiration_seconds,
             iss: self.config.issuer.clone(),
             aud: format!("{}-refresh", self.config.audience),
@@ -227,11 +237,30 @@ impl JwtService {
         encode(&header, claims, &key).map_err(|e| JwtError::EncodingFailed(e.to_string()))
     }
 
+    /// Build the strictest validation profile we accept:
+    /// - algorithm pinned (no `none`, no alg-confusion)
+    /// - `exp`, `nbf`, `iss`, `aud`, `sub` are *required* (not just
+    ///   "validated when present" — the absence of `nbf` would otherwise
+    ///   silently skip the not-before check)
+    /// - configurable `leeway` for clock skew
+    fn base_validation(&self) -> Validation {
+        let mut validation = Validation::new(self.algorithm());
+        validation.set_issuer(&[&self.config.issuer]);
+        validation.leeway = self.config.leeway_seconds;
+        validation.validate_nbf = true;
+        validation.validate_exp = true;
+        // `nbf` must be present and valid: jsonwebtoken's `validate_nbf`
+        // alone would only check it if it appears in the claim set, which
+        // means a token without `nbf` would slip through. Listing it in
+        // `required_spec_claims` forces presence.
+        validation.set_required_spec_claims(&["exp", "nbf", "iss", "aud", "sub"]);
+        validation
+    }
+
     /// Validate a token string and return the decoded claims.
     pub fn validate_token(&self, token: &str) -> Result<Claims, JwtError> {
         let key = self.decoding_key()?;
-        let mut validation = Validation::new(self.algorithm());
-        validation.set_issuer(&[&self.config.issuer]);
+        let mut validation = self.base_validation();
         validation.set_audience(&[&self.config.audience]);
 
         let data: TokenData<Claims> = decode(token, &key, &validation)?;
@@ -241,8 +270,7 @@ impl JwtService {
     /// Validate a refresh token — checks signature and issuer, uses refresh audience.
     pub fn validate_refresh_token(&self, token: &str) -> Result<Claims, JwtError> {
         let key = self.decoding_key()?;
-        let mut validation = Validation::new(self.algorithm());
-        validation.set_issuer(&[&self.config.issuer]);
+        let mut validation = self.base_validation();
         validation.set_audience(&[format!("{}-refresh", self.config.audience)]);
         let data: TokenData<Claims> = decode(token, &key, &validation)?;
         Ok(data.claims)
@@ -296,7 +324,9 @@ impl JwtService {
                     DecodingKey::from_rsa_pem(priv_pem.as_bytes())
                         .map_err(|e| JwtError::Config(format!("Invalid RSA key: {e}")))
                 } else {
-                    Err(JwtError::Config("No RS256 key available for decoding".into()))
+                    Err(JwtError::Config(
+                        "No RS256 key available for decoding".into(),
+                    ))
                 }
             }
         }
@@ -343,13 +373,7 @@ mod tests {
     fn test_has_permission() {
         let svc = default_service();
         let token = svc
-            .issue_token(
-                "user-123",
-                None,
-                None,
-                None,
-                vec!["entities:read".into()],
-            )
+            .issue_token("user-123", None, None, None, vec!["entities:read".into()])
             .unwrap();
         let claims = svc.validate_token(&token).unwrap();
         assert!(claims.has_permission("entities:read"));
@@ -425,5 +449,182 @@ mod tests {
         };
         let result = JwtService::new(cfg);
         assert!(result.is_err());
+    }
+
+    // ─── nbf / leeway hardening tests ─────────────────────────────────────
+
+    /// Helper to encode an arbitrary serde-serializable claim set against the
+    /// service's signing key, bypassing `issue_token` so we can craft tokens
+    /// with non-standard claim shapes (e.g. nbf in the future, or omitted).
+    fn encode_with<T: Serialize>(svc: &JwtService, claims: &T) -> String {
+        let header = Header::new(svc.algorithm());
+        let key = svc.encoding_key().unwrap();
+        encode(&header, claims, &key).unwrap()
+    }
+
+    #[test]
+    fn test_validate_token_rejects_future_nbf() {
+        let svc = default_service();
+        let now = Utc::now().timestamp();
+        // 10 minutes in the future — well past the default 60s leeway.
+        let claims = Claims {
+            sub: "user-1".into(),
+            email: None,
+            name: None,
+            iat: now,
+            nbf: Some(now + 600),
+            exp: now + 3600,
+            iss: svc.config.issuer.clone(),
+            aud: svc.config.audience.clone(),
+            scope: String::new(),
+            org_id: None,
+            permissions: vec![],
+        };
+        let token = encode_with(&svc, &claims);
+        let result = svc.validate_token(&token);
+        assert!(result.is_err(), "future nbf must be rejected");
+    }
+
+    #[test]
+    fn test_validate_token_accepts_recent_nbf_within_leeway() {
+        let svc = default_service();
+        let now = Utc::now().timestamp();
+        // 30 seconds in the future, default leeway is 60 → still acceptable.
+        let claims = Claims {
+            sub: "user-1".into(),
+            email: None,
+            name: None,
+            iat: now,
+            nbf: Some(now + 30),
+            exp: now + 3600,
+            iss: svc.config.issuer.clone(),
+            aud: svc.config.audience.clone(),
+            scope: String::new(),
+            org_id: None,
+            permissions: vec![],
+        };
+        let token = encode_with(&svc, &claims);
+        let result = svc.validate_token(&token);
+        assert!(
+            result.is_ok(),
+            "nbf within leeway must be accepted, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_token_requires_nbf_claim() {
+        // Mirror Claims but omit nbf entirely so the encoded JWT has no
+        // `nbf` field at all (not even null). Validation should fail
+        // because base_validation pins `nbf` as a required spec claim.
+        #[derive(Serialize)]
+        struct ClaimsNoNbf {
+            sub: String,
+            iat: i64,
+            exp: i64,
+            iss: String,
+            aud: String,
+            scope: String,
+            permissions: Vec<String>,
+        }
+
+        let svc = default_service();
+        let now = Utc::now().timestamp();
+        let claims = ClaimsNoNbf {
+            sub: "user-1".into(),
+            iat: now,
+            exp: now + 3600,
+            iss: svc.config.issuer.clone(),
+            aud: svc.config.audience.clone(),
+            scope: String::new(),
+            permissions: vec![],
+        };
+        let token = encode_with(&svc, &claims);
+        let result = svc.validate_token(&token);
+        assert!(result.is_err(), "missing nbf must be rejected");
+        // Surface the underlying error type so we know it's a missing-claim
+        // failure, not a generic decode error from a malformed shape.
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("nbf") || msg.to_lowercase().contains("missing"),
+            "expected missing-nbf error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_leeway_boundary_exp() {
+        // Token whose `exp` is 30 s in the past at validation time. Default
+        // leeway is 60 s, so this must still validate. We avoid
+        // tokio::time::pause because jsonwebtoken reads the system clock,
+        // not the tokio clock; instead we stamp `exp` 30 s in the past so
+        // the leeway window applies at the present moment.
+        let svc = default_service();
+        let now = Utc::now().timestamp();
+        let claims = Claims {
+            sub: "user-1".into(),
+            email: None,
+            name: None,
+            iat: now - 120,
+            nbf: Some(now - 120),
+            exp: now - 30,
+            iss: svc.config.issuer.clone(),
+            aud: svc.config.audience.clone(),
+            scope: String::new(),
+            org_id: None,
+            permissions: vec![],
+        };
+        let token = encode_with(&svc, &claims);
+        let result = svc.validate_token(&token);
+        assert!(
+            result.is_ok(),
+            "exp within leeway must still validate, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_clock_skew_at_leeway_boundary() {
+        // Document the boundary semantics: jsonwebtoken treats
+        // `now <= exp + leeway` as valid (inclusive upper bound). We use
+        // `exp = now - leeway` (exactly at the boundary) and assert it is
+        // ACCEPTED. Anything further into the past must fail; we cover
+        // `exp = now - leeway - 2` as the just-past-boundary rejection.
+        let svc = default_service();
+        let leeway = svc.config.leeway_seconds as i64;
+        let now = Utc::now().timestamp();
+
+        // Exactly at the boundary: exp + leeway == now.
+        let at_boundary = Claims {
+            sub: "user-1".into(),
+            email: None,
+            name: None,
+            iat: now - leeway - 100,
+            nbf: Some(now - leeway - 100),
+            exp: now - leeway,
+            iss: svc.config.issuer.clone(),
+            aud: svc.config.audience.clone(),
+            scope: String::new(),
+            org_id: None,
+            permissions: vec![],
+        };
+        let token = encode_with(&svc, &at_boundary);
+        let at_result = svc.validate_token(&token);
+        assert!(
+            at_result.is_ok(),
+            "token at exactly exp+leeway must be accepted (jsonwebtoken inclusive bound), got {at_result:?}"
+        );
+
+        // Two seconds past the boundary: must be rejected.
+        let past_boundary = Claims {
+            exp: now - leeway - 2,
+            iat: now - leeway - 200,
+            nbf: Some(now - leeway - 200),
+            ..at_boundary
+        };
+        let token = encode_with(&svc, &past_boundary);
+        let past_result = svc.validate_token(&token);
+        assert!(
+            past_result.is_err(),
+            "token past exp+leeway must be rejected"
+        );
     }
 }

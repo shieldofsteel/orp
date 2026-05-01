@@ -4,7 +4,7 @@ info:
   title: ORP API
   version: 1.0.0
   description: |
-    REST API for the ORP (Object Relationship Platform) Data Fusion engine.
+    REST API for ORP (Open Reality Protocol), the data-fusion engine.
     Provides entity CRUD, ORP-QL queries, graph traversal, real-time monitoring,
     connector management, and alert rules for maritime and multi-domain operations.
 
@@ -15,10 +15,11 @@ info:
     All list endpoints support `page`, `limit` (max 1000), `sort_by`, and `sort_order` query parameters.
 
     ## Rate Limiting
-    Default: 1000 req/sec per client API key. Exceeding the limit returns `429 Too Many Requests`.
+    Default: 100 req/sec per client IP, 100-token burst (token-bucket).
+    Exceeding the limit returns `429 Too Many Requests` with a `Retry-After` header.
   contact:
     name: ORP Team
-    url: https://github.com/orproject/orp
+    url: https://github.com/shieldofsteel/orp
   license:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -43,7 +44,7 @@ tags:
   - name: query
     description: ORP-QL and natural language query execution
   - name: graph
-    description: Cypher graph traversal (Kuzu)
+    description: Cypher-style graph traversal (DuckDB-backed projection)
   - name: connectors
     description: Data source connector management
   - name: monitors
@@ -938,11 +939,14 @@ paths:
   /query/natural:
     post:
       operationId: executeNaturalQuery
-      summary: Natural language query (Phase 2)
+      summary: Natural language query (Phase 2 — not yet implemented)
       description: |
         Translates a natural language question into ORP-QL and executes it.
         Returns the interpreted query along with results and confidence score.
-        Note: This endpoint is Phase 2 and may return `501 Not Implemented` in Phase 1.
+
+        **Status:** This endpoint is on the Phase 2 roadmap. The current
+        server returns `501 Not Implemented`. Until Phase 2 lands, clients
+        should call `/query` with an ORP-QL string instead.
       tags: [query]
       requestBody:
         required: true
@@ -966,7 +970,7 @@ paths:
                   query: List ports with high congestion
       responses:
         '200':
-          description: Natural language query result
+          description: Natural language query result (Phase 2 only)
           content:
             application/json:
               schema:
@@ -993,16 +997,26 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
+        '501':
+          description: Not yet implemented in this Phase 1 build.
+          content:
+            application/json:
+              example:
+                status: not_implemented
+                error: "Natural language query is on the Phase 2 roadmap. POST /query with an ORP-QL string instead."
 
   # ── GRAPH ───────────────────────────────────────────────────────────────────
 
   /graph:
     post:
       operationId: executeGraphQuery
-      summary: Execute Cypher graph query (Kuzu)
+      summary: Execute Cypher-style graph query
       description: |
-        Execute property graph queries using Cypher syntax via the embedded Kuzu
-        graph engine. Supports multi-hop traversals up to 3 hops (Phase 1 limit).
+        Execute property graph queries using Cypher syntax. Backed by the
+        DuckDB graph projection (`crates/orp-storage/src/graph_engine.rs`),
+        which materialises an in-memory adjacency list from the
+        `relationships` table on a 30-second sync cadence. Supports
+        multi-hop traversals up to 3 hops (Phase 1 limit).
       tags: [graph]
       requestBody:
         required: true
@@ -2892,7 +2906,7 @@ components:
       properties:
         query:
           type: string
-          description: Cypher query string (Kuzu)
+          description: Cypher-style query string (executed against the DuckDB graph projection)
           example: "MATCH (org:Organization {id: \"org-maersk\"})-[:OWNS]->(s:Ship)-[:HEADING_TO]->(p:Port) RETURN p.id, p.name, COUNT(*) as ships"
         timeout_ms:
           type: integer

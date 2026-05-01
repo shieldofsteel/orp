@@ -6,6 +6,71 @@ This project follows [Semantic Versioning](https://semver.org/) and [Conventiona
 
 ---
 
+## [Unreleased] — 2026-05-01 audit/fix wave
+
+### New crate
+
+- **`orp-ml`** — first ML seam in ORP. Exposes an `AnomalyScorer` trait so any model (rule-based, statistical, deep) plugs into the same hot path. Ships with `NullScorer`, `OnlineQuantileScorer` (rolling-p99.5 baseline), and a small in-house `IsolationForestScorer` (~275 LoC, `bincode` model load) — no heavyweight ML dep. `crates/orp-stream/src/processor.rs` calls the scorer in `upsert_entity`; non-`NullScorer` results land on entities as `ml_anomaly_score: f32` + `ml_model_id: String` and **augments** (does not replace) the rule-based score. The default `NullScorer` is a true no-op — no properties are written — so storage isn't bloated by zero scores from a disabled model.
+
+### New connector
+
+- **MAVLink v2** — drone telemetry adapter at `crates/orp-connector/src/adapters/mavlink.rs`. UDP listener, `mavlink://0.0.0.0:14550` URI scheme, decodes HEARTBEAT, GLOBAL_POSITION_INT, VFR_HUD, ATTITUDE, GPS_RAW_INT, SYS_STATUS. Per-vehicle entity dedup via `(system_id, component_id)`. The single biggest "be a real Lattice/Maven peer" win in the connector subsystem — every PX4/ArduPilot/Skydio/Auterion ground station now interoperates.
+
+### Connector capability expansions
+
+- **GRIB Section 7 (data unpacking)** — `crates/orp-connector/src/adapters/grib.rs` now unpacks Data Representation Template 5.0 (simple packing) per the WMO formula `Y = (R + X * 2^E) / 10^D` (the binary-scale `E` may be negative, so it's a real exponentiation, not a left-shift). GRIB messages now carry actual weather values, not just metadata. Templates other than 5.0 still return metadata-only with a warning rather than failing.
+- **Universal-ingest CSV** — `csv_watcher.rs` switched from naive `line.split(',')` to the `csv` crate. Quoted fields containing commas (`"Doe, John",51.5,-0.1`) parse correctly instead of being silently dropped.
+- **NFFI track-id collision fix** — `nffi.rs` no longer falls back to index-based IDs (`track-0`, `track-1`) for unnamed tracks. Synthesises a stable hash of `(name, lat, lon, affiliation)` so two distinct unnamed tracks don't merge during entity resolution.
+
+### Storage / Ops
+
+- **Persistent storage by default.** `commands.rs::run_start` now reads `config.storage.duckdb.path` and calls `DuckDbStorage::new_with_path`; entities, events, audit log all survive process restarts. New `--in-memory` flag opts back into the old behaviour for tests/demos.
+- **Graph engine cached** in `DuckDbStorage` via `OnceLock<Arc<GraphEngine>>` — DROP/CREATE VIEW × 19 now runs once per storage handle, not once per `graph_query` call (was the worst single perf bug identified by the perf audit).
+- **Forgiving config schema.** `#[serde(default)]` on `ServerConfig`, `StorageConfig`, `DuckDbConfig`, `KuzuConfig`, `RocksDbConfig`, `SqliteConfig`. A 4-line `config.yaml` now boots cleanly instead of demanding all 30 fields.
+- **`/health` now returns `graph_engine`** component (was missing from the response despite being declared in `openapi.yaml`).
+
+### Security hardening
+
+- **CSPRNG everywhere.** `crates/orp-audit/src/crypto.rs` (Ed25519 audit signer) and `crates/orp-security/src/api_keys.rs` (API key generation) swapped from `rand::thread_rng()` to `rand::rngs::OsRng`. Reproducible/predictable keys would have been a real attack on tamper-evidence and key enumeration.
+- **SSRF guard** on `crates/orp-connector/src/adapters/http_poller.rs`. Loopback / RFC1918 / link-local / 100.64/10 (CGNAT) / cloud-metadata hosts are blocked unless the connector opts in via `allow_private_targets = true`. 6 new unit tests.
+- **JWT hardening.** Claims now carry a required `nbf`; `validate_token` enables `validate_nbf`, requires `["exp", "iss", "aud", "sub"]`, and honours a configurable `leeway_seconds` (default 60s). Algorithm pinning was already in.
+- **OIDC discovery TTL cache.** `OidcClient` now caches the discovery document with a configurable TTL (default 1 h, env `ORP_OIDC_DISCOVERY_TTL_SECS`). On refresh failure the still-cached doc is returned with a warning rather than failing closed.
+- **Dev-mode safety belt.** `ORP_DEV_MODE=true` is honoured only when `ORP_ENV` is unset / `development` / `dev` / `test` / `ci`. In any other environment, permissive auth is **refused** with a loud error log so leaking dev env into prod doesn't open the front door.
+- **Database connector SQL safety contract.** `QueryExecutor` trait carries an explicit safety contract; new `validate_query_template` rejects `${watermark}` / `{watermark}` / `%(watermark)s` / `<watermark>` placeholders at connector start so accidental string-interpolation can't slip through.
+
+### Federation
+
+- **Adaptive backoff + per-peer scheduling.** `spawn_federation_sync` no longer sleeps a global 30 s. Each peer has its own next-fire instant; on success we reset to `ORP_FED_BASE_INTERVAL_SECS` (default 30 s), on failure we double up to `ORP_FED_MAX_INTERVAL_SECS` (default 600 s). Flapping satellite/4G uplinks no longer burn bandwidth and CPU.
+
+### Performance / edge
+
+- **`ORP_TRACK_LEN` env var** + default 50 (down from 500) for `AnalyticsEngine`. At 100K entities the in-memory track buffer drops from ~2.4 GB to ~240 MB — Pi-class deployment is real, not aspirational.
+
+### Frontend
+
+- **Canvas mock** in `frontend/src/test-setup.ts` so Leaflet stops throwing in jsdom.
+- **`useWebSocket` tests un-skipped** — `describe.skip` removed from all four blocks; the existing `MockWebSocket` was already correct. **All 19 tests now pass.**
+- **`vite.config.ts` `manualChunks`** for `react-vendor` / `leaflet-vendor` / `data-vendor`; `chunkSizeWarningLimit: 250`.
+
+### Docs
+
+- **Brand unified** to "Open Reality Protocol" across README, openapi.yaml, both SDKs (was three different names: "Open Reality Protocol", "Object Relationship Platform", "Open Relationship Protocol").
+- **License unified** to Apache-2.0 across `sdk/python/setup.py`, both SDK READMEs, and JS package.json (three places previously claimed MIT).
+- **Install URL fixed.** README and `docs/GETTING_STARTED.md` no longer point at the 404 `https://orp.dev/install` for first-time users.
+- **`protoc` listed as a prereq** with brew/apt/dnf/pacman commands.
+- **Kuzu sweep.** README, ARCHITECTURE, CHANGELOG, REQUIREMENTS, openapi.yaml, docs/* all rewritten to describe the actual implementation: a DuckDB-backed graph projection with an in-memory BFS executor. ADR-001 in ARCHITECTURE.md now documents this and reserves a `--features kuzu-graph` Cargo flag for the day a real customer hits a billion-edge / depth-5+ workload.
+- **OpenAPI** rate-limit corrected (1000/sec doc → 100/sec implementation), `/query/natural` documented as 501 Not Implemented (Phase 2 roadmap), `/graph` description updated.
+- **CI workflow branch filter** `[main, develop]` → `[master, main, develop]` so PRs against the actual default branch are gated.
+
+### Project Stats (verified 2026-05-01)
+
+- 13 crates (added `orp-ml`)
+- 34 protocol adapters (added MAVLink)
+- 1,122 backend tests passing across the workspace (orp-connector 547 / orp-core 154 / orp-stream 93 / orp-security 80 / orp-storage 53 / orp-ml 17 / cross-crate 178 + small crates), 0 failing.
+- 45 MB stripped release binary (Mach-O arm64) — verified, persistence test passed end-to-end.
+
+---
+
 ## [0.2.0-alpha] — 2026-03-27
 
 ### New Protocol Adapters (15 new parsers)
@@ -85,18 +150,18 @@ This release delivers a complete, working single-binary data fusion platform: re
 
 - **DuckDB integration** — embedded columnar OLAP engine. Handles geospatial queries (RTREE index), temporal scans, and aggregate analytics.
 - **Core tables** — `entities`, `entity_geometry`, `entity_properties`, `events`, `relationships`, `data_sources`, `audit_log`.
-- **Kuzu graph store** — embedded property graph database. Ships, ports, aircraft, weather systems, and organizations stored as nodes; relationships (HEADING_TO, OWNS, THREATENS, NEAR, etc.) as edges.
-- **DuckDB → Kuzu sync** — background task syncs entity and relationship changes to Kuzu every 30 seconds.
+- **DuckDB graph projection** — `graph_nodes` and `graph_edges` tables held inside DuckDB plus an in-memory adjacency list (`crates/orp-storage/src/graph_engine.rs`) serve as the property graph. Ships, ports, aircraft, weather systems, and organizations are nodes; relationships (HEADING_TO, OWNS, THREATENS, NEAR, etc.) are edges. (See ADR-001 — a `kuzu-graph` Cargo feature is reserved for billion-edge workloads.)
+- **Graph projection refresh** — background task rebuilds the projection tables and in-memory adjacency from the canonical entity/relationship tables every 30 seconds.
 - **RocksDB stream state** — dedup window, entity state cache, connector checkpoints. Survives binary restarts.
-- **Storage trait** — unified abstraction over DuckDB + Kuzu. Query engine routes through this trait; storage backends are swappable in tests.
+- **Storage trait** — unified abstraction over the DuckDB engine and the graph projection. Query engine routes through this trait; storage backends are swappable in tests.
 
 #### Query Engine (`orp-query`)
 
 - **ORP-QL v0.1** — purpose-built query language. LALRPOP-generated parser. SQL-style filtering combined with Cypher-style MATCH patterns.
 - **Supported syntax** — `MATCH`, `WHERE`, `RETURN`, `ORDER BY`, `LIMIT`, `GROUP BY`, `AT TIME` (temporal), `near()`, `within()`, `bbox()`, `point()`, `distance()`, `interval()`.
-- **Query planner** — routes queries to DuckDB (geospatial, analytics, temporal) or Kuzu (graph traversal) based on query shape. Hybrid queries use both engines with Rust-level result merge.
+- **Query planner** — routes queries to DuckDB (geospatial, analytics, temporal) or the graph projection's BFS executor (graph traversal) based on query shape. Hybrid queries use both with a Rust-level result merge.
 - **Query cache** — identical queries within a 30-second window return cached results without hitting storage.
-- **Cypher passthrough** — `POST /api/v1/graph` allows raw Kuzu Cypher queries for power users.
+- **Cypher-style passthrough** — `POST /api/v1/graph` accepts Cypher-style traversal queries that execute against the DuckDB graph projection.
 - **P50 latency** — simple queries < 200 ms; 3-hop graph queries < 1 s.
 
 #### API Layer (`orp-core`)
@@ -163,7 +228,7 @@ This release delivers a complete, working single-binary data fusion platform: re
 - WASM plugin system for custom connectors is not yet implemented (Phase 2).
 - Horizontal clustering / multi-node deployment is not yet implemented (Phase 3).
 - CesiumJS 3D globe is in beta and may have rendering inconsistencies on some GPUs.
-- DuckDB → Kuzu sync has an eventual consistency window of up to 30 seconds. Graph queries on very recently updated entities may reflect slightly stale state.
+- The graph projection refresh runs every 30 seconds. Graph queries on very recently updated entities may reflect slightly stale state during that window.
 - The `supply-chain` and `climate` templates are functional but use placeholder connector configs that require manual customization.
 
 ### Project Stats

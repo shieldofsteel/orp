@@ -23,14 +23,14 @@
 
 ## 1. System Overview
 
-ORP is a single Rust binary (~250–350 MB) that bundles everything required for real-time multi-source data fusion:
+ORP is a single Rust binary (~43 MB stripped, statically linked) that bundles everything required for real-time multi-source data fusion:
 
 - **Connectors** — protocol-specific adapters that pull from AIS feeds, ADS-B, REST APIs, MQTT brokers, CSV files
 - **Stream Processor** — deduplication, change detection, entity resolution, and batch insertion pipeline
-- **Storage** — DuckDB for OLAP analytics + Kuzu for graph queries, synchronized every 30 seconds
-- **Query Engine** — ORP-QL parser and planner that routes to DuckDB or Kuzu based on query shape
+- **Storage** — DuckDB for OLAP analytics; an in-memory graph projection over the same DuckDB tables provides Cypher-style traversal, refreshed every 30 seconds. RocksDB backs the dedup/DLQ event store.
+- **Query Engine** — ORP-QL parser and planner that compiles to DuckDB SQL for analytics or executes against the graph projection for traversal
 - **API** — Axum-based HTTP + WebSocket server exposing REST endpoints and real-time subscriptions
-- **Frontend** — React SPA (Deck.gl map, entity inspector, query bar, alert feed) served from embedded static assets
+- **Frontend** — React SPA (Leaflet map, entity inspector, query bar, alert feed) served from embedded static assets
 
 No external process dependencies. No Docker required. No databases to configure.
 
@@ -40,7 +40,7 @@ No external process dependencies. No Docker required. No databases to configure.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════╗
-║                         ORP BINARY (~300 MB)                            ║
+║                         ORP BINARY (~43 MB stripped)                     ║
 ║                                                                          ║
 ║  ┌────────────────────────────────────────────────────────────────────┐ ║
 ║  │  CLI  (clap v4)                                                    │ ║
@@ -58,8 +58,8 @@ No external process dependencies. No Docker required. No databases to configure.
 ║  └──┬──┘  └───┬───┘  └───┬───┘  └───┬───┘  └───────────────────────┘  ║
 ║     │          │          │          │                                   ║
 ║  ┌──▼──────────▼──┐  ┌────▼──────┐  └──► DuckDB executor               ║
-║  │  OrpEvent bus  │  │  DuckDB   │       Kuzu executor                  ║
-║  │  (tokio::mpsc) │  │  + Kuzu   │       Hybrid router                  ║
+║  │  OrpEvent bus  │  │  DuckDB   │       Graph-projection executor      ║
+║  │  (tokio::mpsc) │  │  + Graph  │       Hybrid router                  ║
 ║  └────────────────┘  │  + Rocks  │                                      ║
 ║                       └───────────┘                                     ║
 ║                                                                          ║
@@ -124,9 +124,10 @@ Data Source
          └─────┬─────┘
                │ every 30 seconds
                ▼
-         ┌───────────┐
-         │   Kuzu    │ ◄── Graph projection of DuckDB state
-         └───────────┘
+         ┌──────────────────┐
+         │ Graph projection │ ◄── In-memory adjacency rebuilt from DuckDB
+         │ (BFS executor)   │
+         └──────────────────┘
 ```
 
 ### 3.2 Query Path
@@ -156,7 +157,7 @@ HTTP POST /api/v1/query
 │  · Cost estimation      │
 │  · Predicate pushdown   │
 │  · Route decision:      │
-│    → graph query? Kuzu  │
+│    → graph query? proj. │
 │    → analytics? DuckDB  │
 │    → hybrid? both       │
 └────────────┬────────────┘
@@ -165,7 +166,7 @@ HTTP POST /api/v1/query
 ┌─────────────────────────┐
 │  Executor               │
 │  · Run DuckDB SQL       │
-│  · Run Kuzu Cypher      │
+│  · Run graph BFS        │
 │  · Merge result sets    │
 │  · Apply ABAC filters   │
 │  · Serialize to JSON    │
@@ -227,9 +228,20 @@ CREATE INDEX idx_events_time ON events (entity_id, timestamp DESC);
 
 **Write Pattern:** Batch inserts every 1–5 seconds, ~1,000 events per batch, wrapped in a transaction. This amortizes DuckDB's per-transaction overhead and achieves > 100K events/sec throughput on commodity hardware.
 
-### 4.2 Kuzu — Graph Store
+### 4.2 Graph Projection — In-Memory BFS over DuckDB
 
-Kuzu is a purpose-built embeddable property graph database with a columnar storage backend. ORP uses it exclusively for relationship-heavy queries: path traversal, reachability, and multi-hop graph walks that would be expensive as self-joins in DuckDB.
+ORP implements its graph capability as a *projection* of the DuckDB
+relationship table into an in-memory adjacency list, traversed by a
+breadth-first executor (`crates/orp-storage/src/graph_engine.rs`). This
+keeps the storage layer to a single columnar engine while still serving
+relationship-heavy queries: path traversal, reachability, and multi-hop
+graph walks that would be expensive as self-joins in DuckDB.
+
+> **Historical note:** Earlier ADR-001 drafts named Kuzu as the graph
+> store. The implementation landed as a DuckDB-backed projection because
+> it kept the binary footprint smaller and avoided a second on-disk file
+> format. The on-the-wire query language (Cypher-style `MATCH`
+> patterns) is unchanged.
 
 **Node Types (Maritime Template):**
 
@@ -253,18 +265,19 @@ NEAR          (Ship → Ship)       : distance_km, duration_min
 FOLLOWS_ROUTE (Ship → Port)       : seq, planned_arrival
 ```
 
-**Sync Design:** The DuckDB → Kuzu sync runs as a background Tokio task every 30 seconds:
+**Sync Design:** The graph projection rebuild runs as a background Tokio task every 30 seconds:
 
 ```
 1. Query DuckDB for entities updated since last_sync_ts
-2. For each changed entity: MERGE node in Kuzu (upsert by entity_id)
+2. Upsert each changed entity into the graph_nodes table (DuckDB-backed)
 3. Query DuckDB for relationships updated since last_sync_ts
-4. For each changed relationship: MERGE edge in Kuzu
-5. Update last_sync_ts = now()
-6. Emit sync metrics (entities_synced, edges_synced, duration_ms)
+4. Upsert each changed relationship into graph_edges
+5. Reload the in-memory adjacency snapshot used by the BFS executor
+6. Update last_sync_ts = now()
+7. Emit sync metrics (entities_synced, edges_synced, duration_ms)
 ```
 
-The sync is eventually consistent (up to 30 seconds behind DuckDB). Graph queries that need freshness < 30s are served by DuckDB with manual joins.
+The projection is eventually consistent (up to 30 seconds behind DuckDB). Graph queries that need freshness < 30s can fall back to DuckDB with manual joins.
 
 ### 4.3 RocksDB — Stream State
 
@@ -360,7 +373,7 @@ limit_clause  ::= "LIMIT" integer
 QueryAst
     │
     ├── Has MATCH with relationship patterns?
-    │   ├── YES, depth ≤ 3 hops → route to Kuzu
+    │   ├── YES, depth ≤ 3 hops → route to graph projection
     │   └── YES, depth > 3 hops → route to DuckDB (recursive CTE)
     │
     ├── Has geospatial functions (near, within, bbox)?
@@ -373,7 +386,7 @@ QueryAst
         └── Route to DuckDB (events table temporal scan)
 ```
 
-**Hybrid queries** (geospatial filter + graph traversal): DuckDB resolves the geospatial filter first (returns entity IDs), then Kuzu does the graph walk on the filtered set. Results are merged in Rust and returned as a single JSON array.
+**Hybrid queries** (geospatial filter + graph traversal): DuckDB resolves the geospatial filter first (returns entity IDs), then the graph projection's BFS executor does the graph walk on the filtered set. Results are merged in Rust and returned as a single JSON array.
 
 ### 6.3 Performance Budget
 
@@ -382,7 +395,7 @@ QueryAst
 | Parse | 5 ms | LALRPOP-generated parser, zero-copy tokens |
 | Plan | 10 ms | Cached query plan for identical queries |
 | Execute (DuckDB) | 130 ms | RTREE index, predicate pushdown |
-| Execute (Kuzu) | 700 ms | 3-hop budget |
+| Execute (graph BFS) | 700 ms | 3-hop budget |
 | Merge + serialize | 15 ms | SIMD JSON serialization |
 | **Total P50** | **< 200 ms** | _(simple queries)_ |
 
@@ -675,7 +688,7 @@ orp (binary, orp-core)
 │   └── orp-entity      (entity resolution: structural matching)
 │       └── orp-proto
 │
-├── orp-storage         (DuckDB + Kuzu + RocksDB integration)
+├── orp-storage         (DuckDB + graph projection)
 │   └── orp-proto
 │
 ├── orp-query           (ORP-QL parser, planner, executor)
@@ -707,34 +720,46 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror      = { version = "1" }
 anyhow         = { version = "1" }
 clap           = { version = "4", features = ["derive"] }
-duckdb         = { version = "0.10", features = ["bundled"] }
-rocksdb        = { version = "0.21", features = ["multi-threaded-cf"] }
+duckdb         = { version = "1.2", features = ["bundled"] }
+rocksdb        = { version = "0.22", features = ["lz4"] }
 ```
 
 ---
 
 ## 12. Design Decisions
 
-### ADR-001: DuckDB + Kuzu + RocksDB
+### ADR-001: DuckDB-backed graph projection (with optional graph-engine flag for the future)
 
-**Context:** Need OLAP analytics, graph traversal, and high-speed stream state. Three separate concerns.
+**Context:** ORP needs OLAP analytics, geospatial filtering, graph traversal, and high-speed stream state — without splitting into multiple processes.
 
-**Decision:** Use three embedded databases, each specializing:
-- DuckDB: columnar OLAP, geospatial, temporal queries
-- Kuzu: graph traversal, path queries
-- RocksDB: mutable K/V stream state, dedup window
+**Decision (current):** **DuckDB is the single source of truth.**
+- `entities`, `entity_properties`, `entity_geometry`, `relationships`, `events`, `audit_log`, plus the projected `graph_nodes` and `graph_edges` tables — all live in one DuckDB instance.
+- A 30-second background task rebuilds an in-memory adjacency from `relationships` (`crates/orp-storage/src/graph_engine.rs`), and a Rust BFS executor handles multi-hop graph traversal up to 3 hops.
+- RocksDB is retained only for the dedup-window and dead-letter event queue (`crates/orp-stream/src/{dedup.rs,dlq.rs}`) — workloads where DuckDB's columnar pattern is a bad fit.
 
-**Consequence:** ~110 MB of storage engines in the binary. But: no external processes, single-binary deploy, and each engine is best-in-class for its workload.
+**Consequence:**
+- One on-disk file format (`orp.duckdb`) → SQLite-style operational simplicity (single-file backup, single-file restore).
+- ~30–35 MB of bundled storage code → "43 MB single binary" goal stays in reach.
+- Graph traversal is eventually-consistent within the 30-second projection refresh window. Acceptable for most maritime/aviation/COP workloads (entity counts ≤ 1M, traversal depth ≤ 3).
 
-**Rejected:** PostgreSQL + PostGIS (requires separate process), SurrealDB (immature), Apache Flink (distributed complexity).
+**Rejected (for now):**
+- **Native Kuzu integration**: a real embedded property-graph engine with Cypher and columnar storage. Buys ~10–100× faster traversal at depth 5+ over 10M-edge graphs, at the cost of ~20–25 MB of additional binary weight, a second on-disk file format, and a real DuckDB↔Kuzu sync to maintain. **Will be reintroduced behind a `--features kuzu-graph` Cargo flag** when a real customer hits a billion-edge / depth-5+ workload that the projection cannot serve under latency budget.
+- **PostgreSQL + PostGIS** — requires a separate process, breaks the single-binary deploy model.
+- **SurrealDB** — too early; ecosystem and edge-deploy story not yet there.
+- **Apache Flink / distributed engines** — incompatible with the Pi-class edge target.
+
+**Outstanding work tracked against this ADR:**
+- Cache `GraphEngine` + adjacency snapshot in `AppState` (currently re-instantiated per call; see `crates/orp-storage/src/duckdb_engine.rs:1130`).
+- Replace the global `Mutex<Connection>` with a connection pool so reads do not serialise behind writes (`duckdb_engine.rs:179`).
+- Add the `kuzu-graph` Cargo feature behind a clean `GraphBackend` trait, so adopters who *do* hit billion-edge graphs can opt in without forking.
 
 ### ADR-002: Single Binary, No Microservices
 
-**Context:** Target users are researchers, disaster response agencies, and developers who want _one command_ to get started.
+**Context:** Target users are researchers, disaster response agencies, vessel/UAS operators, and developers who want _one command_ to get started.
 
 **Decision:** Single static binary. All components are crates linked at compile time. No Docker required for basic usage.
 
-**Consequence:** Binary is ~300 MB (large for a binary, tiny for what it does). Cross-compilation is required for all targets.
+**Consequence:** Binary is ~43 MB stripped (with `lto = "thin"`, `strip = true`, `panic = "abort"` in `[profile.release]`). Cross-compilation is required for ARM/edge targets; `scripts/cross-compile.sh` and the GitHub Actions release workflow handle the matrix.
 
 ### ADR-003: Async Runtime — Tokio, Not Flink
 
@@ -746,9 +771,9 @@ rocksdb        = { version = "0.21", features = ["multi-threaded-cf"] }
 
 ### ADR-004: ORP-QL Instead of SQL or Pure Cypher
 
-**Context:** Users query both analytical data (DuckDB) and graph data (Kuzu). Neither pure SQL nor pure Cypher covers both.
+**Context:** Users query both analytical data (DuckDB tables) and graph data (the in-memory adjacency projection). Neither pure SQL nor pure Cypher covers both.
 
-**Decision:** ORP-QL: SQL-style filtering + Cypher-style MATCH patterns, compiled to either DuckDB SQL or Kuzu Cypher by the query planner.
+**Decision:** ORP-QL: SQL-style filtering + Cypher-style MATCH patterns, compiled to either DuckDB SQL (analytics) or executed against the graph projection's BFS engine (traversal) by the query planner.
 
 **Consequence:** New language to learn. Mitigated by: (a) natural language queries in Phase 2, (b) familiar syntax for anyone who knows SQL or Cypher.
 

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [master, main, develop]
   pull_request:
-    branches: [main, develop]
+    branches: [master, main, develop]
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,11 +41,15 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       # Install protoc so prost-build can compile .proto files
-      - name: Install protoc (Ubuntu)
+      # libcurl4-openssl-dev is required because clippy --all-features pulls
+      # the optional `kafka` adapter, which compiles rdkafka-sys → librdkafka
+      # 2.12.1, whose rdkafka_conf.c always #includes <curl/curl.h> even when
+      # configured with WITH_CURL=0.
+      - name: Install protoc + libcurl-dev (Ubuntu)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
@@ -135,20 +139,20 @@ jobs:
             echo "::warning::Binary size ${SIZE_MB}MB exceeds target of ${WARN_MB}MB"
           fi
 
-      - name: Annotate binary size
-        uses: actions/github-script@v7
-        if: github.event_name == 'pull_request'
-        with:
-          script: |
-            const sizeMb = '${{ steps.size.outputs.size_mb }}';
-            const os = '${{ matrix.os }}';
-            const target = '${{ matrix.target }}';
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `📦 **Binary size** (${target}): **${sizeMb} MB**`
-            });
+      - name: Annotate binary size in step summary
+        # Writes to $GITHUB_STEP_SUMMARY rather than posting a PR comment.
+        # The previous `github-script` createComment call hit 403 on
+        # cross-fork PRs (the GITHUB_TOKEN from the fork can't write to the
+        # upstream issue). Step summary works for every event including
+        # forks, requires no special permissions, and shows up in the
+        # workflow run UI.
+        shell: bash
+        run: |
+          {
+            echo "### 📦 Binary size — \`${{ matrix.target }}\`"
+            echo ""
+            echo "**${{ steps.size.outputs.size_mb }} MB** (${{ steps.size.outputs.size_bytes }} bytes)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Security audit ───────────────────────────────────────────────────────────
   security-audit:

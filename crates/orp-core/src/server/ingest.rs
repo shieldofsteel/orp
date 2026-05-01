@@ -169,10 +169,7 @@ pub fn generate_entity_id(entity_type: &str, props: &HashMap<String, serde_json:
     }
 
     // Fallback: deterministic UUID from all key-value pairs sorted
-    let mut parts: Vec<String> = props
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect();
+    let mut parts: Vec<String> = props.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
     parts.sort();
     let combined = parts.join(";");
 
@@ -194,10 +191,7 @@ pub fn generate_entity_id(entity_type: &str, props: &HashMap<String, serde_json:
 /// assert_eq!(flat["engine.rpm"], serde_json::json!(3000));
 /// assert_eq!(flat["name"], serde_json::json!("foo"));
 /// ```
-pub fn flatten_json(
-    value: &serde_json::Value,
-    prefix: &str,
-) -> HashMap<String, serde_json::Value> {
+pub fn flatten_json(value: &serde_json::Value, prefix: &str) -> HashMap<String, serde_json::Value> {
     let mut result = HashMap::new();
     flatten_recursive(value, prefix, &mut result);
     result
@@ -367,7 +361,11 @@ async fn process_payload(
     if let Err(e) = state
         .storage
         .log_audit(
-            if existed { "entity_updated_via_ingest" } else { "entity_created_via_ingest" },
+            if existed {
+                "entity_updated_via_ingest"
+            } else {
+                "entity_created_via_ingest"
+            },
             Some(entity_type),
             Some(&entity_id),
             Some(subject),
@@ -388,9 +386,9 @@ async fn process_payload(
             entity_id: entity_id.clone(),
             entity_type: entity_type.to_string(),
             changes: serde_json::to_value(&props).unwrap_or_default(),
-            geometry: geometry.as_ref().map(|g| {
-                serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})
-            }),
+            geometry: geometry
+                .as_ref()
+                .map(|g| serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})),
             timestamp: chrono::Utc::now().to_rfc3339(),
         });
     } else {
@@ -399,9 +397,9 @@ async fn process_payload(
             entity_type: entity_type.to_string(),
             entity_name: name.clone(),
             properties: serde_json::to_value(&props).unwrap_or_default(),
-            geometry: geometry.as_ref().map(|g| {
-                serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})
-            }),
+            geometry: geometry
+                .as_ref()
+                .map(|g| serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})),
             timestamp: chrono::Utc::now().to_rfc3339(),
         });
     }
@@ -411,9 +409,8 @@ async fn process_payload(
         entity_type: entity_type.to_string(),
         name,
         properties: props,
-        geometry: geometry.map(|g| {
-            serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})
-        }),
+        geometry: geometry
+            .map(|g| serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})),
         confidence,
         created: !existed,
     })
@@ -614,7 +611,9 @@ mod tests {
     #[test]
     fn test_detect_threat_by_vulnerability() {
         assert_eq!(
-            detect_entity_type(&props(serde_json::json!({"vulnerability": "RCE in OpenSSL"}))),
+            detect_entity_type(&props(
+                serde_json::json!({"vulnerability": "RCE in OpenSSL"})
+            )),
             "threat"
         );
     }
@@ -739,7 +738,10 @@ mod tests {
     #[test]
     fn test_generate_id_vehicle_vin() {
         let p = props(serde_json::json!({"vin": "1HGCM82633A004352"}));
-        assert_eq!(generate_entity_id("vehicle", &p), "vehicle-1HGCM82633A004352");
+        assert_eq!(
+            generate_entity_id("vehicle", &p),
+            "vehicle-1HGCM82633A004352"
+        );
     }
 
     #[test]

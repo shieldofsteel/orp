@@ -49,10 +49,8 @@ pub enum ConnectorError {
 #[async_trait]
 pub trait Connector: Send + Sync {
     fn connector_id(&self) -> &str;
-    async fn start(
-        &self,
-        tx: tokio::sync::mpsc::Sender<SourceEvent>,
-    ) -> Result<(), ConnectorError>;
+    async fn start(&self, tx: tokio::sync::mpsc::Sender<SourceEvent>)
+        -> Result<(), ConnectorError>;
     async fn stop(&self) -> Result<(), ConnectorError>;
     async fn health_check(&self) -> Result<(), ConnectorError>;
     fn config(&self) -> &ConnectorConfig;

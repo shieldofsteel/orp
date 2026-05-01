@@ -23,7 +23,13 @@ impl CsvWatcherConnector {
         }
     }
 
-    /// Parse a CSV file with headers, returning SourceEvents
+    /// Parse a CSV file with headers, returning SourceEvents.
+    ///
+    /// Quoted fields containing commas (e.g. `"Doe, John",51.5,-0.1`)
+    /// parse correctly via the `csv` crate. The optional `parse_errors`
+    /// counter is bumped once per malformed record (invalid UTF-8,
+    /// header decode failure, ...) and each failure is logged via
+    /// `tracing::warn!`. Callers surface this via `errors_count`.
     pub fn parse_csv_with_headers(
         content: &str,
         entity_type: &str,
@@ -31,67 +37,109 @@ impl CsvWatcherConnector {
         id_column: &str,
         lat_column: &str,
         lon_column: &str,
+        parse_errors: Option<&AtomicU64>,
     ) -> Vec<SourceEvent> {
-        let mut lines = content.lines();
-        let headers: Vec<&str> = match lines.next() {
-            Some(header_line) => header_line.split(',').map(|h| h.trim()).collect(),
-            None => return vec![],
+        Self::parse_csv_bytes_with_headers(
+            content.as_bytes(),
+            entity_type,
+            connector_id,
+            id_column,
+            lat_column,
+            lon_column,
+            parse_errors,
+        )
+    }
+
+    /// Byte-oriented variant — the only path that can hit invalid-UTF-8
+    /// errors from the `csv` crate.
+    pub fn parse_csv_bytes_with_headers(
+        bytes: &[u8],
+        entity_type: &str,
+        connector_id: &str,
+        id_column: &str,
+        lat_column: &str,
+        lon_column: &str,
+        parse_errors: Option<&AtomicU64>,
+    ) -> Vec<SourceEvent> {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .trim(csv::Trim::All)
+            .flexible(true) // tolerate ragged rows; we'll filter in-loop.
+            .from_reader(bytes);
+
+        let headers: Vec<String> = match reader.headers() {
+            Ok(h) => h.iter().map(|s| s.to_string()).collect(),
+            Err(e) => {
+                tracing::warn!(connector_id = %connector_id, error = %e,
+                    "CSV header parse failed; skipping file");
+                if let Some(c) = parse_errors {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+                return vec![];
+            }
         };
 
-        let id_idx = headers.iter().position(|h| *h == id_column);
-        let lat_idx = headers.iter().position(|h| *h == lat_column);
-        let lon_idx = headers.iter().position(|h| *h == lon_column);
+        let id_idx = headers.iter().position(|h| h == id_column);
+        let lat_idx = headers.iter().position(|h| h == lat_column);
+        let lon_idx = headers.iter().position(|h| h == lon_column);
 
-        lines
-            .filter_map(|line| {
-                let fields: Vec<&str> = line.split(',').map(|f| f.trim()).collect();
-                if fields.len() < headers.len() {
-                    return None;
+        let mut events: Vec<SourceEvent> = Vec::new();
+        for result in reader.records() {
+            let record = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    let line = e.position().map(|p| p.line()).unwrap_or(0);
+                    tracing::warn!(connector_id = %connector_id, line, error = %e,
+                        "CSV row parse failed; dropping row");
+                    if let Some(c) = parse_errors {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
                 }
+            };
 
-                let entity_id = id_idx
-                    .and_then(|i| fields.get(i))
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                if entity_id.is_empty() {
-                    return None;
-                }
+            let entity_id = id_idx
+                .and_then(|i| record.get(i))
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            if entity_id.is_empty() {
+                continue;
+            }
 
-                let latitude = lat_idx
-                    .and_then(|i| fields.get(i))
-                    .and_then(|s| s.parse::<f64>().ok());
-                let longitude = lon_idx
-                    .and_then(|i| fields.get(i))
-                    .and_then(|s| s.parse::<f64>().ok());
+            let latitude = lat_idx
+                .and_then(|i| record.get(i))
+                .and_then(|s| s.parse::<f64>().ok());
+            let longitude = lon_idx
+                .and_then(|i| record.get(i))
+                .and_then(|s| s.parse::<f64>().ok());
 
-                let mut properties = HashMap::new();
-                for (i, header) in headers.iter().enumerate() {
-                    if Some(i) != id_idx && Some(i) != lat_idx && Some(i) != lon_idx {
-                        if let Some(value) = fields.get(i) {
-                            // Try to parse as number, else string
-                            if let Ok(n) = value.parse::<f64>() {
-                                properties.insert(header.to_string(), serde_json::json!(n));
-                            } else if let Ok(b) = value.parse::<bool>() {
-                                properties.insert(header.to_string(), serde_json::json!(b));
-                            } else {
-                                properties
-                                    .insert(header.to_string(), serde_json::json!(value));
-                            }
+            let mut properties = HashMap::new();
+            for (i, header) in headers.iter().enumerate() {
+                if Some(i) != id_idx && Some(i) != lat_idx && Some(i) != lon_idx {
+                    if let Some(value) = record.get(i) {
+                        // Try number → bool → fall back to string.
+                        if let Ok(n) = value.parse::<f64>() {
+                            properties.insert(header.clone(), serde_json::json!(n));
+                        } else if let Ok(b) = value.parse::<bool>() {
+                            properties.insert(header.clone(), serde_json::json!(b));
+                        } else {
+                            properties.insert(header.clone(), serde_json::json!(value));
                         }
                     }
                 }
+            }
 
-                Some(SourceEvent {
-                    connector_id: connector_id.to_string(),
-                    entity_id: format!("{}:{}", entity_type, entity_id),
-                    entity_type: entity_type.to_string(),
-                    properties,
-                    timestamp: Utc::now(),
-                    latitude,
-                    longitude,
-                })
-            })
-            .collect()
+            events.push(SourceEvent {
+                connector_id: connector_id.to_string(),
+                entity_id: format!("{}:{}", entity_type, entity_id),
+                entity_type: entity_type.to_string(),
+                properties,
+                timestamp: Utc::now(),
+                latitude,
+                longitude,
+            });
+        }
+        events
     }
 }
 
@@ -177,6 +225,7 @@ impl Connector for CsvWatcherConnector {
                                 &id_column,
                                 &lat_column,
                                 &lon_column,
+                                Some(errors_count.as_ref()),
                             );
                             for event in events {
                                 if tx.send(event).await.is_err() {
@@ -242,7 +291,13 @@ mod tests {
                     ship-2,52.00,4.50,Other Ship,8.0";
 
         let events = CsvWatcherConnector::parse_csv_with_headers(
-            csv, "ship", "csv-1", "id", "latitude", "longitude",
+            csv,
+            "ship",
+            "csv-1",
+            "id",
+            "latitude",
+            "longitude",
+            None,
         );
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].entity_id, "ship:ship-1");
@@ -261,7 +316,7 @@ mod tests {
     fn test_parse_csv_empty() {
         let csv = "id,lat,lon\n";
         let events = CsvWatcherConnector::parse_csv_with_headers(
-            csv, "ship", "csv-1", "id", "lat", "lon",
+            csv, "ship", "csv-1", "id", "lat", "lon", None,
         );
         assert!(events.is_empty());
     }
@@ -270,9 +325,46 @@ mod tests {
     fn test_parse_csv_missing_columns() {
         let csv = "name,value\ntest,42";
         let events = CsvWatcherConnector::parse_csv_with_headers(
-            csv, "sensor", "csv-1", "name", "lat", "lon",
+            csv, "sensor", "csv-1", "name", "lat", "lon", None,
         );
         assert_eq!(events.len(), 1);
         assert!(events[0].latitude.is_none());
+    }
+
+    /// Regression: malformed rows must be logged + counted via the
+    /// `parse_errors` parameter, never silently dropped. We trip a real
+    /// `csv::Error` with non-UTF-8 bytes in a field (`flexible(true)`
+    /// already absorbs ragged rows, so UTF-8 is the realistic trigger).
+    #[test]
+    fn test_parse_csv_with_headers_logs_malformed_rows() {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"id,latitude,longitude,name\n");
+        bytes.extend_from_slice(b"ship-1,51.92,4.48,Good Ship\n");
+        bytes.extend_from_slice(b"ship-2,52.00,4.50,");
+        bytes.extend_from_slice(&[0xFF, 0xFE]);
+        bytes.extend_from_slice(b"\nship-3,53.10,4.60,Another Good Ship\n");
+
+        let counter = AtomicU64::new(0);
+        let events = CsvWatcherConnector::parse_csv_bytes_with_headers(
+            &bytes,
+            "ship",
+            "csv-malformed",
+            "id",
+            "latitude",
+            "longitude",
+            Some(&counter),
+        );
+        let ids: Vec<&str> = events.iter().map(|e| e.entity_id.as_str()).collect();
+        assert!(
+            ids.contains(&"ship:ship-1"),
+            "good row before the malformed one was dropped: {:?}",
+            ids
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "expected exactly one parse error (events={:?})",
+            ids
+        );
     }
 }

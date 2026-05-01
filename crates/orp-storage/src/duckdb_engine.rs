@@ -178,6 +178,10 @@ CREATE INDEX IF NOT EXISTS idx_monitor_rules_enabled     ON monitor_rules(enable
 pub struct DuckDbStorage {
     conn: Arc<Mutex<Connection>>,
     spatial_enabled: bool,
+    /// Lazily-initialised graph engine. Constructing one runs DROP/CREATE
+    /// VIEW for every graph view, so we keep it around for the life of the
+    /// storage handle instead of building it per query.
+    graph: std::sync::OnceLock<Arc<crate::graph_engine::GraphEngine>>,
 }
 
 impl DuckDbStorage {
@@ -188,9 +192,25 @@ impl DuckDbStorage {
         let mut s = Self {
             conn: Arc::new(Mutex::new(conn)),
             spatial_enabled: false,
+            graph: std::sync::OnceLock::new(),
         };
         s.initialize()?;
         Ok(s)
+    }
+
+    /// Return a shared graph engine, initialising it on first access.
+    /// Subsequent callers reuse the same `Arc<GraphEngine>` rather than
+    /// re-running graph schema setup per call.
+    fn graph_engine(&self) -> StorageResult<Arc<crate::graph_engine::GraphEngine>> {
+        if let Some(g) = self.graph.get() {
+            return Ok(Arc::clone(g));
+        }
+        let engine = Arc::new(crate::graph_engine::GraphEngine::new(Arc::clone(
+            &self.conn,
+        ))?);
+        // Race-tolerant: if two callers initialise concurrently the loser
+        // simply discards its copy and returns the winner's.
+        Ok(Arc::clone(self.graph.get_or_init(|| engine)))
     }
 
     /// Open a file-based DuckDB instance.
@@ -203,6 +223,7 @@ impl DuckDbStorage {
         let mut s = Self {
             conn: Arc::new(Mutex::new(conn)),
             spatial_enabled: false,
+            graph: std::sync::OnceLock::new(),
         };
         s.initialize()?;
         Ok(s)
@@ -236,9 +257,7 @@ impl DuckDbStorage {
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| {
                 chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                    .or_else(|_| {
-                        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                    })
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
                     .map(|n| n.and_utc())
                     .unwrap_or_else(|_| chrono::Utc::now())
             })
@@ -256,7 +275,11 @@ impl DuckDbStorage {
         let properties: HashMap<String, JsonValue> =
             serde_json::from_str(&props_str).unwrap_or_default();
         let geometry = match (lat, lon) {
-            (Some(la), Some(lo)) => Some(GeoPoint { lat: la, lon: lo, alt }),
+            (Some(la), Some(lo)) => Some(GeoPoint {
+                lat: la,
+                lon: lo,
+                alt,
+            }),
             _ => None,
         };
         let last_updated = Self::parse_ts(&updated_ts_str);
@@ -349,9 +372,7 @@ impl DuckDbStorage {
     }
 
     /// Collect relationship rows into a Vec.
-    fn collect_relationships(
-        mut rows: duckdb::Rows<'_>,
-    ) -> StorageResult<Vec<Relationship>> {
+    fn collect_relationships(mut rows: duckdb::Rows<'_>) -> StorageResult<Vec<Relationship>> {
         let mut rels = Vec::new();
         while let Some(row) = rows
             .next()
@@ -523,8 +544,7 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?
         {
             entities.push(
-                Self::row_to_entity(row)
-                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                Self::row_to_entity(row).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
             );
         }
         Ok(entities)
@@ -670,7 +690,8 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut rows = if has_type {
-            let et = entity_type.ok_or_else(|| StorageError::QueryError("entity_type is required".into()))?;
+            let et = entity_type
+                .ok_or_else(|| StorageError::QueryError("entity_type is required".into()))?;
             stmt.query(params![et, lat_min, lat_max, lon_min, lon_max])
         } else {
             stmt.query(params![lat_min, lat_max, lon_min, lon_max])
@@ -682,8 +703,8 @@ impl Storage for DuckDbStorage {
             .next()
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?
         {
-            let e = Self::row_to_entity(row)
-                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            let e =
+                Self::row_to_entity(row).map_err(|e| StorageError::DatabaseError(e.to_string()))?;
             // Apply precise Haversine filter
             if let Some(g) = &e.geometry {
                 if Self::haversine(lat, lon, g.lat, g.lon) <= radius_km {
@@ -782,12 +803,14 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut rows = if self.spatial_enabled && use_type {
-            let et = entity_type.ok_or_else(|| StorageError::QueryError("entity_type is required".into()))?;
+            let et = entity_type
+                .ok_or_else(|| StorageError::QueryError("entity_type is required".into()))?;
             stmt.query(params![et, polygon_wkt])
         } else if self.spatial_enabled {
             stmt.query(params![polygon_wkt])
         } else if use_type {
-            let et = entity_type.ok_or_else(|| StorageError::QueryError("entity_type is required".into()))?;
+            let et = entity_type
+                .ok_or_else(|| StorageError::QueryError("entity_type is required".into()))?;
             stmt.query(params![et])
         } else {
             stmt.query([])
@@ -800,8 +823,7 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?
         {
             entities.push(
-                Self::row_to_entity(row)
-                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                Self::row_to_entity(row).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
             );
         }
         Ok(entities)
@@ -870,8 +892,7 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?
         {
             events.push(
-                Self::row_to_event(row)
-                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                Self::row_to_event(row).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
             );
         }
         Ok(events)
@@ -904,8 +925,7 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?
         {
             events.push(
-                Self::row_to_event(row)
-                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                Self::row_to_event(row).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
             );
         }
         Ok(events)
@@ -971,8 +991,7 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?
         {
             events.push(
-                Self::row_to_event(row)
-                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                Self::row_to_event(row).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
             );
         }
         Ok(events)
@@ -1120,14 +1139,12 @@ impl Storage for DuckDbStorage {
 
     // ── Graph / path queries ──────────────────────────────────────────────────
 
-    async fn graph_query(
-        &self,
-        query_str: &str,
-    ) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
-        // Delegate to GraphEngine which maintains dedicated graph tables and
-        // supports Cypher-like syntax, raw SQL, and multi-hop traversal against
-        // graph_nodes / graph_edges views.
-        let graph = crate::graph_engine::GraphEngine::new(Arc::clone(&self.conn))?;
+    async fn graph_query(&self, query_str: &str) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
+        // Delegate to a cached GraphEngine. Constructing one re-runs ~19
+        // DROP/CREATE VIEW statements (init_schema is idempotent but not
+        // free); caching here means we pay that cost once per storage
+        // handle instead of once per query.
+        let graph = self.graph_engine()?;
         graph.cypher_query(query_str)
     }
     /// BFS path search up to `max_hops` using a recursive CTE over the relationships table.
@@ -1356,13 +1373,22 @@ impl Storage for DuckDbStorage {
             .query(params![source_id])
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
-        if let Some(row) = rows.next().map_err(|e| StorageError::DatabaseError(e.to_string()))? {
+        if let Some(row) = rows
+            .next()
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?
+        {
             let hb_str: Option<String> = row.get(8).ok().flatten();
             let last_heartbeat = hb_str.map(|s| Self::parse_ts(&s));
             Ok(Some(DataSource {
-                source_id: row.get(0).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
-                source_name: row.get(1).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
-                source_type: row.get(2).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                source_id: row
+                    .get(0)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                source_name: row
+                    .get(1)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                source_type: row
+                    .get(2)
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
                 trust_score: row.get::<_, f32>(3).unwrap_or(0.8),
                 events_ingested: row.get::<_, i64>(4).unwrap_or(0) as u64,
                 entities_provided: row.get::<_, i64>(5).unwrap_or(0) as u64,
@@ -1378,27 +1404,31 @@ impl Storage for DuckDbStorage {
 
     async fn update_data_source(&self, source: &DataSource) -> StorageResult<bool> {
         let conn = self.conn.lock().unwrap();
-        let rows = conn.execute(
-            "UPDATE data_sources SET
+        let rows = conn
+            .execute(
+                "UPDATE data_sources SET
                source_name = ?, source_type = ?, trust_score = ?, enabled = ?
              WHERE source_id = ?",
-            params![
-                source.source_name,
-                source.source_type,
-                source.trust_score,
-                source.enabled,
-                source.source_id,
-            ],
-        ).map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+                params![
+                    source.source_name,
+                    source.source_type,
+                    source.trust_score,
+                    source.enabled,
+                    source.source_id,
+                ],
+            )
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
         Ok(rows > 0)
     }
 
     async fn delete_data_source(&self, source_id: &str) -> StorageResult<bool> {
         let conn = self.conn.lock().unwrap();
-        let rows = conn.execute(
-            "DELETE FROM data_sources WHERE source_id = ?",
-            params![source_id],
-        ).map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "DELETE FROM data_sources WHERE source_id = ?",
+                params![source_id],
+            )
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
         Ok(rows > 0)
     }
 
@@ -1470,8 +1500,7 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?
         {
             events.push(
-                Self::row_to_event(row)
-                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                Self::row_to_event(row).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
             );
         }
         Ok(events)
@@ -1605,7 +1634,8 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let mut rows = if use_type {
-            let et = entity_type.ok_or_else(|| StorageError::QueryError("entity_type is required".into()))?;
+            let et = entity_type
+                .ok_or_else(|| StorageError::QueryError("entity_type is required".into()))?;
             stmt.query(params![et, pattern, pattern, limit as i64])
         } else {
             stmt.query(params![pattern, pattern, limit as i64])
@@ -1618,8 +1648,7 @@ impl Storage for DuckDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?
         {
             entities.push(
-                Self::row_to_entity(row)
-                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+                Self::row_to_entity(row).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
             );
         }
         Ok(entities)
@@ -1681,7 +1710,11 @@ mod tests {
         Entity {
             entity_id: id.to_string(),
             entity_type: etype.to_string(),
-            geometry: Some(GeoPoint { lat, lon, alt: None }),
+            geometry: Some(GeoPoint {
+                lat,
+                lon,
+                alt: None,
+            }),
             ..Entity::default()
         }
     }
@@ -1820,8 +1853,7 @@ mod tests {
         s.insert_entity(&make_entity("e1", "ship")).await.unwrap();
         for i in 0..5 {
             let mut ev = make_event(&format!("ev{}", i), "e1");
-            ev.event_timestamp =
-                chrono::Utc::now() - chrono::Duration::seconds(i as i64 * 10);
+            ev.event_timestamp = chrono::Utc::now() - chrono::Duration::seconds(i as i64 * 10);
             s.insert_event(&ev).await.unwrap();
         }
         let events = s.get_events_for_entity("e1", 10).await.unwrap();
@@ -1874,8 +1906,12 @@ mod tests {
     #[tokio::test]
     async fn test_12_insert_and_get_relationships() {
         let s = DuckDbStorage::new_in_memory().unwrap();
-        s.insert_entity(&make_entity("ship1", "ship")).await.unwrap();
-        s.insert_entity(&make_entity("port1", "port")).await.unwrap();
+        s.insert_entity(&make_entity("ship1", "ship"))
+            .await
+            .unwrap();
+        s.insert_entity(&make_entity("port1", "port"))
+            .await
+            .unwrap();
         s.insert_relationship(&make_relationship("r1", "ship1", "port1"))
             .await
             .unwrap();
@@ -1892,25 +1928,25 @@ mod tests {
         s.insert_relationship(&make_relationship("r1", "a", "b"))
             .await
             .unwrap();
-        let out = s
-            .get_outgoing_relationships("a", None)
-            .await
-            .unwrap();
+        let out = s.get_outgoing_relationships("a", None).await.unwrap();
         assert_eq!(out.len(), 1);
-        let inc = s
-            .get_incoming_relationships("b", None)
-            .await
-            .unwrap();
+        let inc = s.get_incoming_relationships("b", None).await.unwrap();
         assert_eq!(inc.len(), 1);
         // Wrong direction
-        assert!(s.get_outgoing_relationships("b", None).await.unwrap().is_empty());
+        assert!(s
+            .get_outgoing_relationships("b", None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
     async fn test_14_path_query() {
         let s = DuckDbStorage::new_in_memory().unwrap();
         s.insert_entity(&make_entity("a", "ship")).await.unwrap();
-        s.insert_entity(&make_entity("b", "waypoint")).await.unwrap();
+        s.insert_entity(&make_entity("b", "waypoint"))
+            .await
+            .unwrap();
         s.insert_entity(&make_entity("c", "port")).await.unwrap();
         s.insert_relationship(&make_relationship("r1", "a", "b"))
             .await
@@ -1951,7 +1987,9 @@ mod tests {
     async fn test_16_register_and_get_data_sources() {
         let s = DuckDbStorage::new_in_memory().unwrap();
         s.register_data_source(&make_source("ais-1")).await.unwrap();
-        s.register_data_source(&make_source("adsb-1")).await.unwrap();
+        s.register_data_source(&make_source("adsb-1"))
+            .await
+            .unwrap();
         let sources = s.get_data_sources().await.unwrap();
         assert_eq!(sources.len(), 2);
     }
@@ -2064,7 +2102,9 @@ mod tests {
         let path = dir.join("test.duckdb");
         {
             let s = DuckDbStorage::new_with_path(path.to_str().unwrap()).unwrap();
-            s.insert_entity(&make_entity("persist-1", "ship")).await.unwrap();
+            s.insert_entity(&make_entity("persist-1", "ship"))
+                .await
+                .unwrap();
         }
         // Re-open
         let s2 = DuckDbStorage::new_with_path(path.to_str().unwrap()).unwrap();
@@ -2102,7 +2142,9 @@ mod tests {
     async fn test_26_count_entities() {
         let s = DuckDbStorage::new_in_memory().unwrap();
         for i in 0..5 {
-            s.insert_entity(&make_entity(&format!("cnt-{}", i), "ship")).await.unwrap();
+            s.insert_entity(&make_entity(&format!("cnt-{}", i), "ship"))
+                .await
+                .unwrap();
         }
         let count = s.count_entities().await.unwrap();
         assert_eq!(count, 5);
@@ -2125,8 +2167,12 @@ mod tests {
     #[tokio::test]
     async fn test_28_update_entity_property() {
         let s = DuckDbStorage::new_in_memory().unwrap();
-        s.insert_entity(&make_entity("prop-1", "ship")).await.unwrap();
-        s.update_entity_property("prop-1", "speed", serde_json::json!(25.5)).await.unwrap();
+        s.insert_entity(&make_entity("prop-1", "ship"))
+            .await
+            .unwrap();
+        s.update_entity_property("prop-1", "speed", serde_json::json!(25.5))
+            .await
+            .unwrap();
 
         let entity = s.get_entity("prop-1").await.unwrap().unwrap();
         assert!(entity.properties.contains_key("speed"));
@@ -2147,7 +2193,9 @@ mod tests {
     async fn test_30_search_empty_query_returns_all() {
         let s = DuckDbStorage::new_in_memory().unwrap();
         for i in 0..3 {
-            s.insert_entity(&make_entity(&format!("all-{}", i), "ship")).await.unwrap();
+            s.insert_entity(&make_entity(&format!("all-{}", i), "ship"))
+                .await
+                .unwrap();
         }
         let results = s.search_entities("", None, 100).await.unwrap();
         assert!(results.len() >= 3);
@@ -2159,7 +2207,10 @@ mod tests {
         let e = make_entity_with_geo("far", "ship", 10.0, 10.0);
         s.insert_entity(&e).await.unwrap();
 
-        let near = s.get_entities_in_radius(51.0, 4.0, 5.0, None).await.unwrap();
+        let near = s
+            .get_entities_in_radius(51.0, 4.0, 5.0, None)
+            .await
+            .unwrap();
         assert!(near.is_empty());
     }
 
@@ -2192,31 +2243,43 @@ mod tests {
     #[tokio::test]
     async fn test_34_events_global_with_filters() {
         let s = DuckDbStorage::new_in_memory().unwrap();
-        s.insert_entity(&make_entity("glob-e1", "ship")).await.unwrap();
+        s.insert_entity(&make_entity("glob-e1", "ship"))
+            .await
+            .unwrap();
         let ev = make_event("glob-ev1", "glob-e1");
         s.insert_event(&ev).await.unwrap();
 
-        let events = s.get_events_global(Some("glob-e1"), None, None, None, None, 10, 0).await.unwrap();
+        let events = s
+            .get_events_global(Some("glob-e1"), None, None, None, None, 10, 0)
+            .await
+            .unwrap();
         assert!(!events.is_empty());
     }
 
     #[tokio::test]
     async fn test_35_count_events_global() {
         let s = DuckDbStorage::new_in_memory().unwrap();
-        s.insert_entity(&make_entity("cnt-ev", "ship")).await.unwrap();
+        s.insert_entity(&make_entity("cnt-ev", "ship"))
+            .await
+            .unwrap();
         for i in 0..3 {
             let mut ev = make_event(&format!("cnt-ev-{}", i), "cnt-ev");
             ev.event_type = "position_update".to_string();
             s.insert_event(&ev).await.unwrap();
         }
-        let count = s.count_events_global(Some("cnt-ev"), None, None, None, None).await.unwrap();
+        let count = s
+            .count_events_global(Some("cnt-ev"), None, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(count, 3);
     }
 
     #[tokio::test]
     async fn test_36_entity_delete_soft_removes() {
         let s = DuckDbStorage::new_in_memory().unwrap();
-        s.insert_entity(&make_entity("soft-del", "ship")).await.unwrap();
+        s.insert_entity(&make_entity("soft-del", "ship"))
+            .await
+            .unwrap();
         s.delete_entity("soft-del").await.unwrap();
         // After soft delete, entity still exists but is_active = false
         // get_entity returns it regardless of is_active
@@ -2225,5 +2288,107 @@ mod tests {
         // but get_entities_by_type should not return it
         let active = s.get_entities_by_type("ship", 100, 0).await.unwrap();
         assert!(active.iter().all(|e| e.entity_id != "soft-del"));
+    }
+
+    // ── new_with_path persistence tests ──────────────────────────────────────
+    //
+    // These exercise the file-backed constructor that the rest of the suite
+    // (which uses `new_in_memory`) leaves untouched.
+
+    #[tokio::test]
+    async fn test_new_with_path_creates_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("orp.duckdb");
+        let path_str = db_path.to_str().unwrap();
+
+        let original_created_at = {
+            let s = DuckDbStorage::new_with_path(path_str).unwrap();
+            s.insert_entity(&make_entity("persist-1", "ship"))
+                .await
+                .unwrap();
+            let e = s.get_entity("persist-1").await.unwrap().unwrap();
+            e.created_at
+            // `s` drops here, releasing the DuckDB connection.
+        };
+        assert!(db_path.exists(), "DuckDB file was not created on disk");
+
+        // Reopen and confirm the row survived with the same created_at.
+        let s2 = DuckDbStorage::new_with_path(path_str).unwrap();
+        let e2 = s2.get_entity("persist-1").await.unwrap().unwrap();
+        assert_eq!(e2.entity_type, "ship");
+        let delta = (e2.created_at - original_created_at)
+            .num_milliseconds()
+            .abs();
+        assert!(
+            delta < 1000,
+            "created_at drifted across reopen: original={}, reopened={}",
+            original_created_at,
+            e2.created_at
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_with_path_creates_parent_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // Two missing levels — `create_dir_all` must create both.
+        let nested = temp.path().join("a").join("b");
+        let db_path = nested.join("orp.duckdb");
+        assert!(
+            !nested.exists(),
+            "preconditions: parent dir should not exist"
+        );
+
+        let _s = DuckDbStorage::new_with_path(db_path.to_str().unwrap()).unwrap();
+        assert!(
+            nested.is_dir(),
+            "constructor did not create missing parent directory: {:?}",
+            nested
+        );
+        assert!(db_path.exists(), "DuckDB file was not created");
+    }
+
+    #[tokio::test]
+    async fn test_new_with_path_rejects_directory_target() {
+        // Pass the temp dir itself as the target — it's a directory, not a file.
+        let temp = tempfile::TempDir::new().unwrap();
+        let path_str = temp.path().to_str().unwrap();
+        let result = DuckDbStorage::new_with_path(path_str);
+        assert!(result.is_err(), "expected Err when path is a directory");
+        match result {
+            Err(StorageError::DatabaseError(_)) | Err(StorageError::IoError(_)) => {}
+            Err(other) => panic!("unexpected error variant: {:?}", other),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn test_new_with_path_rejects_unwritable_target() {
+        // /etc exists on macOS/Linux but is not writable to non-root users.
+        // If we *are* root (e.g. CI containers), skip the assertion rather
+        // than fail spuriously.
+        if unsafe { libc_geteuid() } == 0 {
+            eprintln!("skipping unwritable-target test: running as root");
+            return;
+        }
+        let result = DuckDbStorage::new_with_path("/etc/orp_test_should_not_exist.duckdb");
+        assert!(
+            result.is_err(),
+            "expected Err when target is unwritable, got Ok"
+        );
+        match result {
+            Err(StorageError::DatabaseError(_)) | Err(StorageError::IoError(_)) => {}
+            Err(other) => panic!("unexpected error variant: {:?}", other),
+            Ok(_) => unreachable!(),
+        }
+    }
+
+    /// Tiny libc shim so we can detect root without pulling in the `libc` dep.
+    #[cfg(not(target_os = "windows"))]
+    unsafe fn libc_geteuid() -> u32 {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        geteuid()
     }
 }

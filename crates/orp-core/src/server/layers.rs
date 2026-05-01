@@ -258,7 +258,11 @@ impl LayerRegistry {
         Ok(layers)
     }
 
-    pub fn update(&self, layer_id: &str, req: UpdateLayerRequest) -> Result<Option<Layer>, LayerError> {
+    pub fn update(
+        &self,
+        layer_id: &str,
+        req: UpdateLayerRequest,
+    ) -> Result<Option<Layer>, LayerError> {
         let now = Utc::now();
         // Fetch existing first
         let existing = match self.get(layer_id)? {
@@ -330,7 +334,9 @@ impl LayerRegistry {
 
     fn row_to_layer(row: &duckdb::Row) -> duckdb::Result<Layer> {
         let layer_type_str: String = row.get(3)?;
-        let layer_type = layer_type_str.parse::<LayerType>().unwrap_or(LayerType::GeoJson);
+        let layer_type = layer_type_str
+            .parse::<LayerType>()
+            .unwrap_or(LayerType::GeoJson);
         let style_str: Option<String> = row.get(9)?;
         let style = style_str
             .as_deref()
@@ -342,7 +348,9 @@ impl LayerRegistry {
                 .map(|dt| dt.with_timezone(&Utc))
                 .or_else(|_| {
                     chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f"))
+                        .or_else(|_| {
+                            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
+                        })
                         .map(|n| n.and_utc())
                 })
                 .unwrap_or_else(|_| Utc::now())
@@ -621,7 +629,8 @@ const ICAO_AIRSPACE_GEOJSON: &str = r#"{
 type BuiltinLayerBuilder = fn() -> CreateLayerRequest;
 
 static BUILTIN_LAYERS: &[(&str, BuiltinLayerBuilder)] = &[
-    ("shipping_lanes", || CreateLayerRequest {
+    ("shipping_lanes", || {
+        CreateLayerRequest {
         name: "shipping_lanes".to_string(),
         description: Some(
             "Major global shipping lanes and strategic chokepoints (Malacca, Suez, Panama, Hormuz, Dover, Gibraltar)".to_string(),
@@ -637,8 +646,10 @@ static BUILTIN_LAYERS: &[(&str, BuiltinLayerBuilder)] = &[
             "line_width": 2,
             "line_dash": [6, 3]
         })),
+    }
     }),
-    ("icao_airspace", || CreateLayerRequest {
+    ("icao_airspace", || {
+        CreateLayerRequest {
         name: "icao_airspace".to_string(),
         description: Some(
             "ICAO FIR boundaries and airspace classifications — NAT, EUROCONTROL, Gulf, Singapore, New York Oceanic".to_string(),
@@ -655,6 +666,7 @@ static BUILTIN_LAYERS: &[(&str, BuiltinLayerBuilder)] = &[
             "line_color": "#8800ff",
             "line_width": 1
         })),
+    }
     }),
     ("exclusion_zones", || CreateLayerRequest {
         name: "exclusion_zones".to_string(),
@@ -674,7 +686,10 @@ static BUILTIN_LAYERS: &[(&str, BuiltinLayerBuilder)] = &[
     }),
     ("threat_zones", || CreateLayerRequest {
         name: "threat_zones".to_string(),
-        description: Some("Dynamic threat zones from assessed entities — auto-populated by threat engine".to_string()),
+        description: Some(
+            "Dynamic threat zones from assessed entities — auto-populated by threat engine"
+                .to_string(),
+        ),
         layer_type: LayerType::GeoJson,
         source_url: None,
         data: Some(r#"{"type":"FeatureCollection","features":[]}"#.to_string()),
@@ -690,7 +705,9 @@ static BUILTIN_LAYERS: &[(&str, BuiltinLayerBuilder)] = &[
     }),
     ("geofences", || CreateLayerRequest {
         name: "geofences".to_string(),
-        description: Some("Operational geofences — alert when entities cross these boundaries".to_string()),
+        description: Some(
+            "Operational geofences — alert when entities cross these boundaries".to_string(),
+        ),
         layer_type: LayerType::GeoJson,
         source_url: None,
         data: Some(r#"{"type":"FeatureCollection","features":[]}"#.to_string()),
@@ -735,7 +752,11 @@ pub async fn get_layer(
     State(state): State<LayerState>,
     Path(id): Path<String>,
 ) -> Result<Json<Layer>, (StatusCode, Json<serde_json::Value>)> {
-    match state.registry.get(&id).map_err(|e| layer_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))? {
+    match state
+        .registry
+        .get(&id)
+        .map_err(|e| layer_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    {
         Some(layer) => Ok(Json(layer)),
         None => Err(layer_error(StatusCode::NOT_FOUND, "Layer not found")),
     }
@@ -824,7 +845,10 @@ pub fn layers_router(registry: Arc<LayerRegistry>) -> axum::Router {
     axum::Router::new()
         .route("/layers", get(list_layers).post(create_layer))
         .route("/layers/seed", post(seed_layers))
-        .route("/layers/{id}", get(get_layer).put(update_layer).delete(delete_layer))
+        .route(
+            "/layers/{id}",
+            get(get_layer).put(update_layer).delete(delete_layer),
+        )
         .with_state(state)
 }
 
@@ -987,7 +1011,11 @@ mod tests {
 
     #[test]
     fn test_layer_type_roundtrip() {
-        for (s, expected) in [("geojson", LayerType::GeoJson), ("wkt", LayerType::Wkt), ("tiles", LayerType::Tiles)] {
+        for (s, expected) in [
+            ("geojson", LayerType::GeoJson),
+            ("wkt", LayerType::Wkt),
+            ("tiles", LayerType::Tiles),
+        ] {
             let parsed: LayerType = s.parse().unwrap();
             assert_eq!(parsed, expected);
             assert_eq!(parsed.to_string(), s);

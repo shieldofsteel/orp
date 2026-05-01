@@ -138,11 +138,51 @@ impl Connector for AisConnector {
 
             // Pre-defined demo ships near Rotterdam
             let demo_ships = vec![
-                ("211378120", 51.92, 4.48, 12.5, 245.0, "Maersk Seatrade", "container"),
-                ("244820583", 51.89, 4.32, 8.3, 180.0, "Rotterdam Express", "tanker"),
-                ("477280410", 51.95, 4.55, 15.0, 90.0, "Ever Given", "container"),
-                ("305160000", 51.88, 4.25, 5.0, 315.0, "Pacific Pioneer", "bulk"),
-                ("636092200", 51.94, 4.42, 10.0, 120.0, "Atlantic Breeze", "general"),
+                (
+                    "211378120",
+                    51.92,
+                    4.48,
+                    12.5,
+                    245.0,
+                    "Maersk Seatrade",
+                    "container",
+                ),
+                (
+                    "244820583",
+                    51.89,
+                    4.32,
+                    8.3,
+                    180.0,
+                    "Rotterdam Express",
+                    "tanker",
+                ),
+                (
+                    "477280410",
+                    51.95,
+                    4.55,
+                    15.0,
+                    90.0,
+                    "Ever Given",
+                    "container",
+                ),
+                (
+                    "305160000",
+                    51.88,
+                    4.25,
+                    5.0,
+                    315.0,
+                    "Pacific Pioneer",
+                    "bulk",
+                ),
+                (
+                    "636092200",
+                    51.94,
+                    4.42,
+                    10.0,
+                    120.0,
+                    "Atlantic Breeze",
+                    "general",
+                ),
             ];
 
             while running.load(Ordering::SeqCst) {

@@ -7,13 +7,16 @@ pub mod sanctions;
 pub mod threat;
 
 pub use analytics::{
-    AnomalyFactors, AnomalyScore, AnalyticsEngine, BoundingBox, CpaResult, DarkTargetAlert,
+    calculate_cpa, detect_dark_targets, detect_dwell, detect_manoeuvres, score_anomaly,
+    AnalyticsEngine, AnomalyFactors, AnomalyScore, BoundingBox, CpaResult, DarkTargetAlert,
     DwellAlert, EntityAnalytics, EntityTrack, ManoeuvreAlert, ManoeuvreType, PatternOfLife,
-    TrackPoint, Zone, ZoneEvent, ZoneEventType, ZoneTracker, calculate_cpa, detect_dark_targets,
-    detect_dwell, detect_manoeuvres, score_anomaly,
+    TrackPoint, Zone, ZoneEvent, ZoneEventType, ZoneTracker,
 };
 pub use dedup::{DedupError, DedupResult, RocksDbDedupWindow};
-pub use dlq::{DeadLetterQueue, DlqEntry, DlqError, DlqResult};
+pub use dlq::{
+    outbox_retention_secs, DeadLetterQueue, DlqEntry, DlqError, DlqResult, FederationOutbox,
+    OutboxEntry, DEFAULT_OUTBOX_RETENTION_SECS,
+};
 pub use monitor::{
     Alert, AlertSeverity, GeofenceTrigger, MonitorAction, MonitorCondition, MonitorEngine,
     MonitorRule, ThresholdOp,
@@ -23,11 +26,11 @@ pub use processor::{
     StreamProcessor,
 };
 pub use sanctions::{
-    SanctionsDatabase, SanctionsMatch, SanctionsQuery, SanctionsResult, SanctionsRiskLevel,
-    SdnEntry, fuzzy_score, levenshtein,
+    fuzzy_score, levenshtein, SanctionsDatabase, SanctionsMatch, SanctionsQuery, SanctionsResult,
+    SanctionsRiskLevel, SdnEntry,
 };
 pub use threat::{
-    CriticalInfrastructure, InfrastructureType, RiskFactors, RiskWeights, SanctionsList,
-    ThreatAlert, ThreatAssessment, ThreatEngine, ThreatLevel, ThreatSummary,
-    default_critical_infrastructure,
+    default_critical_infrastructure, CriticalInfrastructure, InfrastructureType, RiskFactors,
+    RiskWeights, SanctionsList, ThreatAlert, ThreatAssessment, ThreatEngine, ThreatLevel,
+    ThreatSummary,
 };

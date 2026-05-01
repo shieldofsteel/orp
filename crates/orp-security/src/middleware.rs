@@ -41,8 +41,7 @@ pub struct AuthContext {
 impl AuthContext {
     /// Returns true if the context holds the requested permission.
     pub fn has_permission(&self, perm: &str) -> bool {
-        self.permissions.iter().any(|p| p == perm)
-            || self.permissions.iter().any(|p| p == "admin")
+        self.permissions.iter().any(|p| p == perm) || self.permissions.iter().any(|p| p == "admin")
     }
 
     /// Returns true if the context holds the requested scope.
@@ -127,8 +126,7 @@ pub enum AuthMethod {
 }
 
 /// Authentication state shared across Axum handlers.
-#[derive(Clone, Debug)]
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AuthState {
     /// JWT service — `None` means auth is disabled (dev mode)
     pub jwt_service: Option<Arc<JwtService>>,
@@ -149,17 +147,79 @@ impl AuthState {
         }
     }
 
-    /// Development mode — permissive only when ORP_DEV_MODE=true.
-    pub fn dev() -> Self {
-        let permissive = std::env::var("ORP_DEV_MODE")
+    /// Development mode — permissive only when `ORP_DEV_MODE=true` AND
+    /// `ORP_ENV` is empty / `development` / `dev` / `test` / `ci`.
+    ///
+    /// **Production safety belt.** This constructor refuses to return an
+    /// effectively-broken server: if the operator set `ORP_DEV_MODE=true`
+    /// while `ORP_ENV` looks production-y, [`AuthState::dev`] returns
+    /// [`AuthStateError::DevModeRefusedInProd`]. Callers must either
+    /// (a) drop the dev flag and use [`AuthState::production`] with real
+    /// JWT/API-key services, or (b) explicitly set `ORP_ENV` to a dev
+    /// value. We deliberately surface this as a fatal startup error rather
+    /// than silently denying every request — which is what an earlier
+    /// version of this gate did, leaving the server appearing healthy
+    /// while returning 401/500 to literally every caller.
+    pub fn dev() -> Result<Self, AuthStateError> {
+        let env = std::env::var("ORP_ENV").unwrap_or_default();
+        // **Closed by default.** `ORP_ENV` must explicitly be one of the
+        // dev-class names. An unset / empty `ORP_ENV` is *not* treated as
+        // dev — that previously meant a production deploy that simply
+        // forgot to set `ORP_ENV` while inheriting `ORP_DEV_MODE=true`
+        // from a CI script would silently grant admin to every caller.
+        let env_ok = env == "development" || env == "dev" || env == "test" || env == "ci";
+        let raw_permissive = std::env::var("ORP_DEV_MODE")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        Self {
+
+        if raw_permissive && !env_ok {
+            return Err(AuthStateError::DevModeRefusedInProd { env });
+        }
+
+        let permissive = raw_permissive && env_ok;
+        if permissive {
+            tracing::warn!(
+                "Permissive auth ENABLED — every request is treated as anonymous admin. \
+                 NEVER set ORP_DEV_MODE=true in production."
+            );
+        } else {
+            tracing::warn!(
+                "AuthState::dev() returning a state with no JWT or API-key service attached. \
+                 Authenticated endpoints will reject every request. Use AuthState::production() \
+                 to wire real auth services for any non-demo deployment."
+            );
+        }
+        Ok(Self {
             jwt_service: None,
             api_key_service: None,
             permissive_mode: permissive,
-        }
+        })
     }
+
+    /// Infallible variant of [`Self::dev`] for tests and demos that
+    /// genuinely want the old "best-effort dev state" behaviour.
+    /// Returns an effectively-broken state when env is wrong; do not use
+    /// in any production-bound code path.
+    #[doc(hidden)]
+    pub fn dev_or_broken() -> Self {
+        Self::dev().unwrap_or(Self {
+            jwt_service: None,
+            api_key_service: None,
+            permissive_mode: false,
+        })
+    }
+}
+
+/// Errors from constructing an [`AuthState`].
+#[derive(Debug, thiserror::Error)]
+pub enum AuthStateError {
+    #[error(
+        "ORP_DEV_MODE=true but ORP_ENV='{env}' looks production-y. Refusing to start with no \
+         JWT/API-key services attached — that would silently 401/500 every request. Either \
+         unset ORP_DEV_MODE, set ORP_ENV to one of {{development, dev, test, ci}}, or call \
+         AuthState::production() with real services."
+    )]
+    DevModeRefusedInProd { env: String },
 }
 
 /// Authentication error returned as an HTTP response.
@@ -223,10 +283,7 @@ where
     }
 }
 
-async fn extract_auth(
-    parts: &mut Parts,
-    auth_state: &AuthState,
-) -> Result<AuthContext, AuthError> {
+async fn extract_auth(parts: &mut Parts, auth_state: &AuthState) -> Result<AuthContext, AuthError> {
     // Try to extract Bearer token
     let bearer_token = parts
         .headers
@@ -414,6 +471,7 @@ mod tests {
             email: Some("bob@test.com".into()),
             name: Some("Bob".into()),
             iat: 0,
+            nbf: Some(0),
             exp: 9999999999,
             iss: "http://localhost:9090/auth".into(),
             aud: "orp-client".into(),
@@ -428,5 +486,117 @@ mod tests {
         assert!(ctx.has_scope("api:read"));
         assert!(ctx.has_scope("entities:read"));
         assert_eq!(ctx.auth_method, AuthMethod::Jwt);
+    }
+
+    // ─── AuthState::dev() env-gate tests ─────────────────────────────────
+    //
+    // Env vars are process-global, so each of these tests must run
+    // serially. The `serial_test::serial` attribute serialises them within
+    // a single nextest/cargo-test process. Each test sets exactly the env
+    // it needs and clears them in a guard so leakage across tests is
+    // prevented even on early panic.
+
+    use serial_test::serial;
+
+    /// Drop-guard that unsets the env vars `dev()` reads when the test
+    /// scope ends, regardless of pass/fail. Avoids cross-test leakage.
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("ORP_DEV_MODE");
+            std::env::remove_var("ORP_ENV");
+        }
+    }
+
+    fn dev_env_test(
+        orp_dev_mode: Option<&str>,
+        orp_env: Option<&str>,
+    ) -> Result<AuthState, AuthStateError> {
+        // Always start from a clean slate so the previous test's settings
+        // can't leak in.
+        std::env::remove_var("ORP_DEV_MODE");
+        std::env::remove_var("ORP_ENV");
+        if let Some(v) = orp_dev_mode {
+            std::env::set_var("ORP_DEV_MODE", v);
+        }
+        if let Some(v) = orp_env {
+            std::env::set_var("ORP_ENV", v);
+        }
+        AuthState::dev()
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_state_accepts_development_env() {
+        let _guard = EnvGuard;
+        let state = dev_env_test(Some("true"), Some("development")).unwrap();
+        assert!(state.permissive_mode);
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_state_accepts_dev_env() {
+        let _guard = EnvGuard;
+        let state = dev_env_test(Some("true"), Some("dev")).unwrap();
+        assert!(state.permissive_mode);
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_state_accepts_test_env() {
+        let _guard = EnvGuard;
+        let state = dev_env_test(Some("true"), Some("test")).unwrap();
+        assert!(state.permissive_mode);
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_state_accepts_ci_env() {
+        let _guard = EnvGuard;
+        let state = dev_env_test(Some("true"), Some("ci")).unwrap();
+        assert!(state.permissive_mode);
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_state_refuses_production_env() {
+        let _guard = EnvGuard;
+        let result = dev_env_test(Some("true"), Some("production"));
+        assert!(
+            matches!(
+                result,
+                Err(AuthStateError::DevModeRefusedInProd { ref env }) if env == "production"
+            ),
+            "expected DevModeRefusedInProd, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_state_refuses_empty_env_when_dev_mode_set() {
+        let _guard = EnvGuard;
+        // ORP_ENV unset (absent) — the closed-by-default policy means this
+        // is no longer treated as dev-OK. Refused.
+        let result = dev_env_test(Some("true"), None);
+        assert!(
+            matches!(
+                result,
+                Err(AuthStateError::DevModeRefusedInProd { ref env }) if env.is_empty()
+            ),
+            "unset ORP_ENV with dev-mode-on must refuse, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_state_succeeds_when_dev_mode_unset_regardless_of_env() {
+        let _guard = EnvGuard;
+        // ORP_DEV_MODE unset entirely; ORP_ENV=production. Without the dev
+        // flag, dev() returns a non-permissive state with no services
+        // attached — exactly the doctest case.
+        let state = dev_env_test(None, Some("production")).unwrap();
+        assert!(!state.permissive_mode);
+        assert!(state.jwt_service.is_none());
+        assert!(state.api_key_service.is_none());
     }
 }

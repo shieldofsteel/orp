@@ -33,16 +33,16 @@ use std::sync::Arc;
 /// Well-known NMEA 2000 PGN identifiers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum N2kPgn {
-    VesselHeading,       // 127250
-    Speed,               // 128259
-    WaterDepth,          // 128267
-    WindData,            // 130306
-    PositionRapid,       // 129025
-    AisClassAPosition,   // 129038
-    AisClassBPosition,   // 129039
-    CogSogRapid,         // 129026
-    GnssFix,             // 129029
-    Rudder,              // 127245
+    VesselHeading,     // 127250
+    Speed,             // 128259
+    WaterDepth,        // 128267
+    WindData,          // 130306
+    PositionRapid,     // 129025
+    AisClassAPosition, // 129038
+    AisClassBPosition, // 129039
+    CogSogRapid,       // 129026
+    GnssFix,           // 129029
+    Rudder,            // 127245
     Unknown(u32),
 }
 
@@ -420,10 +420,7 @@ pub fn decode_n2k_data(frame: &N2kFrame) -> N2kDecodedData {
 // ---------------------------------------------------------------------------
 
 /// Convert decoded N2K data to a SourceEvent.
-pub fn n2k_to_source_event(
-    decoded: &N2kDecodedData,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn n2k_to_source_event(decoded: &N2kDecodedData, connector_id: &str) -> SourceEvent {
     let mut properties = HashMap::new();
     properties.insert("pgn".into(), json!(decoded.pgn_number));
     properties.insert("pgn_name".into(), json!(decoded.pgn.name()));
@@ -565,13 +562,9 @@ impl Connector for Nmea2000Connector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                ConnectorError::ConfigError("NMEA 2000: url (log file path) required".into())
-            })?;
+        let path = self.config.url.as_deref().ok_or_else(|| {
+            ConnectorError::ConfigError("NMEA 2000: url (log file path) required".into())
+        })?;
 
         let content = tokio::fs::read_to_string(path)
             .await
@@ -666,8 +659,10 @@ mod tests {
             0x00, // SID
             heading_raw.to_le_bytes()[0],
             heading_raw.to_le_bytes()[1],
-            0xFF, 0x7F, // deviation: max (not available)
-            0xFF, 0x7F, // variation: max
+            0xFF,
+            0x7F, // deviation: max (not available)
+            0xFF,
+            0x7F, // variation: max
             0x00, // reference: True
         ];
         let values = decode_pgn_127250(&data);
@@ -685,7 +680,8 @@ mod tests {
             0x00, // SID
             speed_raw.to_le_bytes()[0],
             speed_raw.to_le_bytes()[1],
-            0xFF, 0xFF, // ground speed: not available
+            0xFF,
+            0xFF, // ground speed: not available
         ];
         let values = decode_pgn_128259(&data);
         let speed = values["speed_water_mps"].as_f64().unwrap();
@@ -703,7 +699,8 @@ mod tests {
             depth_raw.to_le_bytes()[1],
             depth_raw.to_le_bytes()[2],
             depth_raw.to_le_bytes()[3],
-            0x00, 0x00, // offset
+            0x00,
+            0x00, // offset
         ];
         let values = decode_pgn_128267(&data);
         let depth = values["depth_m"].as_f64().unwrap();

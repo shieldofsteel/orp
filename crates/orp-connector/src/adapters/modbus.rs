@@ -201,9 +201,7 @@ pub fn parse_mbap_header(data: &[u8]) -> Result<(MbapHeader, usize), ConnectorEr
 }
 
 /// Parse a Modbus TCP response frame (MBAP + PDU).
-pub fn parse_modbus_tcp_response(
-    data: &[u8],
-) -> Result<ModbusResponse, ConnectorError> {
+pub fn parse_modbus_tcp_response(data: &[u8]) -> Result<ModbusResponse, ConnectorError> {
     let (header, offset) = parse_mbap_header(data)?;
     if offset >= data.len() {
         return Err(ConnectorError::ParseError(
@@ -258,9 +256,7 @@ pub fn parse_modbus_tcp_response(
 }
 
 /// Parse a Modbus TCP request frame.
-pub fn parse_modbus_tcp_request(
-    data: &[u8],
-) -> Result<ModbusRequest, ConnectorError> {
+pub fn parse_modbus_tcp_request(data: &[u8]) -> Result<ModbusRequest, ConnectorError> {
     let (header, offset) = parse_mbap_header(data)?;
     if offset + 4 >= data.len() {
         return Err(ConnectorError::ParseError(
@@ -306,10 +302,7 @@ pub fn verify_rtu_crc(frame: &[u8]) -> bool {
         return false;
     }
     let payload = &frame[..frame.len() - 2];
-    let received_crc = u16::from_le_bytes([
-        frame[frame.len() - 2],
-        frame[frame.len() - 1],
-    ]);
+    let received_crc = u16::from_le_bytes([frame[frame.len() - 2], frame[frame.len() - 1]]);
     modbus_crc16(payload) == received_crc
 }
 
@@ -408,25 +401,16 @@ impl RegisterMapping {
     pub fn read_value(&self, data: &[u8], base_address: u16) -> Option<f64> {
         let reg_offset = (self.address - base_address) as usize;
         match self.data_type {
-            RegisterDataType::UInt16 => {
-                RegisterInterpreter::read_u16(data, reg_offset)
-                    .map(|v| v as f64 * self.scale + self.offset)
-            }
-            RegisterDataType::Int16 => {
-                RegisterInterpreter::read_i16(data, reg_offset)
-                    .map(|v| v as f64 * self.scale + self.offset)
-            }
-            RegisterDataType::Float32 => {
-                RegisterInterpreter::read_f32(data, reg_offset)
-                    .map(|v| v as f64 * self.scale + self.offset)
-            }
-            RegisterDataType::UInt32 => {
-                RegisterInterpreter::read_u32(data, reg_offset)
-                    .map(|v| v as f64 * self.scale + self.offset)
-            }
+            RegisterDataType::UInt16 => RegisterInterpreter::read_u16(data, reg_offset)
+                .map(|v| v as f64 * self.scale + self.offset),
+            RegisterDataType::Int16 => RegisterInterpreter::read_i16(data, reg_offset)
+                .map(|v| v as f64 * self.scale + self.offset),
+            RegisterDataType::Float32 => RegisterInterpreter::read_f32(data, reg_offset)
+                .map(|v| v as f64 * self.scale + self.offset),
+            RegisterDataType::UInt32 => RegisterInterpreter::read_u32(data, reg_offset)
+                .map(|v| v as f64 * self.scale + self.offset),
             RegisterDataType::Coil => {
-                RegisterInterpreter::read_coil(data, reg_offset)
-                    .map(|v| if v { 1.0 } else { 0.0 })
+                RegisterInterpreter::read_coil(data, reg_offset).map(|v| if v { 1.0 } else { 0.0 })
             }
         }
     }
@@ -457,10 +441,7 @@ pub fn modbus_response_to_events(
                 serde_json::json!(mapping.address),
             );
             properties.insert("register_name".into(), serde_json::json!(mapping.name));
-            properties.insert(
-                "unit_id".into(),
-                serde_json::json!(response.header.unit_id),
-            );
+            properties.insert("unit_id".into(), serde_json::json!(response.header.unit_id));
             properties.insert(
                 "function_code".into(),
                 serde_json::json!(response.function_code.as_str()),
@@ -582,22 +563,16 @@ impl Connector for ModbusConnector {
                         .get("poll_interval_secs")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(5);
-                    let unit_id = props
-                        .get("unit_id")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(1) as u8;
+                    let unit_id = props.get("unit_id").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
                     let start_addr = props
                         .get("start_address")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u16;
-                    let quantity = props
-                        .get("quantity")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(10) as u16;
+                    let quantity =
+                        props.get("quantity").and_then(|v| v.as_u64()).unwrap_or(10) as u16;
 
-                    let mut interval = tokio::time::interval(
-                        tokio::time::Duration::from_secs(poll_secs),
-                    );
+                    let mut interval =
+                        tokio::time::interval(tokio::time::Duration::from_secs(poll_secs));
                     let mut txn_id: u16 = 0;
 
                     while running.load(Ordering::SeqCst) {
@@ -605,23 +580,18 @@ impl Connector for ModbusConnector {
                         match tokio::net::TcpStream::connect(addr).await {
                             Ok(stream) => {
                                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                                let request =
-                                    ModbusConnector::build_read_holding_registers(
-                                        txn_id, unit_id, start_addr, quantity,
-                                    );
-                                let (mut reader, mut writer) =
-                                    stream.into_split();
+                                let request = ModbusConnector::build_read_holding_registers(
+                                    txn_id, unit_id, start_addr, quantity,
+                                );
+                                let (mut reader, mut writer) = stream.into_split();
                                 if writer.write_all(&request).await.is_err() {
-                                    errors_count
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    errors_count.fetch_add(1, Ordering::Relaxed);
                                     continue;
                                 }
                                 let mut buf = vec![0u8; 256];
                                 match reader.read(&mut buf).await {
                                     Ok(n) if n > 0 => {
-                                        match parse_modbus_tcp_response(
-                                            &buf[..n],
-                                        ) {
+                                        match parse_modbus_tcp_response(&buf[..n]) {
                                             Ok(resp) => {
                                                 // Simple: emit raw register values as a single event
                                                 let mut properties = HashMap::new();
@@ -639,9 +609,14 @@ impl Connector for ModbusConnector {
                                                 );
                                                 // Store first few register values
                                                 for i in 0..(resp.data.len() / 2).min(10) {
-                                                    if let Some(val) = RegisterInterpreter::read_u16(&resp.data, i) {
+                                                    if let Some(val) =
+                                                        RegisterInterpreter::read_u16(&resp.data, i)
+                                                    {
                                                         properties.insert(
-                                                            format!("reg_{}", start_addr + i as u16),
+                                                            format!(
+                                                                "reg_{}",
+                                                                start_addr + i as u16
+                                                            ),
                                                             serde_json::json!(val),
                                                         );
                                                     }
@@ -661,37 +636,23 @@ impl Connector for ModbusConnector {
                                                 if tx.send(event).await.is_err() {
                                                     return;
                                                 }
-                                                events_count.fetch_add(
-                                                    1,
-                                                    Ordering::Relaxed,
-                                                );
+                                                events_count.fetch_add(1, Ordering::Relaxed);
                                             }
                                             Err(e) => {
-                                                tracing::warn!(
-                                                    "Modbus parse error: {}",
-                                                    e
-                                                );
-                                                errors_count.fetch_add(
-                                                    1,
-                                                    Ordering::Relaxed,
-                                                );
+                                                tracing::warn!("Modbus parse error: {}", e);
+                                                errors_count.fetch_add(1, Ordering::Relaxed);
                                             }
                                         }
                                     }
                                     _ => {
-                                        errors_count
-                                            .fetch_add(1, Ordering::Relaxed);
+                                        errors_count.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                                 txn_id = txn_id.wrapping_add(1);
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "Modbus TCP connect error: {}",
-                                    e
-                                );
-                                errors_count
-                                    .fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!("Modbus TCP connect error: {}", e);
+                                errors_count.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -751,11 +712,7 @@ mod tests {
 
     // Build a valid Modbus TCP response for FC03 (Read Holding Registers)
     // Returns: MBAP header + FC + byte_count + register data
-    fn build_fc03_response(
-        transaction_id: u16,
-        unit_id: u8,
-        register_values: &[u16],
-    ) -> Vec<u8> {
+    fn build_fc03_response(transaction_id: u16, unit_id: u8, register_values: &[u16]) -> Vec<u8> {
         let byte_count = (register_values.len() * 2) as u8;
         let pdu_len = 2 + byte_count as usize; // FC(1) + byte_count(1) + data
         let length = 1 + pdu_len as u16; // unit_id(1) + PDU
@@ -871,10 +828,7 @@ mod tests {
     fn test_register_interpreter_f32() {
         let val: f32 = 42.5;
         let bytes = val.to_be_bytes();
-        assert!(
-            (RegisterInterpreter::read_f32(&bytes, 0).unwrap() - 42.5).abs()
-                < 0.001
-        );
+        assert!((RegisterInterpreter::read_f32(&bytes, 0).unwrap() - 42.5).abs() < 0.001);
     }
 
     #[test]
@@ -947,9 +901,8 @@ mod tests {
             },
         ];
 
-        let events = modbus_response_to_events(
-            &resp, &mappings, 0, "modbus-test", "plc-1", None, None,
-        );
+        let events =
+            modbus_response_to_events(&resp, &mappings, 0, "modbus-test", "plc-1", None, None);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].entity_type, "temperature_sensor");
         assert_eq!(events[1].entity_type, "pressure_sensor");
@@ -957,8 +910,7 @@ mod tests {
 
     #[test]
     fn test_build_read_holding_registers() {
-        let frame =
-            ModbusConnector::build_read_holding_registers(42, 1, 100, 10);
+        let frame = ModbusConnector::build_read_holding_registers(42, 1, 100, 10);
         assert_eq!(frame.len(), 12);
         assert_eq!(frame[0..2], 42u16.to_be_bytes()); // txn ID
         assert_eq!(frame[6], 1); // unit ID
@@ -967,8 +919,7 @@ mod tests {
 
     #[test]
     fn test_build_read_input_registers() {
-        let frame =
-            ModbusConnector::build_read_input_registers(1, 2, 0, 5);
+        let frame = ModbusConnector::build_read_input_registers(1, 2, 0, 5);
         assert_eq!(frame[7], 0x04); // FC04
         assert_eq!(frame[6], 2); // unit ID
     }

@@ -1,6 +1,6 @@
 # ORP Python SDK
 
-Lightweight Python client for [ORP — Object Relationship Platform](https://github.com/shieldofsteel/orp).
+Lightweight Python client for [ORP — Open Reality Protocol](https://github.com/shieldofsteel/orp).
 
 - ✅ Zero required dependencies (stdlib only)
 - ✅ Python 3.8+
@@ -216,4 +216,4 @@ def process(ship: Entity) -> None:
 
 ## License
 
-MIT © Shield of Steel
+Apache-2.0 © Shield of Steel — see [LICENSE](../../LICENSE)

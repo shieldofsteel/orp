@@ -93,7 +93,11 @@ impl AisStreamConnector {
         sub
     }
 
-    fn parse_message(msg_json: &str, events_processed: &AtomicU64, errors: &AtomicU64) -> Option<SourceEvent> {
+    fn parse_message(
+        msg_json: &str,
+        events_processed: &AtomicU64,
+        errors: &AtomicU64,
+    ) -> Option<SourceEvent> {
         let data: JsonValue = match serde_json::from_str(msg_json) {
             Ok(v) => v,
             Err(_) => {
@@ -113,9 +117,12 @@ impl AisStreamConnector {
         let metadata = data.get("MetaData")?;
         let message = data.get("Message")?;
 
-        let mmsi = metadata.get("MMSI").and_then(|v| v.as_u64())
+        let mmsi = metadata
+            .get("MMSI")
+            .and_then(|v| v.as_u64())
             .map(|m| m.to_string())?;
-        let ship_name = metadata.get("ShipName")
+        let ship_name = metadata
+            .get("ShipName")
             .and_then(|v| v.as_str())
             .unwrap_or("Unknown")
             .trim()
@@ -134,8 +141,14 @@ impl AisStreamConnector {
 
                 let sog = report.get("Sog").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let cog = report.get("Cog").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let heading = report.get("TrueHeading").and_then(|v| v.as_u64()).unwrap_or(511);
-                let nav_status = report.get("NavigationalStatus").and_then(|v| v.as_u64()).unwrap_or(15);
+                let heading = report
+                    .get("TrueHeading")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(511);
+                let nav_status = report
+                    .get("NavigationalStatus")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(15);
 
                 let mut properties = HashMap::new();
                 properties.insert("speed".to_string(), json!(sog));
@@ -163,12 +176,33 @@ impl AisStreamConnector {
             }
             "ShipStaticData" => {
                 let report = message.get("ShipStaticData")?;
-                let imo = report.get("ImoNumber").and_then(|v| v.as_u64()).unwrap_or(0);
-                let callsign = report.get("CallSign").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                let imo = report
+                    .get("ImoNumber")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let callsign = report
+                    .get("CallSign")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
                 let ship_type = report.get("Type").and_then(|v| v.as_u64()).unwrap_or(0);
-                let dest = report.get("Destination").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                let dim_a = report.get("Dimension").and_then(|d| d.get("A")).and_then(|v| v.as_u64()).unwrap_or(0);
-                let dim_b = report.get("Dimension").and_then(|d| d.get("B")).and_then(|v| v.as_u64()).unwrap_or(0);
+                let dest = report
+                    .get("Destination")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let dim_a = report
+                    .get("Dimension")
+                    .and_then(|d| d.get("A"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let dim_b = report
+                    .get("Dimension")
+                    .and_then(|d| d.get("B"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 let length = dim_a + dim_b;
 
                 let lat = metadata.get("latitude").and_then(|v| v.as_f64());
@@ -177,11 +211,21 @@ impl AisStreamConnector {
                 let mut properties = HashMap::new();
                 properties.insert("mmsi".to_string(), json!(mmsi));
                 properties.insert("name".to_string(), json!(ship_name));
-                if imo > 0 { properties.insert("imo".to_string(), json!(imo)); }
-                if !callsign.is_empty() { properties.insert("callsign".to_string(), json!(callsign)); }
-                if ship_type > 0 { properties.insert("ship_type".to_string(), json!(ship_type)); }
-                if !dest.is_empty() { properties.insert("destination".to_string(), json!(dest)); }
-                if length > 0 { properties.insert("length".to_string(), json!(length)); }
+                if imo > 0 {
+                    properties.insert("imo".to_string(), json!(imo));
+                }
+                if !callsign.is_empty() {
+                    properties.insert("callsign".to_string(), json!(callsign));
+                }
+                if ship_type > 0 {
+                    properties.insert("ship_type".to_string(), json!(ship_type));
+                }
+                if !dest.is_empty() {
+                    properties.insert("destination".to_string(), json!(dest));
+                }
+                if length > 0 {
+                    properties.insert("length".to_string(), json!(length));
+                }
 
                 events_processed.fetch_add(1, Ordering::Relaxed);
 
@@ -206,7 +250,10 @@ impl Connector for AisStreamConnector {
         &self.config.connector_id
     }
 
-    async fn start(&self, tx: mpsc::Sender<SourceEvent>) -> Result<(), crate::traits::ConnectorError> {
+    async fn start(
+        &self,
+        tx: mpsc::Sender<SourceEvent>,
+    ) -> Result<(), crate::traits::ConnectorError> {
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let events_processed = self.events_processed.clone();
@@ -237,11 +284,9 @@ impl Connector for AisStreamConnector {
                     while running.load(Ordering::SeqCst) {
                         match read.next().await {
                             Some(Ok(Message::Text(text))) => {
-                                if let Some(event) = Self::parse_message(
-                                    &text,
-                                    &events_processed,
-                                    &errors,
-                                ) {
+                                if let Some(event) =
+                                    Self::parse_message(&text, &events_processed, &errors)
+                                {
                                     if tx.send(event).await.is_err() {
                                         tracing::warn!("AISStream: channel closed, stopping");
                                         running.store(false, Ordering::SeqCst);
@@ -291,7 +336,9 @@ impl Connector for AisStreamConnector {
         if self.running.load(Ordering::SeqCst) {
             Ok(())
         } else {
-            Err(crate::traits::ConnectorError::ConnectionError("Not running".into()))
+            Err(crate::traits::ConnectorError::ConnectionError(
+                "Not running".into(),
+            ))
         }
     }
 

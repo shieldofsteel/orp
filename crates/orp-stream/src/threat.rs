@@ -229,7 +229,12 @@ pub struct ThreatAssessment {
 
 impl ThreatAssessment {
     /// Create a new assessment with no prior history.
-    pub fn new(entity_id: impl Into<String>, risk_score: f64, factors: RiskFactors, indicators: Vec<String>) -> Self {
+    pub fn new(
+        entity_id: impl Into<String>,
+        risk_score: f64,
+        factors: RiskFactors,
+        indicators: Vec<String>,
+    ) -> Self {
         let threat_level = ThreatLevel::from_score(risk_score);
         Self {
             entity_id: entity_id.into(),
@@ -658,11 +663,11 @@ mod tests {
     fn test_full_sanctions_plus_behaviour_raises_to_red() {
         let weights = RiskWeights::default();
         let factors = RiskFactors {
-            sanctions_match: 100.0,  // × 0.35 = 35
-            behaviour_anomaly: 100.0, // × 0.25 = 25
+            sanctions_match: 100.0,          // × 0.35 = 35
+            behaviour_anomaly: 100.0,        // × 0.25 = 25
             infrastructure_proximity: 100.0, // × 0.20 = 20
-            dark_period: 100.0,      // × 0.12 = 12
-            speed_violation: 100.0,  // × 0.08 = 8
+            dark_period: 100.0,              // × 0.12 = 12
+            speed_violation: 100.0,          // × 0.08 = 8
         };
         let score = factors.composite(&weights);
         assert!((score - 100.0).abs() < 0.01);
@@ -730,9 +735,9 @@ mod tests {
                 &["normal_mmsi"],
                 51.92, // Rotterdam area but 50nm away
                 3.0,
-                12.0,  // normal speed
-                5.0,   // low anomaly
-                None,  // no dark gap
+                12.0, // normal speed
+                5.0,  // low anomaly
+                None, // no dark gap
             )
             .await;
         assert_eq!(assessment.threat_level, ThreatLevel::Green);
@@ -761,7 +766,10 @@ mod tests {
             "Got {:?}",
             assessment.threat_level
         );
-        assert!(assessment.indicators.iter().any(|i| i.contains("sanctions")));
+        assert!(assessment
+            .indicators
+            .iter()
+            .any(|i| i.contains("sanctions")));
     }
 
     #[tokio::test]
@@ -772,7 +780,11 @@ mod tests {
             last_seen: Utc::now() - chrono::Duration::hours(12),
             dark_duration_minutes: 720.0,
             dark_threshold_minutes: 60.0,
-            last_position: orp_proto::GeoPoint { lat: 25.0, lon: 56.0, alt: None },
+            last_position: orp_proto::GeoPoint {
+                lat: 25.0,
+                lon: 56.0,
+                alt: None,
+            },
             detected_at: Utc::now(),
         };
         let assessment = engine
@@ -797,7 +809,15 @@ mod tests {
 
         // Second with sanctions → escalate
         let _a2 = engine
-            .assess("esc_vessel", &["HIGH_RISK_MMSI"], 10.0, 50.0, 40.0, 80.0, None)
+            .assess(
+                "esc_vessel",
+                &["HIGH_RISK_MMSI"],
+                10.0,
+                50.0,
+                40.0,
+                80.0,
+                None,
+            )
             .await;
 
         // At least one alert should be in the channel
@@ -813,8 +833,12 @@ mod tests {
             .await;
 
         // Force two entities to high risk
-        engine.assess("e1", &["S1"], 1.265, 103.82, 35.0, 90.0, None).await;
-        engine.assess("e2", &["S2"], 1.265, 103.82, 35.0, 90.0, None).await;
+        engine
+            .assess("e1", &["S1"], 1.265, 103.82, 35.0, 90.0, None)
+            .await;
+        engine
+            .assess("e2", &["S2"], 1.265, 103.82, 35.0, 90.0, None)
+            .await;
         engine.assess("e3", &[], 50.0, 10.0, 5.0, 2.0, None).await;
 
         let orangeplus = engine.filter_by_level(ThreatLevel::Orange).await;

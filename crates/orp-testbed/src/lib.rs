@@ -118,11 +118,13 @@ pub fn generate_synthetic_ports(count: usize) -> Vec<Entity> {
 
 /// Generate synthetic aircraft entities for testing
 pub fn generate_synthetic_aircraft(count: usize) -> Vec<Entity> {
-    let airline_data = [("A1B2C3", "KLM1234", 52.30, 4.76, 35000.0, 450.0),
+    let airline_data = [
+        ("A1B2C3", "KLM1234", 52.30, 4.76, 35000.0, 450.0),
         ("D4E5F6", "BAW456", 51.47, -0.46, 28000.0, 380.0),
         ("789ABC", "AFR789", 48.86, 2.35, 40000.0, 500.0),
         ("DEF012", "DLH321", 50.03, 8.57, 32000.0, 420.0),
-        ("345678", "AAL100", 40.64, -73.78, 15000.0, 250.0)];
+        ("345678", "AAL100", 40.64, -73.78, 15000.0, 250.0),
+    ];
 
     airline_data
         .iter()
@@ -134,7 +136,10 @@ pub fn generate_synthetic_aircraft(count: usize) -> Vec<Entity> {
             properties.insert("callsign".to_string(), serde_json::json!(callsign));
             properties.insert("altitude".to_string(), serde_json::json!(alt));
             properties.insert("speed".to_string(), serde_json::json!(speed));
-            properties.insert("heading".to_string(), serde_json::json!((i as f64 * 72.0) % 360.0));
+            properties.insert(
+                "heading".to_string(),
+                serde_json::json!((i as f64 * 72.0) % 360.0),
+            );
             properties.insert("on_ground".to_string(), serde_json::json!(false));
 
             Entity {
@@ -155,10 +160,44 @@ pub fn generate_synthetic_aircraft(count: usize) -> Vec<Entity> {
 
 /// Generate synthetic weather system entities
 pub fn generate_synthetic_weather(count: usize) -> Vec<Entity> {
-    let weather_data = [("storm-atlantic-1", "Tropical Storm Alpha", 45.0, -30.0, "tropical_storm", "warning", 200.0),
-        ("low-north-sea", "North Sea Low", 58.0, 5.0, "low_pressure", "info", 500.0),
-        ("high-med", "Mediterranean High", 38.0, 15.0, "high_pressure", "info", 800.0),
-        ("storm-channel", "Channel Storm", 50.0, -2.0, "storm", "critical", 150.0)];
+    let weather_data = [
+        (
+            "storm-atlantic-1",
+            "Tropical Storm Alpha",
+            45.0,
+            -30.0,
+            "tropical_storm",
+            "warning",
+            200.0,
+        ),
+        (
+            "low-north-sea",
+            "North Sea Low",
+            58.0,
+            5.0,
+            "low_pressure",
+            "info",
+            500.0,
+        ),
+        (
+            "high-med",
+            "Mediterranean High",
+            38.0,
+            15.0,
+            "high_pressure",
+            "info",
+            800.0,
+        ),
+        (
+            "storm-channel",
+            "Channel Storm",
+            50.0,
+            -2.0,
+            "storm",
+            "critical",
+            150.0,
+        ),
+    ];
 
     weather_data
         .iter()
@@ -186,10 +225,7 @@ pub fn generate_synthetic_weather(count: usize) -> Vec<Entity> {
 }
 
 /// Generate synthetic relationships between ships and ports
-pub fn generate_synthetic_relationships(
-    ships: &[Entity],
-    ports: &[Entity],
-) -> Vec<Relationship> {
+pub fn generate_synthetic_relationships(ships: &[Entity], ports: &[Entity]) -> Vec<Relationship> {
     let mut relationships = Vec::new();
     let mut rel_id = 0;
 
@@ -298,10 +334,7 @@ mod tests {
         let rels = generate_synthetic_relationships(&ships, &ports);
         assert_eq!(rels.len(), 5);
         for rel in &rels {
-            assert!(
-                rel.relationship_type == "HEADING_TO"
-                    || rel.relationship_type == "DOCKED_AT"
-            );
+            assert!(rel.relationship_type == "HEADING_TO" || rel.relationship_type == "DOCKED_AT");
         }
     }
 

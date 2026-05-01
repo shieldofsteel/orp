@@ -150,15 +150,12 @@ pub fn parse_acars_text(data: &str) -> Result<AcarsMessage, ConnectorError> {
         }
     }
 
-    let mode = mode.ok_or_else(|| {
-        ConnectorError::ParseError("ACARS: missing MODE field".into())
-    })?;
-    let registration = registration.ok_or_else(|| {
-        ConnectorError::ParseError("ACARS: missing REG field".into())
-    })?;
-    let label = label.ok_or_else(|| {
-        ConnectorError::ParseError("ACARS: missing LABEL field".into())
-    })?;
+    let mode =
+        mode.ok_or_else(|| ConnectorError::ParseError("ACARS: missing MODE field".into()))?;
+    let registration = registration
+        .ok_or_else(|| ConnectorError::ParseError("ACARS: missing REG field".into()))?;
+    let label =
+        label.ok_or_else(|| ConnectorError::ParseError("ACARS: missing LABEL field".into()))?;
 
     Ok(AcarsMessage {
         mode,
@@ -246,10 +243,7 @@ pub fn parse_acars_raw(data: &str) -> Option<AcarsMessage> {
 // ---------------------------------------------------------------------------
 
 /// Convert an ACARS message to a SourceEvent.
-pub fn acars_to_source_event(
-    msg: &AcarsMessage,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn acars_to_source_event(msg: &AcarsMessage, connector_id: &str) -> SourceEvent {
     let mut properties = HashMap::new();
     properties.insert("mode".into(), json!(msg.mode.to_string()));
     properties.insert("mode_description".into(), json!(msg.mode_description()));
@@ -319,11 +313,8 @@ impl Connector for AcarsConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
+        let path =
+            self.config.url.as_deref().ok_or_else(|| {
                 ConnectorError::ConfigError("ACARS: url (file path) required".into())
             })?;
 

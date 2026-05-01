@@ -4,6 +4,7 @@ use chrono::Utc;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -37,7 +38,7 @@ use std::sync::Arc;
 //   </nffi>
 
 /// Force affiliation / identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NffiAffiliation {
     Friendly,
     Hostile,
@@ -179,8 +180,65 @@ pub struct NffiTrack {
 // XML Parser
 // ---------------------------------------------------------------------------
 
+/// Deterministic fallback ID for an unnamed NFFI track.
+///
+/// SHA-256 of the (name, lat, lon, affiliation) tuple, truncated to 16
+/// hex chars. SHA-256 (not `DefaultHasher`) gives a *restart-stable* id
+/// so entity-resolution history survives reboots and stays reproducible
+/// across machines.
+pub fn anon_track_id(
+    name: Option<&str>,
+    latitude: f64,
+    longitude: f64,
+    affiliation: &NffiAffiliation,
+) -> String {
+    let mut h = Sha256::new();
+    h.update(b"orp-nffi-anon-v1\0");
+    match name {
+        Some(s) => {
+            h.update(b"name:");
+            h.update((s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
+        }
+        None => h.update(b"name:none"),
+    }
+    h.update(b"\0lat:");
+    h.update(((latitude * 1e7) as i64).to_le_bytes());
+    h.update(b"\0lon:");
+    h.update(((longitude * 1e7) as i64).to_le_bytes());
+    h.update(b"\0aff:");
+    h.update(affiliation.as_str().as_bytes());
+    let digest = h.finalize();
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        use std::fmt::Write;
+        let _ = write!(hex, "{:02x}", byte);
+    }
+    format!("nffi-anon-{}", hex)
+}
+
 /// Parse NFFI XML string into a list of tracks.
+///
+/// Defers to `parse_nffi_xml_with_counter` with no counter — kept as a
+/// thin wrapper for callers that don't need the fallback-ID metric.
 pub fn parse_nffi_xml(xml_data: &str) -> Result<Vec<NffiTrack>, ConnectorError> {
+    parse_nffi_xml_with_counter(xml_data, None)
+}
+
+/// Parse NFFI XML and report whenever an anonymous fallback ID is
+/// synthesised (no `<trackId>` in the source). When supplied, the
+/// `anon_count` AtomicU64 is incremented once per fallback.
+//
+// The `Event::Text(e)` arm wraps a multi-line block in `if in_track { ... }`
+// that contains `continue` and a nested `match`. Clippy 1.95 wants this
+// collapsed into an arm guard, but the body's control-flow makes that
+// refactor noisy without changing behaviour. Allow the lint at the
+// function level rather than introduce a risky multi-line restructure.
+#[allow(clippy::collapsible_match)]
+pub fn parse_nffi_xml_with_counter(
+    xml_data: &str,
+    anon_count: Option<&AtomicU64>,
+) -> Result<Vec<NffiTrack>, ConnectorError> {
     let mut reader = Reader::from_str(xml_data);
 
     let mut tracks = Vec::new();
@@ -232,18 +290,14 @@ pub fn parse_nffi_xml(xml_data: &str) -> Result<Vec<NffiTrack>, ConnectorError> 
 
                         // Check for id attribute
                         for attr in e.attributes().flatten() {
-                            let key =
-                                String::from_utf8_lossy(attr.key.as_ref()).to_lowercase();
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_lowercase();
                             if key == "id" || key == "trackid" {
-                                track_id =
-                                    String::from_utf8_lossy(&attr.value).to_string();
+                                track_id = String::from_utf8_lossy(&attr.value).to_string();
                             }
                         }
                     }
-                    "position" | "pos" | "location" => {
-                        if in_track {
-                            in_position = true;
-                        }
+                    "position" | "pos" | "location" if in_track => {
+                        in_position = true;
                     }
                     _ => {}
                 }
@@ -254,33 +308,43 @@ pub fn parse_nffi_xml(xml_data: &str) -> Result<Vec<NffiTrack>, ConnectorError> 
             Ok(Event::End(e)) => {
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_lowercase();
                 match tag_name.as_str() {
-                    "track" | "trackmessage" | "trackentry" => {
-                        if in_track {
-                            let lat = latitude.unwrap_or(0.0);
-                            let lon = longitude.unwrap_or(0.0);
+                    "track" | "trackmessage" | "trackentry" if in_track => {
+                        let lat = latitude.unwrap_or(0.0);
+                        let lon = longitude.unwrap_or(0.0);
 
-                            if track_id.is_empty() {
-                                track_id = format!("track-{}", tracks.len());
+                        if track_id.is_empty() {
+                            // No <trackId> in source XML — synthesise a
+                            // restart-stable SHA-256 fallback so entity
+                            // resolution survives connector restarts.
+                            track_id = anon_track_id(name.as_deref(), lat, lon, &affiliation);
+                            tracing::warn!(
+                                name = ?name, lat, lon,
+                                affiliation = affiliation.as_str(),
+                                track_id = %track_id,
+                                "NFFI track missing <trackId>; synthesised anon id"
+                            );
+                            if let Some(c) = anon_count {
+                                c.fetch_add(1, Ordering::Relaxed);
                             }
-
-                            tracks.push(NffiTrack {
-                                track_id: track_id.clone(),
-                                name: name.clone(),
-                                latitude: lat,
-                                longitude: lon,
-                                altitude,
-                                speed,
-                                course,
-                                affiliation: affiliation.clone(),
-                                platform_type: platform_type.clone(),
-                                nationality: nationality.clone(),
-                                symbology: symbology.clone(),
-                                operational_status: operational_status.clone(),
-                                timestamp: timestamp.clone(),
-                                remarks: remarks.clone(),
-                            });
-                            in_track = false;
                         }
+
+                        tracks.push(NffiTrack {
+                            track_id: track_id.clone(),
+                            name: name.clone(),
+                            latitude: lat,
+                            longitude: lon,
+                            altitude,
+                            speed,
+                            course,
+                            affiliation: affiliation.clone(),
+                            platform_type: platform_type.clone(),
+                            nationality: nationality.clone(),
+                            symbology: symbology.clone(),
+                            operational_status: operational_status.clone(),
+                            timestamp: timestamp.clone(),
+                            remarks: remarks.clone(),
+                        });
+                        in_track = false;
                     }
                     "position" | "pos" | "location" => {
                         in_position = false;
@@ -298,10 +362,8 @@ pub fn parse_nffi_xml(xml_data: &str) -> Result<Vec<NffiTrack>, ConnectorError> 
                     }
 
                     match current_tag.as_str() {
-                        "trackid" | "id" => {
-                            if track_id.is_empty() {
-                                track_id = text;
-                            }
+                        "trackid" | "id" if track_id.is_empty() => {
+                            track_id = text;
                         }
                         "name" | "callsign" | "designation" => {
                             name = Some(text);
@@ -324,10 +386,8 @@ pub fn parse_nffi_xml(xml_data: &str) -> Result<Vec<NffiTrack>, ConnectorError> 
                         "identity" | "affiliation" | "hostility" => {
                             affiliation = parse_affiliation(&text);
                         }
-                        "platformtype" | "platform" | "type" | "category" => {
-                            if !in_position {
-                                platform_type = parse_platform_type(&text);
-                            }
+                        "platformtype" | "platform" | "type" | "category" if !in_position => {
+                            platform_type = parse_platform_type(&text);
                         }
                         "nationality" | "country" | "nation" => {
                             nationality = Some(text);
@@ -368,10 +428,7 @@ pub fn parse_nffi_xml(xml_data: &str) -> Result<Vec<NffiTrack>, ConnectorError> 
 // ---------------------------------------------------------------------------
 
 /// Convert an NFFI track to a SourceEvent.
-pub fn nffi_track_to_source_event(
-    track: &NffiTrack,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn nffi_track_to_source_event(track: &NffiTrack, connector_id: &str) -> SourceEvent {
     let mut properties = HashMap::new();
     properties.insert("track_id".into(), json!(track.track_id));
     properties.insert("affiliation".into(), json!(track.affiliation.as_str()));
@@ -428,6 +485,9 @@ pub struct NffiConnector {
     running: Arc<AtomicBool>,
     events_processed: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
+    /// Count of NFFI tracks where `<trackId>` was missing and the
+    /// fallback deterministic anon id was synthesised.
+    anonymous_tracks_total: Arc<AtomicU64>,
 }
 
 impl NffiConnector {
@@ -437,7 +497,15 @@ impl NffiConnector {
             running: Arc::new(AtomicBool::new(false)),
             events_processed: Arc::new(AtomicU64::new(0)),
             errors: Arc::new(AtomicU64::new(0)),
+            anonymous_tracks_total: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// `nffi_anonymous_tracks_total` — number of tracks for which the
+    /// fallback `nffi-anon-…` id was synthesised because the source XML
+    /// omitted `<trackId>`.
+    pub fn anonymous_tracks_total(&self) -> u64 {
+        self.anonymous_tracks_total.load(Ordering::Relaxed)
     }
 }
 
@@ -451,13 +519,9 @@ impl Connector for NffiConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                ConnectorError::ConfigError("NFFI: url (XML file path) required".into())
-            })?;
+        let path = self.config.url.as_deref().ok_or_else(|| {
+            ConnectorError::ConfigError("NFFI: url (XML file path) required".into())
+        })?;
 
         let content = tokio::fs::read_to_string(path)
             .await
@@ -468,8 +532,9 @@ impl Connector for NffiConnector {
         let events_processed = Arc::clone(&self.events_processed);
         let errors = Arc::clone(&self.errors);
         let running = Arc::clone(&self.running);
+        let anon = Arc::clone(&self.anonymous_tracks_total);
 
-        match parse_nffi_xml(&content) {
+        match parse_nffi_xml_with_counter(&content, Some(anon.as_ref())) {
             Ok(tracks) => {
                 for track in tracks {
                     if !running.load(Ordering::Relaxed) {
@@ -561,7 +626,10 @@ mod tests {
         assert_eq!(tracks[0].affiliation, NffiAffiliation::Friendly);
         assert_eq!(tracks[0].platform_type, NffiPlatformType::GroundVehicle);
         assert_eq!(tracks[0].nationality, Some("GBR".to_string()));
-        assert_eq!(tracks[0].operational_status, NffiOperationalStatus::Operational);
+        assert_eq!(
+            tracks[0].operational_status,
+            NffiOperationalStatus::Operational
+        );
     }
 
     #[test]
@@ -814,5 +882,35 @@ mod tests {
         let tracks = parse_nffi_xml(xml).unwrap();
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].track_id, "ATTR-ID");
+    }
+
+    /// Regression: the fallback ID generator must be deterministic
+    /// across processes/restarts (used to be `DefaultHasher`, whose
+    /// seed resets on each process — broke entity-resolution history).
+    #[test]
+    fn nffi_anon_id_is_deterministic() {
+        let a = anon_track_id(Some("Alpha"), 51.5074, -0.1278, &NffiAffiliation::Friendly);
+        let b = anon_track_id(Some("Alpha"), 51.5074, -0.1278, &NffiAffiliation::Friendly);
+        assert_eq!(a, b, "anon track id must be deterministic");
+        assert!(a.starts_with("nffi-anon-"));
+        assert_eq!(a.len(), "nffi-anon-".len() + 16);
+        // Sanity: distinct inputs → distinct IDs.
+        let c = anon_track_id(Some("Bravo"), 51.5074, -0.1278, &NffiAffiliation::Friendly);
+        let d = anon_track_id(Some("Alpha"), 51.5074, -0.1278, &NffiAffiliation::Hostile);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
+
+        // Through the parser the counter must increment, and the same
+        // XML produces the same id on a second parse.
+        let xml = r#"<nffi><track><position><latitude>51.5074</latitude>
+            <longitude>-0.1278</longitude></position><identity>FRIENDLY</identity>
+            <platformType>GROUND_VEHICLE</platformType></track></nffi>"#;
+        let ctr = AtomicU64::new(0);
+        let t1 = parse_nffi_xml_with_counter(xml, Some(&ctr)).unwrap();
+        let t2 = parse_nffi_xml_with_counter(xml, None).unwrap();
+        assert_eq!(t1.len(), 1);
+        assert!(t1[0].track_id.starts_with("nffi-anon-"));
+        assert_eq!(ctr.load(Ordering::Relaxed), 1);
+        assert_eq!(t1[0].track_id, t2[0].track_id);
     }
 }

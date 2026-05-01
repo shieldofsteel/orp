@@ -16,8 +16,9 @@
 //! use orp_security::middleware::{AuthState, AuthContext};
 //! use std::sync::Arc;
 //!
-//! // All requests pass through with admin context
-//! let auth = Arc::new(AuthState::dev());
+//! // All requests pass through with admin context (when ORP_DEV_MODE=true
+//! // and ORP_ENV is unset / development / dev / test / ci).
+//! let auth = Arc::new(AuthState::dev().expect("ORP_ENV gate refused dev mode"));
 //! ```
 //!
 //! ### Production
@@ -66,6 +67,6 @@ pub use middleware::{AuthContext, AuthError, AuthMethod, AuthState};
 pub use oidc::{OidcClient, OidcConfig, OidcError, SecurityError, TokenResponse};
 
 pub use rbac::{
-    check_role_permission, check_role_permission_str, register_rbac_policies,
-    Action as RbacAction, Role, RolePermissions,
+    check_role_permission, check_role_permission_str, register_rbac_policies, Action as RbacAction,
+    Role, RolePermissions,
 };

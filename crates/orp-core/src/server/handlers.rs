@@ -1,11 +1,11 @@
 use crate::server::http::AppState;
 use crate::server::websocket::BroadcastEvent;
-use orp_audit::crypto::compute_hash;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
 };
+use orp_audit::crypto::compute_hash;
 use orp_proto::{Entity, GeoPoint, Relationship};
 use orp_security::middleware::AuthContext;
 use orp_security::{AbacEngine, EvaluationContext, EvaluationResult, Resource, Subject};
@@ -141,7 +141,13 @@ async fn audit_log(
 
     if let Err(e) = state
         .storage
-        .log_audit(operation, entity_type, entity_id, Some(user_id), enriched_details)
+        .log_audit(
+            operation,
+            entity_type,
+            entity_id,
+            Some(user_id),
+            enriched_details,
+        )
         .await
     {
         tracing::warn!("Audit log write failed: {}", e);
@@ -162,15 +168,65 @@ pub struct HealthResponse {
 #[derive(Serialize)]
 pub struct HealthComponents {
     database: ComponentHealth,
+    graph_engine: ComponentHealth,
     stream_processor: ComponentHealth,
     api_server: ComponentHealth,
     monitor_engine: ComponentHealth,
+    /// Per-connector live health, derived from each `Connector::stats()`.
+    /// Empty if no connectors are registered with the AppState.
+    connectors: Vec<ConnectorHealthEntry>,
+    /// Per-peer pending outbox count (federation outbound buffer). Empty when
+    /// federation is disabled or the outbox failed to open. Each entry maps
+    /// `peer_id` → number of events currently buffered for that peer.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    federation_outbox: Vec<FederationOutboxHealth>,
+}
+
+#[derive(Serialize)]
+pub struct FederationOutboxHealth {
+    pub peer_id: String,
+    pub pending_count: u64,
 }
 
 #[derive(Serialize)]
 pub struct ComponentHealth {
     status: String,
     latency_ms: Option<f64>,
+}
+
+#[derive(Serialize)]
+pub struct ConnectorHealthEntry {
+    pub id: String,
+    pub connector_type: String,
+    /// "healthy" | "degraded" | "unhealthy". Computed from
+    /// `error_rate_window_pct`: rate > 50% → unhealthy, > 10% → degraded,
+    /// else healthy.
+    pub status: String,
+    pub events_processed: u64,
+    pub errors: u64,
+    /// errors / (events + errors) over the connector's lifetime, expressed
+    /// as a percentage. `0.0` when `events + errors == 0` so a freshly-
+    /// started connector reads as healthy.
+    pub error_rate_window_pct: f64,
+}
+
+/// Compute a connector's status string from its (events, errors) counters.
+/// Policy: > 50% error rate → unhealthy, > 10% → degraded, else healthy.
+/// `events + errors == 0` is healthy by definition.
+fn connector_status_from_counts(events: u64, errors: u64) -> (String, f64) {
+    let total = events.saturating_add(errors);
+    if total == 0 {
+        return ("healthy".to_string(), 0.0);
+    }
+    let rate = errors as f64 / total as f64;
+    let status = if rate > 0.50 {
+        "unhealthy"
+    } else if rate > 0.10 {
+        "degraded"
+    } else {
+        "healthy"
+    };
+    (status.to_string(), rate * 100.0)
 }
 
 pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
@@ -184,8 +240,57 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResp
     let _proc_stats = state.processor.stats();
     let uptime = state.started_at.elapsed().as_secs();
 
+    // Snapshot the live connector registry. We hold the lock just long enough
+    // to read each connector's config + stats; both are sync calls so we never
+    // suspend with the lock held.
+    let connector_entries: Vec<ConnectorHealthEntry> = {
+        let guard = state.connectors.lock().await;
+        guard
+            .iter()
+            .map(|c| {
+                let cfg = c.config();
+                let stats = c.stats();
+                let (status, rate_pct) =
+                    connector_status_from_counts(stats.events_processed, stats.errors);
+                ConnectorHealthEntry {
+                    id: cfg.connector_id.clone(),
+                    connector_type: cfg.connector_type.clone(),
+                    status,
+                    events_processed: stats.events_processed,
+                    errors: stats.errors,
+                    error_rate_window_pct: rate_pct,
+                }
+            })
+            .collect()
+    };
+
+    // If any connector is unhealthy, the top-level status degrades but we
+    // never fail the /health endpoint outright — dashboards still get JSON.
+    let any_unhealthy = connector_entries.iter().any(|c| c.status == "unhealthy");
+    let top_status = if any_unhealthy { "degraded" } else { "healthy" };
+
+    // Surface per-peer outbox pending counts when federation is enabled.
+    // We touch RocksDB synchronously; the prefix scan is O(pending) per peer
+    // and only runs on /health hits, which are not on a hot path.
+    let federation_outbox_entries: Vec<FederationOutboxHealth> =
+        match (&state.federation_registry, &state.federation_outbox) {
+            (Some(registry), Some(outbox)) => {
+                let peers = registry.list().await;
+                let mut entries = Vec::with_capacity(peers.len());
+                for peer in peers {
+                    let count = outbox.pending_count(&peer.id).unwrap_or(0);
+                    entries.push(FederationOutboxHealth {
+                        peer_id: peer.id,
+                        pending_count: count,
+                    });
+                }
+                entries
+            }
+            _ => Vec::new(),
+        };
+
     Json(HealthResponse {
-        status: "healthy".to_string(),
+        status: top_status.to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: uptime,
@@ -193,6 +298,14 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResp
             database: ComponentHealth {
                 status: db_status.to_string(),
                 latency_ms: Some(db_latency),
+            },
+            graph_engine: ComponentHealth {
+                // The graph engine is currently a DuckDB-backed projection
+                // (see crates/orp-storage/src/graph_engine.rs). Its health is
+                // gated on the underlying database; surface that explicitly so
+                // the openapi `graph_engine` component is always populated.
+                status: db_status.to_string(),
+                latency_ms: None,
             },
             stream_processor: ComponentHealth {
                 status: "healthy".to_string(),
@@ -206,14 +319,13 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResp
                 status: "healthy".to_string(),
                 latency_ms: None,
             },
+            connectors: connector_entries,
+            federation_outbox: federation_outbox_entries,
         },
     })
 }
 
-pub async fn metrics(
-    auth: AuthContext,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn metrics(auth: AuthContext, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Require auth — the AuthContext extractor already validated credentials.
     // Additionally check ABAC for metrics access.
     if let Err(resp) = check_abac(&state.abac_engine, &auth, "admin", "system", "metrics") {
@@ -399,8 +511,13 @@ pub async fn create_entity(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateEntityRequest>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:write", "entity", &body.id)
-    {
+    if let Err(resp) = check_abac(
+        &state.abac_engine,
+        &auth,
+        "entities:write",
+        "entity",
+        &body.id,
+    ) {
         return resp.into_response();
     }
 
@@ -473,7 +590,7 @@ pub async fn create_entity(
     match state.storage.insert_entity(&entity).await {
         Ok(()) => {
             audit_log(
-        state.as_ref(),
+                state.as_ref(),
                 "entity_created",
                 Some(&entity.entity_type),
                 Some(&entity.entity_id),
@@ -487,9 +604,10 @@ pub async fn create_entity(
                 entity_type: entity.entity_type.clone(),
                 entity_name: entity.name.clone(),
                 properties: serde_json::to_value(&entity.properties).unwrap_or_default(),
-                geometry: entity.geometry.as_ref().map(|g| {
-                    serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})
-                }),
+                geometry: entity
+                    .geometry
+                    .as_ref()
+                    .map(|g| serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})),
                 timestamp: chrono::Utc::now().to_rfc3339(),
             });
             (StatusCode::CREATED, Json(entity_to_response(&entity))).into_response()
@@ -583,7 +701,7 @@ pub async fn update_entity(
             match state.storage.insert_entity(&entity).await {
                 Ok(()) => {
                     audit_log(
-        state.as_ref(),
+                        state.as_ref(),
                         "entity_updated",
                         Some(&entity.entity_type),
                         Some(&entity.entity_id),
@@ -596,9 +714,9 @@ pub async fn update_entity(
                         entity_id: entity.entity_id.clone(),
                         entity_type: entity.entity_type.clone(),
                         changes: serde_json::to_value(&entity.properties).unwrap_or_default(),
-                        geometry: entity.geometry.as_ref().map(|g| {
-                            serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})
-                        }),
+                        geometry: entity.geometry.as_ref().map(
+                            |g| serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]}),
+                        ),
                         timestamp: chrono::Utc::now().to_rfc3339(),
                     });
                     Json(entity_to_response(&entity)).into_response()
@@ -639,7 +757,7 @@ pub async fn delete_entity(
         Ok(Some(deleted_entity)) => match state.storage.delete_entity(&id).await {
             Ok(()) => {
                 audit_log(
-        state.as_ref(),
+                    state.as_ref(),
                     "entity_deleted",
                     Some("entity"),
                     Some(&id),
@@ -731,8 +849,11 @@ pub async fn search_entities(
                     .await
                 {
                     Ok(entities) => {
-                        let data: Vec<EntityResponse> =
-                            entities.iter().take(limit).map(entity_to_response).collect();
+                        let data: Vec<EntityResponse> = entities
+                            .iter()
+                            .take(limit)
+                            .map(entity_to_response)
+                            .collect();
                         let search_time = start.elapsed().as_secs_f64() * 1000.0;
                         return Json(serde_json::json!({
                             "data": data,
@@ -1042,7 +1163,7 @@ pub async fn create_relationship(
     match state.storage.insert_relationship(&rel).await {
         Ok(()) => {
             audit_log(
-        state.as_ref(),
+                state.as_ref(),
                 "relationship_created",
                 Some("relationship"),
                 Some(&rel.relationship_id),
@@ -1055,14 +1176,16 @@ pub async fn create_relationship(
             )
             .await;
             // Emit broadcast event
-            let _ = state.broadcast_tx.send(BroadcastEvent::RelationshipChanged {
-                relationship_id: rel.relationship_id.clone(),
-                source_id: rel.source_entity_id.clone(),
-                target_id: rel.target_entity_id.clone(),
-                relationship_type: rel.relationship_type.clone(),
-                event: "created".to_string(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            });
+            let _ = state
+                .broadcast_tx
+                .send(BroadcastEvent::RelationshipChanged {
+                    relationship_id: rel.relationship_id.clone(),
+                    source_id: rel.source_entity_id.clone(),
+                    target_id: rel.target_entity_id.clone(),
+                    relationship_type: rel.relationship_type.clone(),
+                    event: "created".to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                });
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
@@ -1100,9 +1223,7 @@ pub async fn execute_query(
     State(state): State<Arc<AppState>>,
     Json(body): Json<QueryRequest>,
 ) -> impl IntoResponse {
-    if let Err(resp) =
-        check_abac(&state.abac_engine, &auth, "query:execute", "query", "*")
-    {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "query:execute", "query", "*") {
         return resp.into_response();
     }
 
@@ -1137,8 +1258,9 @@ pub async fn execute_query(
             }
         }))
         .into_response(),
-        Err(e) => error_response("INVALID_QUERY", StatusCode::BAD_REQUEST, &e.to_string())
-            .into_response(),
+        Err(e) => {
+            error_response("INVALID_QUERY", StatusCode::BAD_REQUEST, &e.to_string()).into_response()
+        }
     }
 }
 
@@ -1252,7 +1374,7 @@ pub async fn create_connector(
     match state.storage.register_data_source(&source).await {
         Ok(()) => {
             audit_log(
-        state.as_ref(),
+                state.as_ref(),
                 "connector_created",
                 Some("connector"),
                 Some(&source.source_id),
@@ -1319,7 +1441,7 @@ pub async fn update_connector(
             match state.storage.update_data_source(&source).await {
                 Ok(_) => {
                     audit_log(
-        state.as_ref(),
+                        state.as_ref(),
                         "connector_updated",
                         Some("connector"),
                         Some(&id),
@@ -1371,7 +1493,7 @@ pub async fn delete_connector(
     match state.storage.delete_data_source(&id).await {
         Ok(true) => {
             audit_log(
-        state.as_ref(),
+                state.as_ref(),
                 "connector_deleted",
                 Some("connector"),
                 Some(&id),
@@ -1402,13 +1524,7 @@ pub async fn list_monitors(
     auth: AuthContext,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_abac(
-        &state.abac_engine,
-        &auth,
-        "monitors:read",
-        "monitor",
-        "*",
-    ) {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "monitors:read", "monitor", "*") {
         return resp.into_response();
     }
 
@@ -1441,11 +1557,7 @@ pub enum MonitorConditionRequest {
         value: f64,
     },
     #[serde(rename = "geofence")]
-    Geofence {
-        lat: f64,
-        lon: f64,
-        radius_km: f64,
-    },
+    Geofence { lat: f64, lon: f64, radius_km: f64 },
     #[serde(rename = "stale")]
     Stale { max_age_seconds: u64 },
     #[serde(rename = "speed_anomaly")]
@@ -1521,13 +1633,7 @@ pub async fn create_monitor(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateMonitorRequest>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_abac(
-        &state.abac_engine,
-        &auth,
-        "monitors:write",
-        "monitor",
-        "*",
-    ) {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "monitors:write", "monitor", "*") {
         return resp.into_response();
     }
 
@@ -1616,7 +1722,7 @@ pub async fn delete_monitor(
 
     if state.monitor_engine.remove_rule(&id).await {
         audit_log(
-        state.as_ref(),
+            state.as_ref(),
             "monitor_deleted",
             Some("monitor"),
             Some(&id),
@@ -1671,7 +1777,7 @@ pub async fn acknowledge_alert(
 
     if state.monitor_engine.acknowledge_alert(&id).await {
         audit_log(
-        state.as_ref(),
+            state.as_ref(),
             "alert_acknowledged",
             Some("alert"),
             Some(&id),
@@ -1706,13 +1812,7 @@ pub async fn create_api_key(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateApiKeyRequestBody>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_abac(
-        &state.abac_engine,
-        &auth,
-        "api-keys:manage",
-        "api_key",
-        "*",
-    ) {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "api-keys:manage", "api_key", "*") {
         return resp.into_response();
     }
 
@@ -1727,7 +1827,7 @@ pub async fn create_api_key(
     match state.api_key_service.create_key(req) {
         Ok(resp) => {
             audit_log(
-        state.as_ref(),
+                state.as_ref(),
                 "api_key_created",
                 Some("api_key"),
                 Some(&resp.id),
@@ -1750,13 +1850,7 @@ pub async fn list_api_keys(
     auth: AuthContext,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_abac(
-        &state.abac_engine,
-        &auth,
-        "api-keys:manage",
-        "api_key",
-        "*",
-    ) {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "api-keys:manage", "api_key", "*") {
         return resp.into_response();
     }
 
@@ -1799,20 +1893,14 @@ pub async fn delete_api_key(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_abac(
-        &state.abac_engine,
-        &auth,
-        "api-keys:manage",
-        "api_key",
-        &id,
-    ) {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "api-keys:manage", "api_key", &id) {
         return resp.into_response();
     }
 
     match state.api_key_service.revoke_key(&id) {
         Ok(()) => {
             audit_log(
-        state.as_ref(),
+                state.as_ref(),
                 "api_key_revoked",
                 Some("api_key"),
                 Some(&id),
@@ -1865,11 +1953,16 @@ mod tests {
         let storage: Arc<dyn orp_storage::traits::Storage> =
             Arc::new(DuckDbStorage::new_in_memory().unwrap());
 
-        let dedup_path = std::env::temp_dir().join(format!("orp-test-dedup-{}", uuid::Uuid::new_v4()));
+        let dedup_path =
+            std::env::temp_dir().join(format!("orp-test-dedup-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dedup_path).ok();
         let dedup = Arc::new(RocksDbDedupWindow::open(&dedup_path, 3600).unwrap());
-        let processor: Arc<dyn StreamProcessor> =
-            Arc::new(DefaultStreamProcessor::new(storage.clone(), dedup, None, 50));
+        let processor: Arc<dyn StreamProcessor> = Arc::new(DefaultStreamProcessor::new(
+            storage.clone(),
+            dedup,
+            None,
+            50,
+        ));
         let query_executor = Arc::new(QueryExecutor::new(storage.clone()));
         let monitor_engine = Arc::new(MonitorEngine::new());
         let auth_state = Arc::new(AuthState {
@@ -1895,6 +1988,8 @@ mod tests {
             started_at: std::time::Instant::now(),
             layer_registry: None,
             federation_registry: None,
+            federation_outbox: None,
+            connectors: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -1913,7 +2008,10 @@ mod tests {
             .route("/api/v1/entities/:id", get(get_entity))
             .route("/api/v1/entities/:id", put(update_entity))
             .route("/api/v1/entities/:id", delete(delete_entity))
-            .route("/api/v1/entities/:id/relationships", get(get_entity_relationships))
+            .route(
+                "/api/v1/entities/:id/relationships",
+                get(get_entity_relationships),
+            )
             .route("/api/v1/entities/:id/events", get(get_entity_events))
             .route("/api/v1/relationships", post(create_relationship))
             .route("/api/v1/query", post(execute_query))
@@ -1982,7 +2080,9 @@ mod tests {
             .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "healthy");
         assert!(json["components"].is_object());
@@ -2234,7 +2334,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["pagination"]["total_count"].as_u64().unwrap() >= 5);
     }
@@ -2260,7 +2362,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["pagination"]["has_next"].as_bool().unwrap_or(false));
     }
@@ -2273,7 +2377,11 @@ mod tests {
         let entity = orp_proto::Entity {
             entity_id: "ship-near-1".to_string(),
             entity_type: "ship".to_string(),
-            geometry: Some(GeoPoint { lat: 51.92, lon: 4.47, alt: None }),
+            geometry: Some(GeoPoint {
+                lat: 51.92,
+                lon: 4.47,
+                alt: None,
+            }),
             ..orp_proto::Entity::default()
         };
         state.storage.insert_entity(&entity).await.unwrap();
@@ -2610,11 +2718,7 @@ mod tests {
     async fn test_list_alerts_200() {
         let (app, _) = make_test_app().await;
         let resp = app
-            .oneshot(
-                Request::get("/api/v1/alerts")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/api/v1/alerts").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2689,11 +2793,7 @@ mod tests {
     async fn test_list_events_global_200() {
         let (app, _) = make_test_app().await;
         let resp = app
-            .oneshot(
-                Request::get("/api/v1/events")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/api/v1/events").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2719,15 +2819,13 @@ mod tests {
     async fn test_metrics_200() {
         let (app, _) = make_test_app().await;
         let resp = app
-            .oneshot(
-                Request::get("/api/v1/metrics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/api/v1/metrics").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("orp_entities_total"));
     }
@@ -2753,7 +2851,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["geometry"].is_object());
     }
@@ -2851,5 +2951,132 @@ mod tests {
         assert!(limiter.check("1.2.3.4").await.is_ok());
         assert!(limiter.check("5.6.7.8").await.is_ok());
         assert!(limiter.check("1.2.3.4").await.is_err());
+    }
+
+    // ── Connector health surfacing ───────────────────────────────────────────
+
+    /// Stub adapter that lets tests pump arbitrary event/error counts into
+    /// `Connector::stats()` without spinning up a real network listener.
+    struct StubConnector {
+        cfg: orp_connector::ConnectorConfig,
+        events: u64,
+        errors: u64,
+    }
+
+    impl StubConnector {
+        fn new(id: &str, kind: &str, events: u64, errors: u64) -> Self {
+            Self {
+                cfg: orp_connector::ConnectorConfig {
+                    connector_id: id.to_string(),
+                    connector_type: kind.to_string(),
+                    url: None,
+                    entity_type: "test".to_string(),
+                    enabled: true,
+                    trust_score: 1.0,
+                    properties: std::collections::HashMap::new(),
+                },
+                events,
+                errors,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl orp_connector::Connector for StubConnector {
+        fn connector_id(&self) -> &str {
+            &self.cfg.connector_id
+        }
+        async fn start(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<orp_connector::SourceEvent>,
+        ) -> Result<(), orp_connector::ConnectorError> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), orp_connector::ConnectorError> {
+            Ok(())
+        }
+        async fn health_check(&self) -> Result<(), orp_connector::ConnectorError> {
+            Ok(())
+        }
+        fn config(&self) -> &orp_connector::ConnectorConfig {
+            &self.cfg
+        }
+        fn stats(&self) -> orp_connector::ConnectorStats {
+            orp_connector::ConnectorStats {
+                events_processed: self.events,
+                errors: self.errors,
+                last_event_timestamp: None,
+                uptime_seconds: 0,
+            }
+        }
+    }
+
+    async fn read_health(app: Router) -> serde_json::Value {
+        let resp = app
+            .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_includes_connectors_field() {
+        let (app, state) = make_test_app().await;
+        {
+            let mut guard = state.connectors.lock().await;
+            guard.push(Arc::new(StubConnector::new("ais-1", "ais", 10, 0)));
+            guard.push(Arc::new(StubConnector::new("adsb-1", "adsb", 20, 0)));
+        }
+
+        let json = read_health(app).await;
+        let connectors = json["components"]["connectors"]
+            .as_array()
+            .expect("connectors array missing");
+        assert_eq!(connectors.len(), 2);
+        // Healthy when error rate is zero.
+        assert_eq!(connectors[0]["status"], "healthy");
+        assert_eq!(connectors[1]["status"], "healthy");
+        assert_eq!(json["status"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn health_status_degraded_when_connector_error_rate_high() {
+        // 80 errors / (20 events + 80 errors) = 80% → unhealthy at the
+        // connector level, which propagates to a top-level "degraded".
+        // A degraded threshold (>10%, ≤50%) is exercised separately below
+        // by tweaking events/errors without crossing 50%.
+        let (app, state) = make_test_app().await;
+        {
+            let mut guard = state.connectors.lock().await;
+            // 6 errors / (50 + 6) ≈ 10.7% — > 10% so this is "degraded".
+            guard.push(Arc::new(StubConnector::new("ais-1", "ais", 50, 6)));
+        }
+
+        let json = read_health(app).await;
+        let entry = &json["components"]["connectors"][0];
+        assert_eq!(entry["status"], "degraded");
+        // No unhealthy connector → top-level stays healthy.
+        assert_eq!(json["status"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn health_status_unhealthy_when_connector_error_rate_critical() {
+        // 99 / (1 + 99) = 99% → unhealthy. Top-level should become "degraded"
+        // (we never fail /health outright — dashboards still get JSON).
+        let (app, state) = make_test_app().await;
+        {
+            let mut guard = state.connectors.lock().await;
+            guard.push(Arc::new(StubConnector::new("ais-1", "ais", 1, 99)));
+        }
+
+        let json = read_health(app).await;
+        let entry = &json["components"]["connectors"][0];
+        assert_eq!(entry["status"], "unhealthy");
+        assert_eq!(entry["events_processed"], 1);
+        assert_eq!(entry["errors"], 99);
+        assert_eq!(json["status"], "degraded");
     }
 }

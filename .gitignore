@@ -4,3 +4,4 @@
 *.db
 Cargo.lock
 .DS_Store
+.claude/

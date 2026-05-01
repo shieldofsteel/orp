@@ -194,11 +194,11 @@ impl Dnp3LinkHeader {
 /// DNP3 application control byte.
 #[derive(Clone, Debug)]
 pub struct Dnp3AppControl {
-    pub fir: bool,  // first fragment
-    pub fin: bool,  // final fragment
-    pub con: bool,  // confirmation required
-    pub uns: bool,  // unsolicited
-    pub seq: u8,    // sequence number (0–15)
+    pub fir: bool, // first fragment
+    pub fin: bool, // final fragment
+    pub con: bool, // confirmation required
+    pub uns: bool, // unsolicited
+    pub seq: u8,   // sequence number (0–15)
 }
 
 /// DNP3 data object header.
@@ -233,45 +233,91 @@ impl Dnp3ObjectHeader {
 /// Parsed DNP3 data object value.
 #[derive(Clone, Debug)]
 pub enum Dnp3DataValue {
-    BinaryInput { index: u16, value: bool, flags: u8 },
-    BinaryOutput { index: u16, value: bool, flags: u8 },
-    Counter { index: u16, value: u32, flags: u8 },
-    AnalogInput { index: u16, value: f64, flags: u8 },
-    AnalogOutput { index: u16, value: f64, flags: u8 },
-    TimeAndDate { timestamp_ms: u64 },
-    Raw { group: u8, variation: u8, data: Vec<u8> },
+    BinaryInput {
+        index: u16,
+        value: bool,
+        flags: u8,
+    },
+    BinaryOutput {
+        index: u16,
+        value: bool,
+        flags: u8,
+    },
+    Counter {
+        index: u16,
+        value: u32,
+        flags: u8,
+    },
+    AnalogInput {
+        index: u16,
+        value: f64,
+        flags: u8,
+    },
+    AnalogOutput {
+        index: u16,
+        value: f64,
+        flags: u8,
+    },
+    TimeAndDate {
+        timestamp_ms: u64,
+    },
+    Raw {
+        group: u8,
+        variation: u8,
+        data: Vec<u8>,
+    },
 }
 
 impl Dnp3DataValue {
     pub fn to_json(&self) -> JsonValue {
         match self {
-            Dnp3DataValue::BinaryInput { index, value, flags } => json!({
+            Dnp3DataValue::BinaryInput {
+                index,
+                value,
+                flags,
+            } => json!({
                 "type": "binary_input",
                 "index": index,
                 "value": value,
                 "flags": flags,
                 "online": flags & 0x01 != 0,
             }),
-            Dnp3DataValue::BinaryOutput { index, value, flags } => json!({
+            Dnp3DataValue::BinaryOutput {
+                index,
+                value,
+                flags,
+            } => json!({
                 "type": "binary_output",
                 "index": index,
                 "value": value,
                 "flags": flags,
             }),
-            Dnp3DataValue::Counter { index, value, flags } => json!({
+            Dnp3DataValue::Counter {
+                index,
+                value,
+                flags,
+            } => json!({
                 "type": "counter",
                 "index": index,
                 "value": value,
                 "flags": flags,
             }),
-            Dnp3DataValue::AnalogInput { index, value, flags } => json!({
+            Dnp3DataValue::AnalogInput {
+                index,
+                value,
+                flags,
+            } => json!({
                 "type": "analog_input",
                 "index": index,
                 "value": value,
                 "flags": flags,
                 "online": flags & 0x01 != 0,
             }),
-            Dnp3DataValue::AnalogOutput { index, value, flags } => json!({
+            Dnp3DataValue::AnalogOutput {
+                index,
+                value,
+                flags,
+            } => json!({
                 "type": "analog_output",
                 "index": index,
                 "value": value,
@@ -281,7 +327,11 @@ impl Dnp3DataValue {
                 "type": "time_and_date",
                 "timestamp_ms": timestamp_ms,
             }),
-            Dnp3DataValue::Raw { group, variation, data } => {
+            Dnp3DataValue::Raw {
+                group,
+                variation,
+                data,
+            } => {
                 let hex: String = data.iter().map(|b| format!("{:02X}", b)).collect();
                 json!({
                     "type": "raw",
@@ -401,7 +451,9 @@ pub fn parse_app_control(byte: u8) -> Dnp3AppControl {
 }
 
 /// Parse application layer data from reassembled transport payload.
-pub fn parse_dnp3_application(data: &[u8]) -> Result<(Dnp3AppControl, Dnp3Function, Vec<Dnp3DataValue>), ConnectorError> {
+pub fn parse_dnp3_application(
+    data: &[u8],
+) -> Result<(Dnp3AppControl, Dnp3Function, Vec<Dnp3DataValue>), ConnectorError> {
     if data.len() < 2 {
         return Err(ConnectorError::ParseError(
             "DNP3: application data too short".into(),
@@ -555,7 +607,9 @@ pub fn parse_dnp3_application(data: &[u8]) -> Result<(Dnp3AppControl, Dnp3Functi
                         let mut bytes = [0u8; 8];
                         bytes[0..6].copy_from_slice(&data[offset..offset + 6]);
                         let ts_ms = u64::from_le_bytes(bytes);
-                        objects.push(Dnp3DataValue::TimeAndDate { timestamp_ms: ts_ms });
+                        objects.push(Dnp3DataValue::TimeAndDate {
+                            timestamp_ms: ts_ms,
+                        });
                         offset += 6;
                     }
                 }
@@ -583,10 +637,7 @@ pub fn parse_dnp3_application(data: &[u8]) -> Result<(Dnp3AppControl, Dnp3Functi
 // ---------------------------------------------------------------------------
 
 /// Convert DNP3 data values from a frame into SourceEvents.
-pub fn dnp3_frame_to_events(
-    frame: &Dnp3Frame,
-    connector_id: &str,
-) -> Vec<SourceEvent> {
+pub fn dnp3_frame_to_events(frame: &Dnp3Frame, connector_id: &str) -> Vec<SourceEvent> {
     let src = frame.link_header.source;
     let dst = frame.link_header.destination;
     let function_name = frame
@@ -600,7 +651,11 @@ pub fn dnp3_frame_to_events(
         .iter()
         .map(|obj| {
             let (entity_id, properties) = match obj {
-                Dnp3DataValue::BinaryInput { index, value, flags } => {
+                Dnp3DataValue::BinaryInput {
+                    index,
+                    value,
+                    flags,
+                } => {
                     let id = format!("dnp3:{}:bi:{}", src, index);
                     let mut props = HashMap::new();
                     props.insert("point_type".into(), json!("binary_input"));
@@ -610,7 +665,11 @@ pub fn dnp3_frame_to_events(
                     props.insert("online".into(), json!(flags & 0x01 != 0));
                     (id, props)
                 }
-                Dnp3DataValue::BinaryOutput { index, value, flags } => {
+                Dnp3DataValue::BinaryOutput {
+                    index,
+                    value,
+                    flags,
+                } => {
                     let id = format!("dnp3:{}:bo:{}", src, index);
                     let mut props = HashMap::new();
                     props.insert("point_type".into(), json!("binary_output"));
@@ -619,7 +678,11 @@ pub fn dnp3_frame_to_events(
                     props.insert("flags".into(), json!(flags));
                     (id, props)
                 }
-                Dnp3DataValue::Counter { index, value, flags } => {
+                Dnp3DataValue::Counter {
+                    index,
+                    value,
+                    flags,
+                } => {
                     let id = format!("dnp3:{}:counter:{}", src, index);
                     let mut props = HashMap::new();
                     props.insert("point_type".into(), json!("counter"));
@@ -628,7 +691,11 @@ pub fn dnp3_frame_to_events(
                     props.insert("flags".into(), json!(flags));
                     (id, props)
                 }
-                Dnp3DataValue::AnalogInput { index, value, flags } => {
+                Dnp3DataValue::AnalogInput {
+                    index,
+                    value,
+                    flags,
+                } => {
                     let id = format!("dnp3:{}:ai:{}", src, index);
                     let mut props = HashMap::new();
                     props.insert("point_type".into(), json!("analog_input"));
@@ -638,7 +705,11 @@ pub fn dnp3_frame_to_events(
                     props.insert("online".into(), json!(flags & 0x01 != 0));
                     (id, props)
                 }
-                Dnp3DataValue::AnalogOutput { index, value, flags } => {
+                Dnp3DataValue::AnalogOutput {
+                    index,
+                    value,
+                    flags,
+                } => {
                     let id = format!("dnp3:{}:ao:{}", src, index);
                     let mut props = HashMap::new();
                     props.insert("point_type".into(), json!("analog_output"));
@@ -654,7 +725,11 @@ pub fn dnp3_frame_to_events(
                     props.insert("timestamp_ms".into(), json!(timestamp_ms));
                     (id, props)
                 }
-                Dnp3DataValue::Raw { group, variation, data } => {
+                Dnp3DataValue::Raw {
+                    group,
+                    variation,
+                    data,
+                } => {
                     let id = format!("dnp3:{}:raw:g{}v{}", src, group, variation);
                     let hex: String = data.iter().map(|b| format!("{:02X}", b)).collect();
                     let mut props = HashMap::new();
@@ -688,9 +763,8 @@ pub fn dnp3_frame_to_events(
 /// Expected format: {"source": 10, "destination": 1, "function": "Response",
 ///   "objects": [{"type": "analog_input", "index": 0, "value": 42.5, "flags": 1}, ...]}
 pub fn parse_dnp3_json(data: &str) -> Result<Vec<Dnp3DataValue>, ConnectorError> {
-    let value: JsonValue = serde_json::from_str(data).map_err(|e| {
-        ConnectorError::ParseError(format!("DNP3: invalid JSON: {}", e))
-    })?;
+    let value: JsonValue = serde_json::from_str(data)
+        .map_err(|e| ConnectorError::ParseError(format!("DNP3: invalid JSON: {}", e)))?;
 
     let objects = value
         .get("objects")
@@ -706,30 +780,47 @@ pub fn parse_dnp3_json(data: &str) -> Result<Vec<Dnp3DataValue>, ConnectorError>
         match obj_type {
             "binary_input" => {
                 let value = obj.get("value").and_then(|v| v.as_bool()).unwrap_or(false);
-                result.push(Dnp3DataValue::BinaryInput { index, value, flags });
+                result.push(Dnp3DataValue::BinaryInput {
+                    index,
+                    value,
+                    flags,
+                });
             }
             "binary_output" => {
                 let value = obj.get("value").and_then(|v| v.as_bool()).unwrap_or(false);
-                result.push(Dnp3DataValue::BinaryOutput { index, value, flags });
+                result.push(Dnp3DataValue::BinaryOutput {
+                    index,
+                    value,
+                    flags,
+                });
             }
             "counter" => {
                 let value = obj.get("value").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                result.push(Dnp3DataValue::Counter { index, value, flags });
+                result.push(Dnp3DataValue::Counter {
+                    index,
+                    value,
+                    flags,
+                });
             }
             "analog_input" => {
                 let value = obj.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                result.push(Dnp3DataValue::AnalogInput { index, value, flags });
+                result.push(Dnp3DataValue::AnalogInput {
+                    index,
+                    value,
+                    flags,
+                });
             }
             "analog_output" => {
                 let value = obj.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                result.push(Dnp3DataValue::AnalogOutput { index, value, flags });
+                result.push(Dnp3DataValue::AnalogOutput {
+                    index,
+                    value,
+                    flags,
+                });
             }
             _ => {
                 // Store as raw
-                let data_hex = obj
-                    .get("data_hex")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let data_hex = obj.get("data_hex").and_then(|v| v.as_str()).unwrap_or("");
                 let bytes: Vec<u8> = (0..data_hex.len())
                     .step_by(2)
                     .filter_map(|i| {
@@ -742,10 +833,7 @@ pub fn parse_dnp3_json(data: &str) -> Result<Vec<Dnp3DataValue>, ConnectorError>
                     .collect();
                 result.push(Dnp3DataValue::Raw {
                     group: obj.get("group").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
-                    variation: obj
-                        .get("variation")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u8,
+                    variation: obj.get("variation").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
                     data: bytes,
                 });
             }
@@ -787,13 +875,9 @@ impl Connector for Dnp3Connector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                ConnectorError::ConfigError("DNP3: url (file path or endpoint) required".into())
-            })?;
+        let path = self.config.url.as_deref().ok_or_else(|| {
+            ConnectorError::ConfigError("DNP3: url (file path or endpoint) required".into())
+        })?;
 
         let content = tokio::fs::read_to_string(path)
             .await
@@ -939,7 +1023,10 @@ mod tests {
     fn test_function_codes() {
         assert_eq!(Dnp3Function::from_code(0x01), Dnp3Function::Read);
         assert_eq!(Dnp3Function::from_code(0x81), Dnp3Function::Response);
-        assert_eq!(Dnp3Function::from_code(0x82), Dnp3Function::UnsolicitedResponse);
+        assert_eq!(
+            Dnp3Function::from_code(0x82),
+            Dnp3Function::UnsolicitedResponse
+        );
         assert_eq!(Dnp3Function::Read.as_str(), "Read");
         assert_eq!(Dnp3Function::Response.code(), 0x81);
     }
@@ -956,9 +1043,17 @@ mod tests {
 
     #[test]
     fn test_object_header_names() {
-        let hdr = Dnp3ObjectHeader { group: 30, variation: 1, qualifier: 0 };
+        let hdr = Dnp3ObjectHeader {
+            group: 30,
+            variation: 1,
+            qualifier: 0,
+        };
         assert_eq!(hdr.group_name(), "Analog Input");
-        let hdr2 = Dnp3ObjectHeader { group: 1, variation: 2, qualifier: 0 };
+        let hdr2 = Dnp3ObjectHeader {
+            group: 1,
+            variation: 2,
+            qualifier: 0,
+        };
         assert_eq!(hdr2.group_name(), "Binary Input");
     }
 
@@ -971,7 +1066,12 @@ mod tests {
             ]}"#;
         let values = parse_dnp3_json(json).unwrap();
         assert_eq!(values.len(), 2);
-        if let Dnp3DataValue::AnalogInput { index, value, flags } = &values[0] {
+        if let Dnp3DataValue::AnalogInput {
+            index,
+            value,
+            flags,
+        } = &values[0]
+        {
             assert_eq!(*index, 0);
             assert!((value - 42.5).abs() < 0.01);
             assert_eq!(*flags, 1);
@@ -1020,8 +1120,16 @@ mod tests {
             app_control: Some(parse_app_control(0xC0)),
             function: Some(Dnp3Function::Response),
             objects: vec![
-                Dnp3DataValue::AnalogInput { index: 0, value: 100.5, flags: 1 },
-                Dnp3DataValue::BinaryInput { index: 0, value: true, flags: 1 },
+                Dnp3DataValue::AnalogInput {
+                    index: 0,
+                    value: 100.5,
+                    flags: 1,
+                },
+                Dnp3DataValue::BinaryInput {
+                    index: 0,
+                    value: true,
+                    flags: 1,
+                },
             ],
         };
         let events = dnp3_frame_to_events(&frame, "dnp3-test");
@@ -1034,7 +1142,11 @@ mod tests {
 
     #[test]
     fn test_data_value_to_json() {
-        let ai = Dnp3DataValue::AnalogInput { index: 5, value: 42.0, flags: 1 };
+        let ai = Dnp3DataValue::AnalogInput {
+            index: 5,
+            value: 42.0,
+            flags: 1,
+        };
         let j = ai.to_json();
         assert_eq!(j["type"], json!("analog_input"));
         assert_eq!(j["index"], json!(5));

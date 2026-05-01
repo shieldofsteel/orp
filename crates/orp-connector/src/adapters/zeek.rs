@@ -163,7 +163,7 @@ fn parse_zeek_separator(s: &str) -> char {
     s.chars().next().unwrap_or('\t')
 }
 
-/// Parse a Zeek epoch timestamp string to DateTime<Utc>.
+/// Parse a Zeek epoch timestamp string to `DateTime<Utc>`.
 pub fn parse_zeek_timestamp(ts_str: &str) -> Option<DateTime<Utc>> {
     // Zeek timestamps are epoch floats: "1700000000.123456"
     let f: f64 = ts_str.parse().ok()?;
@@ -173,10 +173,7 @@ pub fn parse_zeek_timestamp(ts_str: &str) -> Option<DateTime<Utc>> {
 }
 
 /// Parse a single TSV data line into a ZeekRecord.
-pub fn parse_zeek_tsv_line(
-    line: &str,
-    header: &ZeekTsvHeader,
-) -> Option<ZeekRecord> {
+pub fn parse_zeek_tsv_line(line: &str, header: &ZeekTsvHeader) -> Option<ZeekRecord> {
     if line.starts_with('#') {
         return None;
     }
@@ -219,20 +216,29 @@ pub fn parse_zeek_tsv_line(
 /// Convert a Zeek field value to JSON based on the Zeek type.
 fn zeek_field_to_json(raw: &str, zeek_type: &str, set_separator: &str) -> JsonValue {
     match zeek_type {
-        "count" | "int" => raw.parse::<i64>().map(JsonValue::from).unwrap_or(json!(raw)),
-        "double" => raw.parse::<f64>().map(JsonValue::from).unwrap_or(json!(raw)),
+        "count" | "int" => raw
+            .parse::<i64>()
+            .map(JsonValue::from)
+            .unwrap_or(json!(raw)),
+        "double" => raw
+            .parse::<f64>()
+            .map(JsonValue::from)
+            .unwrap_or(json!(raw)),
         "bool" => match raw {
             "T" => json!(true),
             "F" => json!(false),
             _ => json!(raw),
         },
-        "port" => raw.parse::<u16>().map(JsonValue::from).unwrap_or(json!(raw)),
-        "time" | "interval" => raw.parse::<f64>().map(JsonValue::from).unwrap_or(json!(raw)),
+        "port" => raw
+            .parse::<u16>()
+            .map(JsonValue::from)
+            .unwrap_or(json!(raw)),
+        "time" | "interval" => raw
+            .parse::<f64>()
+            .map(JsonValue::from)
+            .unwrap_or(json!(raw)),
         t if t.starts_with("set[") || t.starts_with("vector[") => {
-            let items: Vec<JsonValue> = raw
-                .split(set_separator)
-                .map(|s| json!(s))
-                .collect();
+            let items: Vec<JsonValue> = raw.split(set_separator).map(|s| json!(s)).collect();
             json!(items)
         }
         _ => json!(raw),
@@ -244,7 +250,11 @@ pub fn parse_zeek_tsv(content: &str) -> Result<Vec<ZeekRecord>, ConnectorError> 
     let lines: Vec<&str> = content.lines().collect();
 
     // Collect header lines
-    let header_lines: Vec<&str> = lines.iter().filter(|l| l.starts_with('#')).copied().collect();
+    let header_lines: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.starts_with('#'))
+        .copied()
+        .collect();
     if header_lines.is_empty() {
         return Err(ConnectorError::ParseError(
             "Zeek TSV: no header lines found".into(),
@@ -274,14 +284,11 @@ pub fn parse_zeek_tsv(content: &str) -> Result<Vec<ZeekRecord>, ConnectorError> 
 pub fn parse_zeek_json_line(line: &str, log_type: &ZeekLogType) -> Option<ZeekRecord> {
     let obj: HashMap<String, JsonValue> = serde_json::from_str(line).ok()?;
 
-    let timestamp = obj
-        .get("ts")
-        .and_then(|v| v.as_f64())
-        .and_then(|f| {
-            let secs = f.trunc() as i64;
-            let nanos = ((f.fract()) * 1_000_000_000.0) as u32;
-            DateTime::from_timestamp(secs, nanos)
-        });
+    let timestamp = obj.get("ts").and_then(|v| v.as_f64()).and_then(|f| {
+        let secs = f.trunc() as i64;
+        let nanos = ((f.fract()) * 1_000_000_000.0) as u32;
+        DateTime::from_timestamp(secs, nanos)
+    });
 
     Some(ZeekRecord {
         log_type: log_type.clone(),
@@ -304,10 +311,7 @@ pub fn parse_zeek_json(content: &str, log_type: &ZeekLogType) -> Vec<ZeekRecord>
 // ---------------------------------------------------------------------------
 
 /// Convert a ZeekRecord into a SourceEvent.
-pub fn zeek_record_to_source_event(
-    record: &ZeekRecord,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn zeek_record_to_source_event(record: &ZeekRecord, connector_id: &str) -> SourceEvent {
     let entity_id = build_entity_id(record);
 
     let mut properties = record.fields.clone();
@@ -379,11 +383,8 @@ impl Connector for ZeekConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
+        let path =
+            self.config.url.as_deref().ok_or_else(|| {
                 ConnectorError::ConfigError("Zeek: url (file path) required".into())
             })?;
 
@@ -552,7 +553,10 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].log_type, ZeekLogType::Ssl);
         assert_eq!(records[0].fields["version"], json!("TLSv13"));
-        assert_eq!(records[0].fields["server_name"], json!("secure.example.com"));
+        assert_eq!(
+            records[0].fields["server_name"],
+            json!("secure.example.com")
+        );
         assert_eq!(records[0].fields["established"], json!(true));
     }
 
@@ -593,7 +597,10 @@ mod tests {
 
     #[test]
     fn test_zeek_log_type_from_path() {
-        assert_eq!(ZeekLogType::from_path("/var/log/zeek/conn.log"), ZeekLogType::Conn);
+        assert_eq!(
+            ZeekLogType::from_path("/var/log/zeek/conn.log"),
+            ZeekLogType::Conn
+        );
         assert_eq!(ZeekLogType::from_path("dns.log"), ZeekLogType::Dns);
         assert_eq!(ZeekLogType::from_path("http"), ZeekLogType::Http);
         assert_eq!(ZeekLogType::from_path("ssl.log"), ZeekLogType::Ssl);

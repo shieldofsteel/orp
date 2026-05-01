@@ -114,8 +114,7 @@ pub fn parse_syslog(raw: &str) -> SyslogMessage {
 
     // Try RFC 5424: next token is VERSION (single digit)
     let (timestamp, hostname, app_name, proc_id, msg_id, message, structured_data) =
-        if rest.starts_with(|c: char| c.is_ascii_digit()) && rest.len() > 2 && &rest[1..2] == " "
-        {
+        if rest.starts_with(|c: char| c.is_ascii_digit()) && rest.len() > 2 && &rest[1..2] == " " {
             parse_rfc5424(rest)
         } else {
             parse_rfc3164(rest)
@@ -162,7 +161,15 @@ fn parse_rfc5424(s: &str) -> SyslogFields {
     // Parse structured data: `[sd_id key="value" ...]`
     let (structured_data, message) = parse_sd(rest);
 
-    (timestamp, hostname, app_name, proc_id, msg_id, message.to_string(), structured_data)
+    (
+        timestamp,
+        hostname,
+        app_name,
+        proc_id,
+        msg_id,
+        message.to_string(),
+        structured_data,
+    )
 }
 
 fn parse_rfc3164(s: &str) -> SyslogFields {
@@ -191,14 +198,26 @@ fn parse_rfc3164(s: &str) -> SyslogFields {
     let hostname = msg_parts.next().map(str::to_string);
     let message = msg_parts.next().unwrap_or(rest).to_string();
 
-    (timestamp, hostname, None, None, None, message, HashMap::new())
+    (
+        timestamp,
+        hostname,
+        None,
+        None,
+        None,
+        message,
+        HashMap::new(),
+    )
 }
 
 /// Parse RFC 5424 structured-data section and return (sd_map, remaining_message).
 fn parse_sd(s: &str) -> (HashMap<String, String>, &str) {
     let mut map = HashMap::new();
     if s.is_empty() || s.starts_with('-') {
-        let msg = if let Some(stripped) = s.strip_prefix("- ") { stripped } else { s.trim_start_matches('-') };
+        let msg = if let Some(stripped) = s.strip_prefix("- ") {
+            stripped
+        } else {
+            s.trim_start_matches('-')
+        };
         return (map, msg);
     }
     if !s.starts_with('[') {
@@ -238,10 +257,7 @@ pub fn parse_cef(line: &str) -> Option<CefMessage> {
 
     let mut parts = cef_part.splitn(8, '|');
     let version_str = parts.next()?; // "CEF:0"
-    let cef_version: u8 = version_str
-        .trim_start_matches("CEF:")
-        .parse()
-        .unwrap_or(0);
+    let cef_version: u8 = version_str.trim_start_matches("CEF:").parse().unwrap_or(0);
 
     let device_vendor = parts.next()?.to_string();
     let device_product = parts.next()?.to_string();
@@ -403,9 +419,18 @@ fn syslog_to_event(
 
     // CEF fields
     if let Some(cef) = cef {
-        properties.insert("cef_vendor".to_string(), serde_json::json!(cef.device_vendor));
-        properties.insert("cef_product".to_string(), serde_json::json!(cef.device_product));
-        properties.insert("cef_signature_id".to_string(), serde_json::json!(cef.signature_id));
+        properties.insert(
+            "cef_vendor".to_string(),
+            serde_json::json!(cef.device_vendor),
+        );
+        properties.insert(
+            "cef_product".to_string(),
+            serde_json::json!(cef.device_product),
+        );
+        properties.insert(
+            "cef_signature_id".to_string(),
+            serde_json::json!(cef.signature_id),
+        );
         properties.insert("cef_name".to_string(), serde_json::json!(cef.name));
         properties.insert("cef_severity".to_string(), serde_json::json!(cef.severity));
         for (k, v) in &cef.extensions {
@@ -564,18 +589,19 @@ impl Connector for SyslogConnector {
             "SyslogConnector starting"
         );
 
-        let addr: SocketAddr = syslog_cfg.bind_addr.parse().map_err(|e| {
-            ConnectorError::ConfigError(format!("Invalid bind address: {e}"))
-        })?;
+        let addr: SocketAddr = syslog_cfg
+            .bind_addr
+            .parse()
+            .map_err(|e| ConnectorError::ConfigError(format!("Invalid bind address: {e}")))?;
 
         // ── UDP listener ──────────────────────────────────────────────────
         if matches!(
             syslog_cfg.transport,
             SyslogTransport::Udp | SyslogTransport::Both
         ) {
-            let socket = UdpSocket::bind(addr).await.map_err(|e| {
-                ConnectorError::ConnectionError(format!("UDP bind failed: {e}"))
-            })?;
+            let socket = UdpSocket::bind(addr)
+                .await
+                .map_err(|e| ConnectorError::ConnectionError(format!("UDP bind failed: {e}")))?;
 
             let tx_udp = tx.clone();
             let running_udp = running.clone();
@@ -621,9 +647,9 @@ impl Connector for SyslogConnector {
                 addr
             };
 
-            let listener = TcpListener::bind(tcp_addr).await.map_err(|e| {
-                ConnectorError::ConnectionError(format!("TCP bind failed: {e}"))
-            })?;
+            let listener = TcpListener::bind(tcp_addr)
+                .await
+                .map_err(|e| ConnectorError::ConnectionError(format!("TCP bind failed: {e}")))?;
 
             let tx_tcp = tx.clone();
             let running_tcp = running.clone();

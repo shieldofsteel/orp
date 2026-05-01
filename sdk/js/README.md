@@ -1,6 +1,6 @@
 # @orp/client
 
-Official JavaScript/TypeScript SDK for **ORP** (Open Relationship Protocol).
+Official JavaScript/TypeScript SDK for **ORP** (Open Reality Protocol).
 
 - ✅ Zero dependencies
 - ✅ TypeScript-first with full type coverage
@@ -384,4 +384,4 @@ npm run build
 
 ## License
 
-MIT
+Apache-2.0 — see [LICENSE](../../LICENSE)

@@ -40,7 +40,11 @@ fn bearing_deg(from: &GeoPoint, to: &GeoPoint) -> f64 {
 /// Angular difference between two headings (0–180°).
 fn heading_diff(a: f64, b: f64) -> f64 {
     let d = (a - b).abs() % 360.0;
-    if d > 180.0 { 360.0 - d } else { d }
+    if d > 180.0 {
+        360.0 - d
+    } else {
+        d
+    }
 }
 
 // ── Entity track ──────────────────────────────────────────────────────────────
@@ -123,7 +127,11 @@ fn project_position(pos: &GeoPoint, speed_knots: f64, course_deg: f64, minutes: 
     let lon1 = pos.lon.to_radians();
     let lat2 = (lat1.sin() * d.cos() + lat1.cos() * d.sin() * brng.cos()).asin();
     let lon2 = lon1 + (brng.sin() * d.sin() * lat1.cos()).atan2(d.cos() - lat1.sin() * lat2.sin());
-    GeoPoint { lat: lat2.to_degrees(), lon: lon2.to_degrees(), alt: pos.alt }
+    GeoPoint {
+        lat: lat2.to_degrees(),
+        lon: lon2.to_degrees(),
+        alt: pos.alt,
+    }
 }
 
 fn km_to_nm(km: f64) -> f64 {
@@ -329,10 +337,7 @@ impl ZoneTracker {
         timestamp: DateTime<Utc>,
     ) -> Vec<ZoneEvent> {
         let mut events = Vec::new();
-        let prev_inside = self
-            .state
-            .entry(entity_id.to_string())
-            .or_default();
+        let prev_inside = self.state.entry(entity_id.to_string()).or_default();
 
         let mut now_inside = std::collections::HashSet::new();
 
@@ -567,10 +572,12 @@ pub fn score_anomaly(
         // Speed anomaly: z-score mapped to 0–100
         // If std is near zero but speed differs, that's maximally anomalous.
         if pattern.std_speed_knots > 0.01 {
-            let z = ((latest.speed_knots - pattern.mean_speed_knots) / pattern.std_speed_knots).abs();
+            let z =
+                ((latest.speed_knots - pattern.mean_speed_knots) / pattern.std_speed_knots).abs();
             factors.speed_anomaly = (z / 3.0 * 100.0).clamp(0.0, 100.0);
         } else if pattern.mean_speed_knots > 0.1 {
-            let pct_diff = ((latest.speed_knots - pattern.mean_speed_knots) / pattern.mean_speed_knots).abs();
+            let pct_diff =
+                ((latest.speed_knots - pattern.mean_speed_knots) / pattern.mean_speed_knots).abs();
             factors.speed_anomaly = (pct_diff * 100.0).clamp(0.0, 100.0);
         }
 
@@ -589,7 +596,10 @@ pub fn score_anomaly(
 
         // Course change anomaly — flag if recent change > 45°
         let alerts = detect_manoeuvres(entity_id, track, 999.0, 45.0, 5);
-        if alerts.iter().any(|a| a.alert_type == ManoeuvreType::CourseChange) {
+        if alerts
+            .iter()
+            .any(|a| a.alert_type == ManoeuvreType::CourseChange)
+        {
             factors.course_anomaly = 20.0;
         }
     }
@@ -693,8 +703,20 @@ pub struct AnalyticsEngine {
 }
 
 impl AnalyticsEngine {
+    /// Default analytics engine.
+    ///
+    /// `track_len` defaults to 50 (down from a previous 500). At 500 the
+    /// engine held ~2.4 GB of in-memory track buffers at 100K entities,
+    /// which broke the Pi-class edge target. Operators that need deeper
+    /// history can opt back in via `with_config` or by setting the env var
+    /// `ORP_TRACK_LEN`.
     pub fn new() -> Self {
-        Self::with_config(500, 30.0, 50.0, 30.0, 0.5, 20.0)
+        let track_len = std::env::var("ORP_TRACK_LEN")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(50);
+        Self::with_config(track_len, 30.0, 50.0, 30.0, 0.5, 20.0)
     }
 
     pub fn with_config(
@@ -778,9 +800,19 @@ impl AnalyticsEngine {
         let pattern = patterns.get(entity_id).unwrap_or(&default_pattern);
 
         let anomaly_score = score_anomaly(entity_id, track, pattern);
-        let manoeuvre_alerts =
-            detect_manoeuvres(entity_id, track, self.speed_threshold_pct, self.course_threshold_deg, 5);
-        let dwell_alert = detect_dwell(entity_id, track, self.dwell_radius_km, self.dwell_threshold_minutes);
+        let manoeuvre_alerts = detect_manoeuvres(
+            entity_id,
+            track,
+            self.speed_threshold_pct,
+            self.course_threshold_deg,
+            5,
+        );
+        let dwell_alert = detect_dwell(
+            entity_id,
+            track,
+            self.dwell_radius_km,
+            self.dwell_threshold_minutes,
+        );
 
         let is_dark = track.last_seen.is_some_and(|ls| {
             (Utc::now() - ls).num_seconds() as f64 / 60.0 >= self.dark_threshold_minutes
@@ -858,7 +890,11 @@ mod tests {
     use chrono::Duration;
 
     fn make_point(lat: f64, lon: f64) -> GeoPoint {
-        GeoPoint { lat, lon, alt: None }
+        GeoPoint {
+            lat,
+            lon,
+            alt: None,
+        }
     }
 
     fn make_track_with_points(entity_id: &str, points: Vec<(f64, f64, f64, f64)>) -> EntityTrack {
@@ -926,7 +962,9 @@ mod tests {
             ],
         );
         let alerts = detect_manoeuvres("vessel1", &track, 50.0, 30.0, 10);
-        assert!(alerts.iter().any(|a| a.alert_type == ManoeuvreType::SpeedChange));
+        assert!(alerts
+            .iter()
+            .any(|a| a.alert_type == ManoeuvreType::SpeedChange));
     }
 
     #[test]
@@ -956,7 +994,9 @@ mod tests {
             ],
         );
         let alerts = detect_manoeuvres("vessel2", &track, 50.0, 30.0, 10);
-        assert!(alerts.iter().any(|a| a.alert_type == ManoeuvreType::CourseChange));
+        assert!(alerts
+            .iter()
+            .any(|a| a.alert_type == ManoeuvreType::CourseChange));
     }
 
     // ── Zone detection ──

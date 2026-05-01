@@ -1,3 +1,9 @@
+// The notification engine module is fully scaffolded but not yet wired into
+// the server router (see server/handlers.rs — `notification_router` is
+// intentionally unused on master). Allow dead_code at the module level so
+// clippy doesn't fight the staged rollout; the wire-up lands in a follow-up.
+#![allow(dead_code)]
+
 //! Multi-channel alert notification engine.
 //!
 //! When a threat or monitor alert fires, this engine fans out notifications to
@@ -48,10 +54,7 @@ pub enum ChannelConfig {
     /// Slack incoming webhook.
     Slack { webhook_url: String },
     /// Telegram Bot API — send_message.
-    Telegram {
-        bot_token: String,
-        chat_id: String,
-    },
+    Telegram { bot_token: String, chat_id: String },
 }
 
 impl ChannelConfig {
@@ -166,16 +169,23 @@ impl NotificationEngine {
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
             audit_log: Arc::new(Mutex::new(NotificationAuditLog::default())),
-            http: Arc::new(reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .build()
-                .expect("Failed to build HTTP client")),
+            http: Arc::new(
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+                    .expect("Failed to build HTTP client"),
+            ),
         }
     }
 
     // ── Channel CRUD ──────────────────────────────────────────────────────────
 
-    pub async fn register_channel(&self, name: String, config: ChannelConfig, enabled: bool) -> NotificationChannel {
+    pub async fn register_channel(
+        &self,
+        name: String,
+        config: ChannelConfig,
+        enabled: bool,
+    ) -> NotificationChannel {
         let ch = NotificationChannel {
             channel_id: Uuid::new_v4().to_string(),
             name,
@@ -183,14 +193,17 @@ impl NotificationEngine {
             enabled,
             created_at: Utc::now(),
         };
-        self.channels.write().await.insert(ch.channel_id.clone(), ch.clone());
+        self.channels
+            .write()
+            .await
+            .insert(ch.channel_id.clone(), ch.clone());
         ch
     }
 
     pub async fn list_channels(&self) -> Vec<NotificationChannel> {
         let map = self.channels.read().await;
         let mut v: Vec<_> = map.values().cloned().collect();
-        v.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        v.sort_by_key(|x| x.created_at);
         v
     }
 
@@ -207,7 +220,10 @@ impl NotificationEngine {
     /// Send `payload` to every enabled channel, retrying each up to 3 times.
     pub async fn fan_out(&self, payload: &AlertPayload) {
         let channels: Vec<NotificationChannel> = {
-            self.channels.read().await.values()
+            self.channels
+                .read()
+                .await
+                .values()
                 .filter(|c| c.enabled)
                 .cloned()
                 .collect()
@@ -277,7 +293,11 @@ impl NotificationEngine {
     }
 
     /// Single send attempt — returns Ok(()) on success, Err(description) on failure.
-    async fn send_once(&self, channel: &NotificationChannel, payload: &AlertPayload) -> Result<(), String> {
+    async fn send_once(
+        &self,
+        channel: &NotificationChannel,
+        payload: &AlertPayload,
+    ) -> Result<(), String> {
         match &channel.config {
             ChannelConfig::Webhook { url, secret } => {
                 self.send_webhook(url, secret.as_deref(), payload).await
@@ -291,14 +311,17 @@ impl NotificationEngine {
                 to_addresses,
             } => {
                 send_email(
-                    smtp_host, *smtp_port, username, password,
-                    from_address, to_addresses, payload,
+                    smtp_host,
+                    *smtp_port,
+                    username,
+                    password,
+                    from_address,
+                    to_addresses,
+                    payload,
                 )
                 .await
             }
-            ChannelConfig::Slack { webhook_url } => {
-                self.send_slack(webhook_url, payload).await
-            }
+            ChannelConfig::Slack { webhook_url } => self.send_slack(webhook_url, payload).await,
             ChannelConfig::Telegram { bot_token, chat_id } => {
                 self.send_telegram(bot_token, chat_id, payload).await
             }
@@ -318,7 +341,10 @@ impl NotificationEngine {
             req = req.header("X-ORP-Secret", s);
         }
         req = req.header("Content-Type", "application/json");
-        let resp = req.send().await.map_err(|e| format!("webhook send error: {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("webhook send error: {e}"))?;
         if resp.status().is_success() {
             Ok(())
         } else {
@@ -353,7 +379,9 @@ impl NotificationEngine {
                 }
             ]
         });
-        let resp = self.http.post(webhook_url)
+        let resp = self
+            .http
+            .post(webhook_url)
             .json(&body)
             .send()
             .await
@@ -393,7 +421,9 @@ impl NotificationEngine {
             "text": text,
             "parse_mode": "Markdown"
         });
-        let resp = self.http.post(&url)
+        let resp = self
+            .http
+            .post(&url)
             .json(&body)
             .send()
             .await
@@ -495,7 +525,9 @@ async fn send_email(
     macro_rules! smtp_read {
         ($label:expr) => {{
             let mut line = String::new();
-            reader.read_line(&mut line).await
+            reader
+                .read_line(&mut line)
+                .await
                 .map_err(|e| format!("SMTP read {}: {e}", $label))?;
             line
         }};
@@ -508,30 +540,44 @@ async fn send_email(
     }
 
     // EHLO
-    writer.write_all(b"EHLO orp-notifications\r\n").await
+    writer
+        .write_all(b"EHLO orp-notifications\r\n")
+        .await
         .map_err(|e| format!("SMTP EHLO write: {e}"))?;
     // Read all EHLO response lines (multi-line: 250-)
     loop {
         let line = smtp_read!("EHLO");
-        if line.starts_with("250 ") || line.starts_with("250\r") || line.starts_with("250\n") { break; }
+        if line.starts_with("250 ") || line.starts_with("250\r") || line.starts_with("250\n") {
+            break;
+        }
         if !line.starts_with("250-") {
             return Err(format!("SMTP EHLO unexpected: {}", line.trim()));
         }
     }
 
     // AUTH LOGIN
-    writer.write_all(b"AUTH LOGIN\r\n").await.map_err(|e| format!("SMTP AUTH write: {e}"))?;
+    writer
+        .write_all(b"AUTH LOGIN\r\n")
+        .await
+        .map_err(|e| format!("SMTP AUTH write: {e}"))?;
     let auth_prompt = smtp_read!("AUTH prompt");
     if !auth_prompt.starts_with("334") {
-        return Err(format!("SMTP AUTH LOGIN not accepted: {}", auth_prompt.trim()));
+        return Err(format!(
+            "SMTP AUTH LOGIN not accepted: {}",
+            auth_prompt.trim()
+        ));
     }
-    writer.write_all(format!("{}\r\n", B64.encode(username)).as_bytes()).await
+    writer
+        .write_all(format!("{}\r\n", B64.encode(username)).as_bytes())
+        .await
         .map_err(|e| format!("SMTP write username: {e}"))?;
     let user_resp = smtp_read!("username resp");
     if !user_resp.starts_with("334") {
         return Err(format!("SMTP username not accepted: {}", user_resp.trim()));
     }
-    writer.write_all(format!("{}\r\n", B64.encode(password)).as_bytes()).await
+    writer
+        .write_all(format!("{}\r\n", B64.encode(password)).as_bytes())
+        .await
         .map_err(|e| format!("SMTP write password: {e}"))?;
     let pass_resp = smtp_read!("password resp");
     if !pass_resp.starts_with("235") {
@@ -539,7 +585,9 @@ async fn send_email(
     }
 
     // MAIL FROM
-    writer.write_all(format!("MAIL FROM:<{}>\r\n", from).as_bytes()).await
+    writer
+        .write_all(format!("MAIL FROM:<{}>\r\n", from).as_bytes())
+        .await
         .map_err(|e| format!("SMTP MAIL FROM write: {e}"))?;
     let mail_resp = smtp_read!("MAIL FROM resp");
     if !mail_resp.starts_with("250") {
@@ -548,21 +596,31 @@ async fn send_email(
 
     // RCPT TO
     for rcpt_addr in to_addresses {
-        writer.write_all(format!("RCPT TO:<{}>\r\n", rcpt_addr).as_bytes()).await
+        writer
+            .write_all(format!("RCPT TO:<{}>\r\n", rcpt_addr).as_bytes())
+            .await
             .map_err(|e| format!("SMTP RCPT TO write: {e}"))?;
         let rcpt_resp = smtp_read!("RCPT TO resp");
         if !rcpt_resp.starts_with("250") && !rcpt_resp.starts_with("251") {
-            return Err(format!("SMTP RCPT TO rejected for {rcpt_addr}: {}", rcpt_resp.trim()));
+            return Err(format!(
+                "SMTP RCPT TO rejected for {rcpt_addr}: {}",
+                rcpt_resp.trim()
+            ));
         }
     }
 
     // DATA
-    writer.write_all(b"DATA\r\n").await.map_err(|e| format!("SMTP DATA cmd: {e}"))?;
+    writer
+        .write_all(b"DATA\r\n")
+        .await
+        .map_err(|e| format!("SMTP DATA cmd: {e}"))?;
     let data_resp = smtp_read!("DATA resp");
     if !data_resp.starts_with("354") {
         return Err(format!("SMTP DATA not accepted: {}", data_resp.trim()));
     }
-    writer.write_all(format!("{}\r\n.\r\n", mime).as_bytes()).await
+    writer
+        .write_all(format!("{}\r\n.\r\n", mime).as_bytes())
+        .await
         .map_err(|e| format!("SMTP DATA write: {e}"))?;
     let sent_resp = smtp_read!("sent resp");
     if !sent_resp.starts_with("250") {
@@ -587,15 +645,16 @@ async fn register_channel(
     State(state): State<NotificationState>,
     Json(req): Json<RegisterChannelRequest>,
 ) -> Result<(StatusCode, Json<NotificationChannel>), (StatusCode, Json<serde_json::Value>)> {
-    let ch = state.engine.register_channel(req.name, req.config, req.enabled).await;
+    let ch = state
+        .engine
+        .register_channel(req.name, req.config, req.enabled)
+        .await;
     info!(channel_id = %ch.channel_id, channel_type = %ch.config.type_label(), "registered notification channel");
     Ok((StatusCode::CREATED, Json(ch)))
 }
 
 /// List `GET /api/v1/notifications/channels`
-async fn list_channels(
-    State(state): State<NotificationState>,
-) -> Json<Vec<NotificationChannel>> {
+async fn list_channels(State(state): State<NotificationState>) -> Json<Vec<NotificationChannel>> {
     Json(state.engine.list_channels().await)
 }
 
@@ -636,8 +695,13 @@ async fn test_channel(
     state.engine.send_with_retry(&channel, &test_payload).await;
 
     let entries = state.engine.audit_entries().await;
-    let last = entries.iter().rev().find(|e| e.channel_id == id && e.alert_id == test_payload.alert_id);
-    let outcome = last.map(|e| e.outcome.clone()).unwrap_or(AttemptOutcome::Failure);
+    let last = entries
+        .iter()
+        .rev()
+        .find(|e| e.channel_id == id && e.alert_id == test_payload.alert_id);
+    let outcome = last
+        .map(|e| e.outcome.clone())
+        .unwrap_or(AttemptOutcome::Failure);
 
     if outcome == AttemptOutcome::Success {
         Ok(Json(serde_json::json!({
@@ -646,7 +710,9 @@ async fn test_channel(
             "alert_id": test_payload.alert_id
         })))
     } else {
-        let err_msg = last.and_then(|e| e.error.as_deref()).unwrap_or("unknown error");
+        let err_msg = last
+            .and_then(|e| e.error.as_deref())
+            .unwrap_or("unknown error");
         Err((
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({
@@ -701,11 +767,16 @@ mod tests {
     #[tokio::test]
     async fn test_register_and_list_channel() {
         let eng = engine();
-        let ch = eng.register_channel(
-            "test-webhook".into(),
-            ChannelConfig::Webhook { url: "http://localhost:9999".into(), secret: None },
-            true,
-        ).await;
+        let ch = eng
+            .register_channel(
+                "test-webhook".into(),
+                ChannelConfig::Webhook {
+                    url: "http://localhost:9999".into(),
+                    secret: None,
+                },
+                true,
+            )
+            .await;
         assert!(!ch.channel_id.is_empty());
         assert_eq!(ch.name, "test-webhook");
 
@@ -717,11 +788,15 @@ mod tests {
     #[tokio::test]
     async fn test_remove_channel_returns_true() {
         let eng = engine();
-        let ch = eng.register_channel(
-            "slack".into(),
-            ChannelConfig::Slack { webhook_url: "https://hooks.slack.com/x".into() },
-            true,
-        ).await;
+        let ch = eng
+            .register_channel(
+                "slack".into(),
+                ChannelConfig::Slack {
+                    webhook_url: "https://hooks.slack.com/x".into(),
+                },
+                true,
+            )
+            .await;
         assert!(eng.remove_channel(&ch.channel_id).await);
         assert!(eng.list_channels().await.is_empty());
     }
@@ -735,11 +810,16 @@ mod tests {
     #[tokio::test]
     async fn test_get_channel() {
         let eng = engine();
-        let ch = eng.register_channel(
-            "tg".into(),
-            ChannelConfig::Telegram { bot_token: "token".into(), chat_id: "123".into() },
-            true,
-        ).await;
+        let ch = eng
+            .register_channel(
+                "tg".into(),
+                ChannelConfig::Telegram {
+                    bot_token: "token".into(),
+                    chat_id: "123".into(),
+                },
+                true,
+            )
+            .await;
         let found = eng.get_channel(&ch.channel_id).await;
         assert!(found.is_some());
         assert_eq!(found.unwrap().channel_id, ch.channel_id);
@@ -759,9 +839,13 @@ mod tests {
         // Register a disabled channel pointing at a non-listening port
         eng.register_channel(
             "disabled-webhook".into(),
-            ChannelConfig::Webhook { url: "http://localhost:19999/nope".into(), secret: None },
+            ChannelConfig::Webhook {
+                url: "http://localhost:19999/nope".into(),
+                secret: None,
+            },
             false,
-        ).await;
+        )
+        .await;
 
         let payload = make_payload("WARNING");
         // fan_out should not attempt to send (no active channel)
@@ -769,20 +853,51 @@ mod tests {
         // Give any spurious spawns a moment
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let entries = eng.audit_entries().await;
-        assert!(entries.is_empty(), "disabled channel should not have been attempted");
+        assert!(
+            entries.is_empty(),
+            "disabled channel should not have been attempted"
+        );
     }
 
     // ── channel type labels ───────────────────────────────────────────────────
 
     #[test]
     fn test_channel_type_labels() {
-        assert_eq!(ChannelConfig::Webhook { url: "x".into(), secret: None }.type_label(), "webhook");
-        assert_eq!(ChannelConfig::Slack { webhook_url: "x".into() }.type_label(), "slack");
-        assert_eq!(ChannelConfig::Telegram { bot_token: "t".into(), chat_id: "c".into() }.type_label(), "telegram");
-        assert_eq!(ChannelConfig::Email {
-            smtp_host: "h".into(), smtp_port: 587, username: "u".into(),
-            password: "p".into(), from_address: "f@e.com".into(), to_addresses: vec![],
-        }.type_label(), "email");
+        assert_eq!(
+            ChannelConfig::Webhook {
+                url: "x".into(),
+                secret: None
+            }
+            .type_label(),
+            "webhook"
+        );
+        assert_eq!(
+            ChannelConfig::Slack {
+                webhook_url: "x".into()
+            }
+            .type_label(),
+            "slack"
+        );
+        assert_eq!(
+            ChannelConfig::Telegram {
+                bot_token: "t".into(),
+                chat_id: "c".into()
+            }
+            .type_label(),
+            "telegram"
+        );
+        assert_eq!(
+            ChannelConfig::Email {
+                smtp_host: "h".into(),
+                smtp_port: 587,
+                username: "u".into(),
+                password: "p".into(),
+                from_address: "f@e.com".into(),
+                to_addresses: vec![],
+            }
+            .type_label(),
+            "email"
+        );
     }
 
     // ── audit log ─────────────────────────────────────────────────────────────
@@ -790,12 +905,17 @@ mod tests {
     #[tokio::test]
     async fn test_audit_log_records_failure() {
         let eng = engine();
-        let ch = eng.register_channel(
-            "bad-webhook".into(),
-            // Port 1 is refused on every OS
-            ChannelConfig::Webhook { url: "http://127.0.0.1:1/bad".into(), secret: None },
-            true,
-        ).await;
+        let ch = eng
+            .register_channel(
+                "bad-webhook".into(),
+                // Port 1 is refused on every OS
+                ChannelConfig::Webhook {
+                    url: "http://127.0.0.1:1/bad".into(),
+                    secret: None,
+                },
+                true,
+            )
+            .await;
         let payload = make_payload("CRITICAL");
         eng.send_with_retry(&ch, &payload).await;
 
@@ -809,11 +929,16 @@ mod tests {
     #[tokio::test]
     async fn test_audit_log_records_channel_type() {
         let eng = engine();
-        let ch = eng.register_channel(
-            "tg-bad".into(),
-            ChannelConfig::Telegram { bot_token: "invalid_token".into(), chat_id: "0".into() },
-            true,
-        ).await;
+        let ch = eng
+            .register_channel(
+                "tg-bad".into(),
+                ChannelConfig::Telegram {
+                    bot_token: "invalid_token".into(),
+                    chat_id: "0".into(),
+                },
+                true,
+            )
+            .await;
         let payload = make_payload("INFO");
         eng.send_with_retry(&ch, &payload).await;
 
@@ -842,7 +967,7 @@ mod tests {
         let (tx, rx) = broadcast::channel::<AlertPayload>(4);
         let handle = eng.spawn_alert_consumer(rx);
         drop(tx); // close the sender
-        // Task should terminate cleanly
+                  // Task should terminate cleanly
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
     }
 
@@ -884,7 +1009,9 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let channels: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert!(channels.is_empty());
     }
@@ -925,7 +1052,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = notification_router(eng).oneshot(req2).await.unwrap();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let channels: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(channels.len(), 1);
         assert_eq!(channels[0]["name"], "slack-prod");

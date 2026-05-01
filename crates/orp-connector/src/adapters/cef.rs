@@ -301,10 +301,7 @@ pub fn parse_cef(line: &str) -> Result<CefMessage, ConnectorError> {
 // ---------------------------------------------------------------------------
 
 /// Convert a CEF message to a SourceEvent.
-pub fn cef_to_source_event(
-    msg: &CefMessage,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn cef_to_source_event(msg: &CefMessage, connector_id: &str) -> SourceEvent {
     let mut properties = HashMap::new();
     properties.insert("cef_version".into(), json!(msg.header.version));
     properties.insert("device_vendor".into(), json!(msg.header.device_vendor));
@@ -313,7 +310,10 @@ pub fn cef_to_source_event(
     properties.insert("signature_id".into(), json!(msg.header.signature_id));
     properties.insert("event_name".into(), json!(msg.header.name));
     properties.insert("severity".into(), json!(msg.header.severity.as_str()));
-    properties.insert("severity_numeric".into(), json!(msg.header.severity.numeric()));
+    properties.insert(
+        "severity_numeric".into(),
+        json!(msg.header.severity.numeric()),
+    );
     properties.insert("severity_raw".into(), json!(msg.header.severity_raw));
 
     // Copy all extensions into properties
@@ -392,11 +392,8 @@ impl Connector for CefConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
+        let path =
+            self.config.url.as_deref().ok_or_else(|| {
                 ConnectorError::ConfigError("CEF: url (file path) required".into())
             })?;
 
@@ -475,7 +472,8 @@ mod tests {
 
     #[test]
     fn test_parse_cef_basic() {
-        let line = "CEF:0|Security|Firewall|1.0|100|Connection blocked|5|src=10.0.0.1 dst=192.168.1.1";
+        let line =
+            "CEF:0|Security|Firewall|1.0|100|Connection blocked|5|src=10.0.0.1 dst=192.168.1.1";
         let msg = parse_cef(line).unwrap();
         assert_eq!(msg.header.version, 0);
         assert_eq!(msg.header.device_vendor, "Security");
@@ -554,7 +552,8 @@ mod tests {
 
     #[test]
     fn test_cef_to_source_event() {
-        let line = "CEF:0|Acme|WAF|2.0|XSS-01|Cross Site Scripting|8|src=10.0.0.1 dst=10.0.0.2 act=Block";
+        let line =
+            "CEF:0|Acme|WAF|2.0|XSS-01|Cross Site Scripting|8|src=10.0.0.1 dst=10.0.0.2 act=Block";
         let msg = parse_cef(line).unwrap();
         let event = cef_to_source_event(&msg, "cef-test");
         assert_eq!(event.entity_type, "security_event");

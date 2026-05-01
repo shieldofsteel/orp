@@ -133,7 +133,9 @@ struct JsonSanctionsFile {
 
 struct SanctionsIndex {
     entries: Vec<SdnEntry>,
-    /// Normalised name → entry indices
+    /// Normalised name → entry indices. Built at load time; reserved for
+    /// the planned fuzzy-name matcher (currently MMSI/IMO lookups only).
+    #[allow(dead_code)]
     name_index: HashMap<String, Vec<usize>>,
     /// MMSI → entry index
     mmsi_index: HashMap<String, usize>,
@@ -233,7 +235,8 @@ impl SanctionsDatabase {
         Ok(db)
     }
 
-    /// Load from JSON format (see [`JsonSanctionsFile`]).
+    /// Load from JSON format (see the private `JsonSanctionsFile` struct
+    /// inside this module for the expected schema).
     pub async fn load_from_json(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mtime = file_mtime(&path);
@@ -335,7 +338,9 @@ impl SanctionsDatabase {
             if let Some(&idx) = index.imo_index.get(&key) {
                 let entry = &index.entries[idx];
                 // Avoid duplicating if already caught by MMSI
-                let already = matches.iter().any(|m| m.sdn_name == entry.name && m.id_match);
+                let already = matches
+                    .iter()
+                    .any(|m| m.sdn_name == entry.name && m.id_match);
                 if !already {
                     matches.push(SanctionsMatch {
                         sdn_name: entry.name.clone(),
@@ -394,11 +399,7 @@ impl SanctionsDatabase {
         }
 
         // Deduplicate: if the same SDN name appears via both ID and fuzzy, keep ID match
-        matches.sort_by(|a, b| {
-            b.id_match
-                .cmp(&a.id_match)
-                .then(b.score.cmp(&a.score))
-        });
+        matches.sort_by(|a, b| b.id_match.cmp(&a.id_match).then(b.score.cmp(&a.score)));
         matches.dedup_by(|a, b| a.sdn_name == b.sdn_name && b.id_match);
 
         if matches.is_empty() {
@@ -447,7 +448,13 @@ fn compute_risk(matches: &[SanctionsMatch]) -> SanctionsRiskLevel {
 /// Normalise a name for comparison: uppercase, collapse whitespace, strip punctuation.
 fn normalise(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == ' ' { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -488,9 +495,7 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
         curr[0] = i;
         for j in 1..=n {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (curr[j - 1] + 1)
-                .min(prev[j] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (curr[j - 1] + 1).min(prev[j] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -539,7 +544,12 @@ fn parse_csv(path: &Path) -> anyhow::Result<Vec<SdnEntry>> {
             continue;
         }
 
-        let get = |idx: usize| fields.get(idx).map(|s| s.trim().trim_matches('"')).unwrap_or("");
+        let get = |idx: usize| {
+            fields
+                .get(idx)
+                .map(|s| s.trim().trim_matches('"'))
+                .unwrap_or("")
+        };
         let split_semi = |s: &str| -> Vec<String> {
             s.split(';')
                 .map(|p| p.trim().to_string())

@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{warn, debug};
+use tracing::{debug, warn};
 
 use crate::error::OrpError;
 
@@ -146,9 +146,8 @@ impl RetryPolicy {
                     sleep(sleep_dur).await;
 
                     // Advance backoff (capped)
-                    let next_secs =
-                        (backoff.as_secs_f64() * self.backoff_multiplier)
-                            .min(self.max_backoff.as_secs_f64());
+                    let next_secs = (backoff.as_secs_f64() * self.backoff_multiplier)
+                        .min(self.max_backoff.as_secs_f64());
                     backoff = Duration::from_secs_f64(next_secs);
                 }
             }

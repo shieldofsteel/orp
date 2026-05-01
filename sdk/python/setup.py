@@ -6,7 +6,8 @@ with open("README.md", encoding="utf-8") as f:
 setup(
     name="orp-client",
     version="0.1.0",
-    description="Python SDK for ORP — Object Relationship Platform",
+    description="Python SDK for ORP — Open Reality Protocol",
+    license="Apache-2.0",
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="Shield of Steel",
@@ -27,7 +28,7 @@ setup(
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
-        "License :: OSI Approved :: MIT License",
+        "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",

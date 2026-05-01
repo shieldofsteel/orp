@@ -16,7 +16,12 @@ use clap_complete::Shell;
 #[command(propagate_version = true)]
 pub struct Cli {
     /// ORP server host (default: localhost:9090). Can also be set via ORP_HOST env var.
-    #[arg(long, global = true, env = "ORP_HOST", default_value = "http://localhost:9090")]
+    #[arg(
+        long,
+        global = true,
+        env = "ORP_HOST",
+        default_value = "http://localhost:9090"
+    )]
     pub host: String,
 
     /// Suppress non-essential output (errors still shown on stderr)
@@ -67,6 +72,13 @@ pub enum Commands {
         /// Equivalent to --dev with ORP_DEV_MODE=true in the environment.
         #[arg(long)]
         no_auth: bool,
+
+        /// Use an in-memory DuckDB instance instead of persisting to disk.
+        /// Default is persistent (the configured `storage.duckdb.path`); pass
+        /// this for tests, demos, or short-lived CI runs where state should
+        /// vanish on shutdown.
+        #[arg(long)]
+        in_memory: bool,
     },
 
     /// Connect a data source in one command
@@ -74,14 +86,16 @@ pub enum Commands {
     /// Protocols: ais://, adsb://, mqtt://, http://, ws://, syslog://
     ///
     /// Examples:
+    /// ```text
     ///   orp connect ais://0.0.0.0:10110
     ///   orp connect adsb://192.168.1.100:30005
     ///   orp connect mqtt://broker.local:1883/sensors/+
     ///   orp connect http://api.example.com/feed
     ///   orp connect ws://stream.example.com/updates
     ///   orp connect syslog://0.0.0.0:514
+    /// ```
     Connect {
-        /// Connection URL in the form <protocol>://<host:port>[/path]
+        /// Connection URL in the form `<protocol>://<host:port>[/path]`
         url: String,
 
         /// Human-readable name for this connector (defaults to the URL)
@@ -538,9 +552,14 @@ impl Severity {
 // ── Validators ───────────────────────────────────────────────────────────────
 
 fn parse_trust_score(s: &str) -> Result<f64, String> {
-    let v: f64 = s.parse().map_err(|_| format!("'{}' is not a valid number", s))?;
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid number", s))?;
     if !(0.0..=1.0).contains(&v) {
-        return Err(format!("trust score must be between 0.0 and 1.0 (got {})", v));
+        return Err(format!(
+            "trust score must be between 0.0 and 1.0 (got {})",
+            v
+        ));
     }
     Ok(v)
 }

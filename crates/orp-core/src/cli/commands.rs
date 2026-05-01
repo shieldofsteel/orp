@@ -2,8 +2,8 @@ use anyhow::Result;
 use colored::Colorize;
 use orp_config::{get_maritime_template, Config};
 use orp_connector::adapters::ais::AisConnector;
-use orp_connector::AisStreamConnector;
 use orp_connector::traits::ConnectorConfig;
+use orp_connector::AisStreamConnector;
 use orp_connector::Connector;
 use orp_proto::{EventPayload, OrpEvent};
 use orp_query::QueryExecutor;
@@ -261,6 +261,7 @@ pub async fn run_start(
     dev: bool,
     headless: bool,
     no_auth: bool,
+    in_memory: bool,
 ) -> Result<()> {
     // --no-auth implies --dev and sets ORP_DEV_MODE
     let dev = dev || no_auth;
@@ -301,12 +302,23 @@ pub async fn run_start(
 
     tracing::info!("Initializing ORP...");
 
-    // Initialize storage
-    tracing::info!("Initializing DuckDB storage...");
-    let storage: Arc<dyn Storage> = Arc::new(
-        DuckDbStorage::new_in_memory()
-            .map_err(|e| anyhow::anyhow!("Storage init failed: {}", e))?,
-    );
+    // Initialize storage. Persistent by default — that's the SQLite-style
+    // promise of "single binary, single file". Pass `--in-memory` for tests
+    // or demos where the state should vanish on shutdown.
+    let storage: Arc<dyn Storage> = if in_memory {
+        tracing::warn!("Initializing DuckDB storage (in-memory). All state is lost on shutdown.");
+        Arc::new(
+            DuckDbStorage::new_in_memory()
+                .map_err(|e| anyhow::anyhow!("Storage init failed: {}", e))?,
+        )
+    } else {
+        let path = &config.storage.duckdb.path;
+        tracing::info!("Initializing DuckDB storage at {}", path);
+        Arc::new(
+            DuckDbStorage::new_with_path(path)
+                .map_err(|e| anyhow::anyhow!("Storage init failed at {}: {}", path, e))?,
+        )
+    };
 
     // Load demo data (ports)
     tracing::info!("Loading demo port data...");
@@ -341,14 +353,13 @@ pub async fn run_start(
     let monitor_engine = Arc::new(MonitorEngine::new());
     for monitor_def in &config.monitors {
         if monitor_def.enabled {
-            let condition =
-                parse_simple_condition(&monitor_def.condition).unwrap_or_else(|| {
-                    MonitorCondition::PropertyThreshold {
-                        property: "speed".to_string(),
-                        operator: ThresholdOp::GreaterThan,
-                        value: 25.0,
-                    }
-                });
+            let condition = parse_simple_condition(&monitor_def.condition).unwrap_or_else(|| {
+                MonitorCondition::PropertyThreshold {
+                    property: "speed".to_string(),
+                    operator: ThresholdOp::GreaterThan,
+                    value: 25.0,
+                }
+            });
 
             monitor_engine
                 .add_rule(MonitorRule {
@@ -419,7 +430,11 @@ pub async fn run_start(
     tokio::spawn(async move {
         tracing::info!("Event processor task started, waiting for events...");
         while let Some(source_event) = rx.recv().await {
-            tracing::debug!("Received event: {} ({})", source_event.entity_id, source_event.entity_type);
+            tracing::debug!(
+                "Received event: {} ({})",
+                source_event.entity_id,
+                source_event.entity_type
+            );
             let event = OrpEvent::new(
                 source_event.entity_id.clone(),
                 source_event.entity_type.clone(),
@@ -511,7 +526,10 @@ pub async fn run_start(
 
     let auth_state: Arc<AuthState> = if is_dev_mode {
         tracing::warn!("⚠️  ORP_DEV_MODE is enabled — authentication is permissive");
-        Arc::new(AuthState::dev())
+        // Refuse to boot if `ORP_DEV_MODE=true` is leaking into a
+        // production-y `ORP_ENV`: the alternative was silently denying
+        // every request with a misleading error.
+        Arc::new(AuthState::dev().map_err(|e| anyhow::anyhow!("auth state init failed: {}", e))?)
     } else {
         match JwtService::from_env() {
             Ok(jwt_svc) => {
@@ -676,10 +694,7 @@ pub async fn run_query(host: &str, query: &str, format: OutputFormat) -> Result<
             }
         }
         Err(e) => {
-            print_error(&format!(
-                "Cannot reach ORP server at {}: {}",
-                host, e
-            ));
+            print_error(&format!("Cannot reach ORP server at {}: {}", host, e));
             eprintln!("  → Start the server with: orp start --template maritime");
             eprintln!("  → Or point to a different host: orp --host <host:port> …");
             std::process::exit(1);
@@ -709,7 +724,10 @@ pub async fn run_status(host: &str, format: OutputFormat) -> Result<()> {
                 OutputFormat::Csv => {
                     // status as simple csv
                     let status = parsed.get("status").and_then(|s| s.as_str()).unwrap_or("?");
-                    let version = parsed.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+                    let version = parsed
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
                     println!("status,version");
                     println!("{},{}", status, version);
                     return Ok(());
@@ -813,7 +831,19 @@ pub async fn run_connectors_list(host: &str, format: OutputFormat) -> Result<()>
                         .iter()
                         .filter_map(|r| serde_json::from_value(r.clone()).ok())
                         .collect();
-                    print!("{}", format_csv(&rows, &["source_id", "source_name", "source_type", "trust_score", "enabled"]));
+                    print!(
+                        "{}",
+                        format_csv(
+                            &rows,
+                            &[
+                                "source_id",
+                                "source_name",
+                                "source_type",
+                                "trust_score",
+                                "enabled"
+                            ]
+                        )
+                    );
                 }
                 OutputFormat::Table => {
                     if data.is_empty() {
@@ -824,7 +854,19 @@ pub async fn run_connectors_list(host: &str, format: OutputFormat) -> Result<()>
                             .iter()
                             .filter_map(|r| serde_json::from_value(r.clone()).ok())
                             .collect();
-                        println!("{}", render_table(&rows, &["source_id", "source_name", "source_type", "trust_score", "enabled"]));
+                        println!(
+                            "{}",
+                            render_table(
+                                &rows,
+                                &[
+                                    "source_id",
+                                    "source_name",
+                                    "source_type",
+                                    "trust_score",
+                                    "enabled"
+                                ]
+                            )
+                        );
                     }
                 }
             }
@@ -866,7 +908,10 @@ pub async fn run_connectors_add(
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await?;
-            print_error(&format!("Failed to add connector (HTTP {}): {}", status, body));
+            print_error(&format!(
+                "Failed to add connector (HTTP {}): {}",
+                status, body
+            ));
             std::process::exit(1);
         }
         Err(e) => {
@@ -896,7 +941,10 @@ pub async fn run_connectors_remove(host: &str, id: &str, yes: bool) -> Result<()
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await?;
-            print_error(&format!("Failed to remove connector (HTTP {}): {}", status, body));
+            print_error(&format!(
+                "Failed to remove connector (HTTP {}): {}",
+                status, body
+            ));
             std::process::exit(1);
         }
         Err(e) => {
@@ -938,12 +986,14 @@ pub async fn run_entities_search(
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await?;
-            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| {
-                serde_json::json!({ "error": body })
-            });
+            let parsed: serde_json::Value = serde_json::from_str(&body)
+                .unwrap_or_else(|_| serde_json::json!({ "error": body }));
 
             if !status.is_success() {
-                let msg = parsed.get("error").and_then(|e| e.as_str()).unwrap_or(&body);
+                let msg = parsed
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or(&body);
                 print_error(&format!("Search failed (HTTP {}): {}", status, msg));
                 std::process::exit(1);
             }
@@ -953,7 +1003,10 @@ pub async fn run_entities_search(
                 .and_then(|d| d.as_array())
                 .cloned()
                 .unwrap_or_default();
-            let count = parsed.get("count").and_then(|c| c.as_u64()).unwrap_or(data.len() as u64);
+            let count = parsed
+                .get("count")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(data.len() as u64);
 
             match format {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&parsed)?),
@@ -962,7 +1015,10 @@ pub async fn run_entities_search(
                         .iter()
                         .filter_map(|r| serde_json::from_value(r.clone()).ok())
                         .collect();
-                    println!("{}", render_table(&rows, &["id", "type", "name", "confidence"]));
+                    println!(
+                        "{}",
+                        render_table(&rows, &["id", "type", "name", "confidence"])
+                    );
                     eprintln!("\n{} entities found", count);
                 }
                 OutputFormat::Csv => {
@@ -970,7 +1026,10 @@ pub async fn run_entities_search(
                         .iter()
                         .filter_map(|r| serde_json::from_value(r.clone()).ok())
                         .collect();
-                    print!("{}", format_csv(&rows, &["id", "type", "name", "confidence"]));
+                    print!(
+                        "{}",
+                        format_csv(&rows, &["id", "type", "name", "confidence"])
+                    );
                 }
             }
         }
@@ -1075,20 +1134,15 @@ pub async fn run_events(
         let since_val = parse_relative_time(s).unwrap_or_else(|| s.to_string());
         params.push(format!("since={}", since_val));
     }
-    let url = format!(
-        "{}/api/v1/events?{}",
-        base_url(host),
-        params.join("&")
-    );
+    let url = format!("{}/api/v1/events?{}", base_url(host), params.join("&"));
 
     let response = client.get(&url).send().await;
 
     match response {
         Ok(resp) => {
             let body = resp.text().await?;
-            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| {
-                serde_json::json!({ "error": body })
-            });
+            let parsed: serde_json::Value = serde_json::from_str(&body)
+                .unwrap_or_else(|_| serde_json::json!({ "error": body }));
 
             let data = parsed
                 .get("data")
@@ -1106,7 +1160,10 @@ pub async fn run_events(
                     if rows.is_empty() {
                         println!("  No events found.");
                     } else {
-                        println!("{}", render_table(&rows, &["id", "entity_id", "event_type", "timestamp"]));
+                        println!(
+                            "{}",
+                            render_table(&rows, &["id", "entity_id", "event_type", "timestamp"])
+                        );
                     }
                 }
                 OutputFormat::Csv => {
@@ -1114,7 +1171,10 @@ pub async fn run_events(
                         .iter()
                         .filter_map(|r| serde_json::from_value(r.clone()).ok())
                         .collect();
-                    print!("{}", format_csv(&rows, &["id", "entity_id", "event_type", "timestamp"]));
+                    print!(
+                        "{}",
+                        format_csv(&rows, &["id", "entity_id", "event_type", "timestamp"])
+                    );
                 }
             }
         }
@@ -1136,9 +1196,8 @@ pub async fn run_monitors_list(host: &str, format: OutputFormat) -> Result<()> {
     match response {
         Ok(resp) => {
             let body = resp.text().await?;
-            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| {
-                serde_json::json!({ "error": body })
-            });
+            let parsed: serde_json::Value = serde_json::from_str(&body)
+                .unwrap_or_else(|_| serde_json::json!({ "error": body }));
 
             let data = parsed
                 .get("data")
@@ -1153,7 +1212,13 @@ pub async fn run_monitors_list(host: &str, format: OutputFormat) -> Result<()> {
                         .iter()
                         .filter_map(|r| serde_json::from_value(r.clone()).ok())
                         .collect();
-                    print!("{}", format_csv(&rows, &["rule_id", "name", "entity_type", "severity", "enabled"]));
+                    print!(
+                        "{}",
+                        format_csv(
+                            &rows,
+                            &["rule_id", "name", "entity_type", "severity", "enabled"]
+                        )
+                    );
                 }
                 OutputFormat::Table => {
                     if data.is_empty() {
@@ -1164,7 +1229,13 @@ pub async fn run_monitors_list(host: &str, format: OutputFormat) -> Result<()> {
                             .iter()
                             .filter_map(|r| serde_json::from_value(r.clone()).ok())
                             .collect();
-                        println!("{}", render_table(&rows, &["rule_id", "name", "entity_type", "severity", "enabled"]));
+                        println!(
+                            "{}",
+                            render_table(
+                                &rows,
+                                &["rule_id", "name", "entity_type", "severity", "enabled"]
+                            )
+                        );
                     }
                 }
             }
@@ -1228,7 +1299,10 @@ pub async fn run_monitors_add(
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await?;
-            print_error(&format!("Failed to create monitor (HTTP {}): {}", status, body));
+            print_error(&format!(
+                "Failed to create monitor (HTTP {}): {}",
+                status, body
+            ));
             std::process::exit(1);
         }
         Err(e) => {
@@ -1258,7 +1332,10 @@ pub async fn run_monitors_remove(host: &str, id: &str, yes: bool) -> Result<()> 
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await?;
-            print_error(&format!("Failed to remove monitor (HTTP {}): {}", status, body));
+            print_error(&format!(
+                "Failed to remove monitor (HTTP {}): {}",
+                status, body
+            ));
             std::process::exit(1);
         }
         Err(e) => {
@@ -1322,16 +1399,16 @@ pub async fn run_connect(
     trust_score: f64,
 ) -> Result<()> {
     // Parse scheme from url
-    let scheme = url
-        .split("://")
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL '{}': expected <protocol>://<host>[/path]", url))?;
+    let scheme = url.split("://").next().ok_or_else(|| {
+        anyhow::anyhow!("Invalid URL '{}': expected <protocol>://<host>[/path]", url)
+    })?;
 
-    let connector_type = ConnectorType::from_scheme(scheme)
-        .ok_or_else(|| anyhow::anyhow!(
+    let connector_type = ConnectorType::from_scheme(scheme).ok_or_else(|| {
+        anyhow::anyhow!(
             "Unknown protocol '{}'. Supported: ais, adsb, mqtt, http, https, ws, wss, syslog",
             scheme
-        ))?;
+        )
+    })?;
 
     // Strip our custom schemes to a transport URL the connector understands
     let transport_url = match scheme {
@@ -1372,7 +1449,10 @@ pub async fn run_connect(
                 connector_type.as_str(),
                 etype
             ));
-            println!("  → Data will appear at: orp entities search --entity-type {}", etype);
+            println!(
+                "  → Data will appear at: orp entities search --entity-type {}",
+                etype
+            );
         }
         Ok(resp) => {
             let status = resp.status();
@@ -1445,7 +1525,11 @@ pub async fn run_ingest(
         return Ok(());
     }
 
-    print_header(&format!("Ingesting {} records from '{}'", records.len(), file));
+    print_header(&format!(
+        "Ingesting {} records from '{}'",
+        records.len(),
+        file
+    ));
 
     if let Some(etype) = entity_type {
         println!("  Entity type override: {}", etype);
@@ -1501,9 +1585,15 @@ pub async fn run_ingest(
         Ok(resp) if resp.status().is_success() => {
             let body = resp.text().await?;
             let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-            let ingested = parsed.get("ingested").and_then(|v| v.as_u64()).unwrap_or(total as u64);
+            let ingested = parsed
+                .get("ingested")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(total as u64);
             let failed = parsed.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
-            print_success(&format!("{} records ingested ({} failed)", ingested, failed));
+            print_success(&format!(
+                "{} records ingested ({} failed)",
+                ingested, failed
+            ));
         }
         Ok(resp) => {
             let status = resp.status();
@@ -1521,7 +1611,12 @@ pub async fn run_ingest(
 }
 
 /// Register a peer ORP instance for federation
-pub async fn run_peer_add(host: &str, address: &str, name: Option<&str>, trust_score: f64) -> Result<()> {
+pub async fn run_peer_add(
+    host: &str,
+    address: &str,
+    name: Option<&str>,
+    trust_score: f64,
+) -> Result<()> {
     let peer_name = name.unwrap_or(address);
     let client = reqwest::Client::new();
     let url = format!("{}/api/v1/peers", base_url(host));
@@ -1540,7 +1635,10 @@ pub async fn run_peer_add(host: &str, address: &str, name: Option<&str>, trust_s
             let body = resp.text().await?;
             let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
             let peer_id = parsed.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-            print_success(&format!("Peer '{}' registered (id: {})", peer_name, peer_id));
+            print_success(&format!(
+                "Peer '{}' registered (id: {})",
+                peer_name, peer_id
+            ));
             println!("  → View peers with: orp peer list");
         }
         Ok(resp) => {
@@ -1580,7 +1678,20 @@ pub async fn run_peer_list(host: &str, format: OutputFormat) -> Result<()> {
                         .iter()
                         .filter_map(|r| serde_json::from_value(r.clone()).ok())
                         .collect();
-                    print!("{}", format_csv(&rows, &["id", "name", "address", "status", "trust_score", "last_seen"]));
+                    print!(
+                        "{}",
+                        format_csv(
+                            &rows,
+                            &[
+                                "id",
+                                "name",
+                                "address",
+                                "status",
+                                "trust_score",
+                                "last_seen"
+                            ]
+                        )
+                    );
                 }
                 OutputFormat::Table => {
                     if data.is_empty() {
@@ -1591,7 +1702,20 @@ pub async fn run_peer_list(host: &str, format: OutputFormat) -> Result<()> {
                             .iter()
                             .filter_map(|r| serde_json::from_value(r.clone()).ok())
                             .collect();
-                        println!("{}", render_table(&rows, &["id", "name", "address", "status", "trust_score", "last_seen"]));
+                        println!(
+                            "{}",
+                            render_table(
+                                &rows,
+                                &[
+                                    "id",
+                                    "name",
+                                    "address",
+                                    "status",
+                                    "trust_score",
+                                    "last_seen"
+                                ]
+                            )
+                        );
                     }
                 }
             }
@@ -1622,7 +1746,10 @@ pub async fn run_peer_remove(host: &str, id: &str, yes: bool) -> Result<()> {
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await?;
-            print_error(&format!("Failed to remove peer (HTTP {}): {}", status, body));
+            print_error(&format!(
+                "Failed to remove peer (HTTP {}): {}",
+                status, body
+            ));
             std::process::exit(1);
         }
         Err(e) => {
@@ -1652,7 +1779,10 @@ pub async fn run_export(
         base_url(host),
         params.join("&")
     );
-    let response = client.get(&url).send().await
+    let response = client
+        .get(&url)
+        .send()
+        .await
         .map_err(|e| anyhow::anyhow!("Cannot reach ORP server at {}: {}", host, e))?;
 
     if !response.status().is_success() {
@@ -1673,18 +1803,18 @@ pub async fn run_export(
         .unwrap_or_default();
 
     let output = match format {
-        ExportFormat::Json => {
-            serde_json::to_string_pretty(&entities)?
-        }
+        ExportFormat::Json => serde_json::to_string_pretty(&entities)?,
         ExportFormat::Geojson => {
             // Build GeoJSON FeatureCollection
             let features: Vec<serde_json::Value> = entities
                 .iter()
                 .map(|entity| {
-                    let lat = entity.get("latitude")
+                    let lat = entity
+                        .get("latitude")
                         .or_else(|| entity.get("lat"))
                         .and_then(|v| v.as_f64());
-                    let lon = entity.get("longitude")
+                    let lon = entity
+                        .get("longitude")
                         .or_else(|| entity.get("lon"))
                         .or_else(|| entity.get("lng"))
                         .and_then(|v| v.as_f64());

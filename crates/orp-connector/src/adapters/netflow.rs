@@ -141,12 +141,24 @@ impl NetFlowV5Record {
 
     pub fn tcp_flags_str(&self) -> String {
         let mut s = String::new();
-        if self.tcp_flags & 0x01 != 0 { s.push_str("FIN "); }
-        if self.tcp_flags & 0x02 != 0 { s.push_str("SYN "); }
-        if self.tcp_flags & 0x04 != 0 { s.push_str("RST "); }
-        if self.tcp_flags & 0x08 != 0 { s.push_str("PSH "); }
-        if self.tcp_flags & 0x10 != 0 { s.push_str("ACK "); }
-        if self.tcp_flags & 0x20 != 0 { s.push_str("URG "); }
+        if self.tcp_flags & 0x01 != 0 {
+            s.push_str("FIN ");
+        }
+        if self.tcp_flags & 0x02 != 0 {
+            s.push_str("SYN ");
+        }
+        if self.tcp_flags & 0x04 != 0 {
+            s.push_str("RST ");
+        }
+        if self.tcp_flags & 0x08 != 0 {
+            s.push_str("PSH ");
+        }
+        if self.tcp_flags & 0x10 != 0 {
+            s.push_str("ACK ");
+        }
+        if self.tcp_flags & 0x20 != 0 {
+            s.push_str("URG ");
+        }
         s.trim().to_string()
     }
 
@@ -408,7 +420,11 @@ pub fn parse_v9_data_flowset(
     let mut pos = offset;
     let mut records = Vec::new();
 
-    let record_len: usize = template.fields.iter().map(|f| f.field_length as usize).sum();
+    let record_len: usize = template
+        .fields
+        .iter()
+        .map(|f| f.field_length as usize)
+        .sum();
     if record_len == 0 {
         return records;
     }
@@ -452,8 +468,7 @@ pub fn parse_v9_data_flowset(
                     field_data[7],
                 ])),
                 _ => {
-                    let hex: String =
-                        field_data.iter().map(|b| format!("{:02x}", b)).collect();
+                    let hex: String = field_data.iter().map(|b| format!("{:02x}", b)).collect();
                     json!(hex)
                 }
             };
@@ -595,11 +610,7 @@ impl Connector for NetFlowConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let bind_addr = self
-            .config
-            .url
-            .as_deref()
-            .unwrap_or("0.0.0.0:2055");
+        let bind_addr = self.config.url.as_deref().unwrap_or("0.0.0.0:2055");
 
         let socket = tokio::net::UdpSocket::bind(bind_addr)
             .await
@@ -644,8 +655,7 @@ impl Connector for NetFlowConnector {
                 NetFlowVersion::V5 => {
                     if let Ok((header, records)) = parse_v5_packet(data) {
                         for record in &records {
-                            let event =
-                                v5_record_to_source_event(record, &header, &connector_id);
+                            let event = v5_record_to_source_event(record, &header, &connector_id);
                             if tx.send(event).await.is_err() {
                                 running.store(false, Ordering::SeqCst);
                                 break;
@@ -655,7 +665,11 @@ impl Connector for NetFlowConnector {
                     }
                 }
                 NetFlowVersion::V9 | NetFlowVersion::Ipfix => {
-                    let hdr_len = if version == NetFlowVersion::V9 { 20 } else { 16 };
+                    let hdr_len = if version == NetFlowVersion::V9 {
+                        20
+                    } else {
+                        16
+                    };
                     if let Ok(v9_header) = parse_v9_header(data) {
                         let mut offset = hdr_len;
                         while offset + 4 <= len {
@@ -666,11 +680,9 @@ impl Connector for NetFlowConnector {
                                 }
                                 if fs_hdr.flowset_id == 0 {
                                     // Template FlowSet
-                                    if let Ok(tmpls) = parse_v9_template_flowset(
-                                        data,
-                                        offset + 4,
-                                        fs_len - 4,
-                                    ) {
+                                    if let Ok(tmpls) =
+                                        parse_v9_template_flowset(data, offset + 4, fs_len - 4)
+                                    {
                                         for t in tmpls {
                                             templates.insert(t.template_id, t);
                                         }
@@ -886,10 +898,7 @@ mod tests {
         let (header, _) = parse_v5_packet(&packet).unwrap();
         let event = v5_record_to_source_event(&record, &header, "netflow-test");
         assert_eq!(event.entity_type, "network_flow");
-        assert_eq!(
-            event.entity_id,
-            "netflow:192.168.1.100:54321-10.0.0.1:80"
-        );
+        assert_eq!(event.entity_id, "netflow:192.168.1.100:54321-10.0.0.1:80");
         assert_eq!(event.properties["packets"], json!(42));
         assert_eq!(event.properties["bytes"], json!(12345));
         assert_eq!(event.properties["protocol"], json!("TCP"));
@@ -931,7 +940,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&256u16.to_be_bytes()); // template ID
         data.extend_from_slice(&5u16.to_be_bytes()); // field count
-        // src addr: type=8, len=4
+                                                     // src addr: type=8, len=4
         data.extend_from_slice(&8u16.to_be_bytes());
         data.extend_from_slice(&4u16.to_be_bytes());
         // dst addr: type=12, len=4
@@ -960,9 +969,18 @@ mod tests {
             template_id: 256,
             field_count: 3,
             fields: vec![
-                V9FieldSpec { field_type: 8, field_length: 4 },  // src_addr
-                V9FieldSpec { field_type: 12, field_length: 4 }, // dst_addr
-                V9FieldSpec { field_type: 7, field_length: 2 },  // src_port
+                V9FieldSpec {
+                    field_type: 8,
+                    field_length: 4,
+                }, // src_addr
+                V9FieldSpec {
+                    field_type: 12,
+                    field_length: 4,
+                }, // dst_addr
+                V9FieldSpec {
+                    field_type: 7,
+                    field_length: 2,
+                }, // src_port
             ],
         };
 

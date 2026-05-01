@@ -15,3 +15,6 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 duckdb = { version = "1.2", features = ["bundled"] }
 sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

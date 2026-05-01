@@ -187,13 +187,9 @@ pub fn parse_feature(value: &JsonValue) -> Option<GeoJsonFeature> {
         return None;
     }
 
-    let geometry = obj.get("geometry").and_then(|g| {
-        if g.is_null() {
-            None
-        } else {
-            parse_geometry(g)
-        }
-    });
+    let geometry = obj
+        .get("geometry")
+        .and_then(|g| if g.is_null() { None } else { parse_geometry(g) });
 
     let properties = obj
         .get("properties")
@@ -215,29 +211,28 @@ pub fn parse_feature(value: &JsonValue) -> Option<GeoJsonFeature> {
 }
 
 /// Parse a GeoJSON FeatureCollection.
-pub fn parse_feature_collection(value: &JsonValue) -> Result<GeoJsonFeatureCollection, ConnectorError> {
-    let obj = value.as_object().ok_or_else(|| {
-        ConnectorError::ParseError("GeoJSON: expected JSON object".into())
-    })?;
+pub fn parse_feature_collection(
+    value: &JsonValue,
+) -> Result<GeoJsonFeatureCollection, ConnectorError> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| ConnectorError::ParseError("GeoJSON: expected JSON object".into()))?;
 
-    let type_str = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let type_str = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match type_str {
         "FeatureCollection" => {
             let features_val = obj.get("features").ok_or_else(|| {
-                ConnectorError::ParseError("GeoJSON: FeatureCollection missing 'features' array".into())
+                ConnectorError::ParseError(
+                    "GeoJSON: FeatureCollection missing 'features' array".into(),
+                )
             })?;
             let features_arr = features_val.as_array().ok_or_else(|| {
                 ConnectorError::ParseError("GeoJSON: 'features' is not an array".into())
             })?;
 
-            let features: Vec<GeoJsonFeature> = features_arr
-                .iter()
-                .filter_map(parse_feature)
-                .collect();
+            let features: Vec<GeoJsonFeature> =
+                features_arr.iter().filter_map(parse_feature).collect();
 
             Ok(GeoJsonFeatureCollection { features })
         }
@@ -273,9 +268,8 @@ pub fn parse_feature_collection(value: &JsonValue) -> Result<GeoJsonFeatureColle
 
 /// Parse a GeoJSON string.
 pub fn parse_geojson(data: &str) -> Result<GeoJsonFeatureCollection, ConnectorError> {
-    let value: JsonValue = serde_json::from_str(data).map_err(|e| {
-        ConnectorError::ParseError(format!("GeoJSON: invalid JSON: {}", e))
-    })?;
+    let value: JsonValue = serde_json::from_str(data)
+        .map_err(|e| ConnectorError::ParseError(format!("GeoJSON: invalid JSON: {}", e)))?;
     parse_feature_collection(&value)
 }
 
@@ -304,10 +298,13 @@ pub fn feature_to_source_event(
 
     if let Some(ref geom) = feature.geometry {
         properties.insert("geometry_type".into(), json!(geom.geometry_type.as_str()));
-        properties.insert("geometry".into(), json!({
-            "type": geom.geometry_type.as_str(),
-            "coordinates": geom.coordinates,
-        }));
+        properties.insert(
+            "geometry".into(),
+            json!({
+                "type": geom.geometry_type.as_str(),
+                "coordinates": geom.coordinates,
+            }),
+        );
     }
 
     // Determine entity type from properties or default
@@ -361,13 +358,9 @@ impl Connector for GeoJsonConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                ConnectorError::ConfigError("GeoJSON: url (file path or URL) required".into())
-            })?;
+        let path = self.config.url.as_deref().ok_or_else(|| {
+            ConnectorError::ConfigError("GeoJSON: url (file path or URL) required".into())
+        })?;
 
         let content = tokio::fs::read_to_string(path)
             .await

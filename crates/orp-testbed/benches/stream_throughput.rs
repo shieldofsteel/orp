@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use orp_proto::{EventPayload, OrpEvent};
 use orp_storage::DuckDbStorage;
 use orp_stream::{DefaultStreamProcessor, RocksDbDedupWindow, StreamContext, StreamProcessor};

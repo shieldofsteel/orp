@@ -169,6 +169,80 @@ jobs:
           path: frontend-dist.tar.gz
           retention-days: 1
 
+  # ── Smoke-test the linux-x86_64 binary before releasing ────────────────────
+  smoke:
+    name: Smoke test (linux-x86_64)
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Download linux-x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: orp-linux-x86_64
+          path: smoke/
+
+      - name: Extract tarball
+        run: |
+          cd smoke
+          tar xzf orp-linux-x86_64.tar.gz
+          chmod +x orp-linux-x86_64/orp
+          ls -lh orp-linux-x86_64/orp
+
+      - name: Run smoke flow
+        run: |
+          set -uo pipefail
+          BIN="$PWD/smoke/orp-linux-x86_64/orp"
+          PORT=19099
+          BASE="http://127.0.0.1:${PORT}"
+          LOG="$PWD/smoke/orp.log"
+
+          fail() { echo "FAIL: $1" >&2; [ -f "$LOG" ] && tail -50 "$LOG"; exit 1; }
+
+          "$BIN" start --in-memory --headless --no-auth --port "$PORT" \
+            >"$LOG" 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+
+          # Wait up to 30s for /health.
+          deadline=$(( $(date +%s) + 30 ))
+          health=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            kill -0 "$PID" 2>/dev/null || fail "server exited early"
+            if health=$(curl -fsS "${BASE}/api/v1/health" 2>/dev/null); then
+              break
+            fi
+            sleep 1
+          done
+          [ -n "$health" ] || fail "health timeout"
+          echo "$health" | grep -q '"graph_engine"' \
+            || fail "health missing graph_engine"
+
+          # POST a test entity.
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X POST "${BASE}/api/v1/entities" \
+            -H 'Content-Type: application/json' \
+            --data '{"id":"smoke-1","type":"generic","name":"smoke"}')
+          case "$status" in
+            201|200) ;;
+            *) fail "POST /entities -> HTTP $status" ;;
+          esac
+
+          # GET entities and assert the one we created is there.
+          list=$(curl -fsS "${BASE}/api/v1/entities?type=generic") \
+            || fail "GET /entities failed"
+          echo "$list" | grep -q '"smoke-1"' \
+            || fail "smoke-1 not in entities list"
+
+          # ORP-QL query.
+          q=$(curl -fsS -X POST "${BASE}/api/v1/query" \
+            -H 'Content-Type: application/json' \
+            --data '{"query":"MATCH (e:Entity) RETURN e LIMIT 3"}') \
+            || fail "POST /query failed"
+          echo "$q" | grep -q '"status":"success"' \
+            || fail "query not success: $q"
+
+          echo "OK"
+
   # ── Build + push Docker image ───────────────────────────────────────────────
   docker:
     name: Docker build & push
@@ -217,7 +291,7 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build, build-frontend, docker]
+    needs: [build, smoke, build-frontend, docker]
     steps:
       - uses: actions/checkout@v4
 

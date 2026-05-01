@@ -6,9 +6,5 @@
 pub mod resolver;
 
 pub use resolver::{
-    EntityResolver,
-    MatchType,
-    ResolutionMatch,
-    StructuralEntityResolver,
-    name_similarity,
+    name_similarity, EntityResolver, MatchType, ResolutionMatch, StructuralEntityResolver,
 };

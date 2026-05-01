@@ -58,23 +58,19 @@ impl AdsbConnector {
         let lat: Option<f64> = parts.get(14).and_then(|s| s.trim().parse().ok());
         let lon: Option<f64> = parts.get(15).and_then(|s| s.trim().parse().ok());
         let vertical_rate: Option<f64> = parts.get(16).and_then(|s| s.trim().parse().ok());
-        let squawk = parts
-            .get(17)
-            .and_then(|s| {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            });
-        let on_ground: Option<bool> = parts
-            .get(21)
-            .and_then(|s| match s.trim() {
-                "-1" | "1" => Some(true),
-                "0" => Some(false),
-                _ => None,
-            });
+        let squawk = parts.get(17).and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        let on_ground: Option<bool> = parts.get(21).and_then(|s| match s.trim() {
+            "-1" | "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        });
 
         Some(AdsbMessage {
             icao,
@@ -173,8 +169,7 @@ impl Connector for AdsbConnector {
                     match tokio::net::TcpStream::connect(addr).await {
                         Ok(stream) => {
                             tracing::info!("Connected to ADS-B feed at {}", addr);
-                            let mut reader =
-                                tokio::io::BufReader::new(stream);
+                            let mut reader = tokio::io::BufReader::new(stream);
                             use tokio::io::AsyncBufReadExt;
                             let mut line = String::new();
                             while running.load(Ordering::SeqCst) {
@@ -182,17 +177,13 @@ impl Connector for AdsbConnector {
                                 match reader.read_line(&mut line).await {
                                     Ok(0) => break,
                                     Ok(_) => {
-                                        if let Some(msg) =
-                                            AdsbConnector::parse_sbs_message(&line)
-                                        {
+                                        if let Some(msg) = AdsbConnector::parse_sbs_message(&line) {
                                             if msg.latitude.is_some() {
-                                                let event =
-                                                    msg.to_source_event(&connector_id);
+                                                let event = msg.to_source_event(&connector_id);
                                                 if tx.send(event).await.is_err() {
                                                     return;
                                                 }
-                                                events_count
-                                                    .fetch_add(1, Ordering::Relaxed);
+                                                events_count.fetch_add(1, Ordering::Relaxed);
                                             }
                                         }
                                     }

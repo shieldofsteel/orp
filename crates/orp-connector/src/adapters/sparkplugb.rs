@@ -236,9 +236,8 @@ pub fn parse_sparkplug_topic(topic: &str) -> Option<SparkplugTopic> {
 
 /// Parse a SparkplugB JSON payload.
 pub fn parse_sparkplug_payload_json(data: &str) -> Result<SparkplugPayload, ConnectorError> {
-    let value: JsonValue = serde_json::from_str(data).map_err(|e| {
-        ConnectorError::ParseError(format!("SparkplugB: invalid JSON: {}", e))
-    })?;
+    let value: JsonValue = serde_json::from_str(data)
+        .map_err(|e| ConnectorError::ParseError(format!("SparkplugB: invalid JSON: {}", e)))?;
     parse_sparkplug_payload_value(&value)
 }
 
@@ -256,11 +255,7 @@ pub fn parse_sparkplug_payload_value(
     let metrics = value
         .get("metrics")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(parse_metric_json)
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(parse_metric_json).collect())
         .unwrap_or_default();
 
     Ok(SparkplugPayload {
@@ -338,10 +333,7 @@ pub fn parse_sparkplug_message(
 // ---------------------------------------------------------------------------
 
 /// Convert a SparkplugB message into SourceEvents (one per metric).
-pub fn sparkplug_message_to_events(
-    msg: &SparkplugMessage,
-    connector_id: &str,
-) -> Vec<SourceEvent> {
+pub fn sparkplug_message_to_events(msg: &SparkplugMessage, connector_id: &str) -> Vec<SourceEvent> {
     let base_id = if let Some(ref did) = msg.topic.device_id {
         format!(
             "sparkplug:{}:{}:{}",
@@ -438,15 +430,11 @@ impl Connector for SparkplugBConnector {
     ) -> Result<(), ConnectorError> {
         // In production this would subscribe to MQTT topics matching spBv1.0/#
         // For now, read from a file of JSON messages (one per line: topic\tpayload)
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                ConnectorError::ConfigError(
-                    "SparkplugB: url (file path or MQTT broker) required".into(),
-                )
-            })?;
+        let path = self.config.url.as_deref().ok_or_else(|| {
+            ConnectorError::ConfigError(
+                "SparkplugB: url (file path or MQTT broker) required".into(),
+            )
+        })?;
 
         let content = tokio::fs::read_to_string(path)
             .await
@@ -631,7 +619,10 @@ mod tests {
         assert_eq!(SparkplugDataType::from_code(10), SparkplugDataType::Double);
         assert_eq!(SparkplugDataType::from_code(11), SparkplugDataType::Boolean);
         assert_eq!(SparkplugDataType::from_code(12), SparkplugDataType::String);
-        assert_eq!(SparkplugDataType::from_code(99), SparkplugDataType::Unknown(99));
+        assert_eq!(
+            SparkplugDataType::from_code(99),
+            SparkplugDataType::Unknown(99)
+        );
     }
 
     #[test]

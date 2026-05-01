@@ -3,7 +3,6 @@
 //! Keys follow the format: `orpk_prod_<random-hex>` as specified in the ORP API spec.
 
 use chrono::{DateTime, Duration, Utc};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -57,9 +56,7 @@ pub struct ApiKeyRecord {
 
 impl ApiKeyRecord {
     pub fn is_expired(&self) -> bool {
-        self.expires_at
-            .map(|exp| exp < Utc::now())
-            .unwrap_or(false)
+        self.expires_at.map(|exp| exp < Utc::now()).unwrap_or(false)
     }
 }
 
@@ -145,15 +142,16 @@ impl ApiKeyService {
     /// Generate a new API key from the given request.
     ///
     /// Returns both the record and the raw key (plaintext) — the raw key is shown once only.
-    pub fn create_key(&self, req: CreateApiKeyRequest) -> Result<CreateApiKeyResponse, ApiKeyError> {
+    pub fn create_key(
+        &self,
+        req: CreateApiKeyRequest,
+    ) -> Result<CreateApiKeyResponse, ApiKeyError> {
         let raw_key = generate_api_key();
         let key_hash = hash_key(&raw_key);
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
         let rate_limit = req.rate_limit.unwrap_or(1000);
-        let expires_at = req
-            .expires_in
-            .map(|secs| now + Duration::seconds(secs));
+        let expires_at = req.expires_in.map(|secs| now + Duration::seconds(secs));
 
         let record = ApiKeyRecord {
             id: id.clone(),
@@ -291,10 +289,16 @@ impl Default for ApiKeyService {
     }
 }
 
-/// Generate a new API key with the `orpk_prod_` prefix followed by 32 random hex bytes.
+/// Generate a new API key with the `orpk_prod_` prefix followed by 24 random bytes
+/// (48 hex chars ≈ 192 bits of entropy) drawn from the OS CSPRNG.
+///
+/// `OsRng` (not `thread_rng`) is required: API keys grant scoped access to the
+/// API surface, and a non-cryptographic RNG would let an attacker enumerate
+/// valid keys after observing a few.
 fn generate_api_key() -> String {
-    let mut rng = rand::thread_rng();
-    let bytes: Vec<u8> = (0..24).map(|_| rng.gen::<u8>()).collect();
+    use rand::{rngs::OsRng, RngCore};
+    let mut bytes = [0u8; 24];
+    OsRng.fill_bytes(&mut bytes);
     format!("orpk_prod_{}", hex::encode(bytes))
 }
 
@@ -409,9 +413,6 @@ mod tests {
         svc.validate_key(&resp.api_key).await.unwrap();
         // Third should be rate limited
         let result = svc.validate_key(&resp.api_key).await;
-        assert!(matches!(
-            result,
-            Err(ApiKeyError::RateLimitExceeded { .. })
-        ));
+        assert!(matches!(result, Err(ApiKeyError::RateLimitExceeded { .. })));
     }
 }

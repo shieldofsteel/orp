@@ -21,8 +21,7 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 /// Authentication method for the API.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthConfig {
     /// No authentication.
@@ -37,8 +36,7 @@ pub enum AuthConfig {
 }
 
 /// Pagination strategy.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(tag = "strategy", rename_all = "snake_case")]
 pub enum PaginationConfig {
     /// No pagination — single request per poll cycle.
@@ -473,8 +471,14 @@ fn map_item(
 
     let entity_id = format!("{}:{}", effective_entity_type, raw_id);
 
-    let latitude = mapping.lat_field.as_deref().and_then(|f| resolve_f64(item, f));
-    let longitude = mapping.lon_field.as_deref().and_then(|f| resolve_f64(item, f));
+    let latitude = mapping
+        .lat_field
+        .as_deref()
+        .and_then(|f| resolve_f64(item, f));
+    let longitude = mapping
+        .lon_field
+        .as_deref()
+        .and_then(|f| resolve_f64(item, f));
 
     let timestamp = mapping
         .timestamp_field
@@ -608,9 +612,10 @@ async fn fetch_page(
     api_cfg: &GenericApiConfig,
 ) -> Result<JsonValue, ConnectorError> {
     let req = build_request(client, url, &api_cfg.auth, &api_cfg.headers);
-    let resp = req.send().await.map_err(|e| {
-        ConnectorError::ConnectionError(format!("HTTP request failed: {e}"))
-    })?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ConnectorError::ConnectionError(format!("HTTP request failed: {e}")))?;
 
     if !resp.status().is_success() {
         return Err(ConnectorError::ConnectionError(format!(
@@ -619,9 +624,9 @@ async fn fetch_page(
         )));
     }
 
-    resp.json::<JsonValue>().await.map_err(|e| {
-        ConnectorError::ParseError(format!("JSON parse error: {e}"))
-    })
+    resp.json::<JsonValue>()
+        .await
+        .map_err(|e| ConnectorError::ParseError(format!("JSON parse error: {e}")))
 }
 
 /// Fetch all pages according to the pagination strategy, collecting all
@@ -659,8 +664,8 @@ async fn fetch_all_pages(
                         .unwrap_or(0)
                 } else {
                     // Count items in the response
-                    if let Some(arr) = resolve_path(&json, &api_cfg.mapping.items_path)
-                        .and_then(|v| v.as_array())
+                    if let Some(arr) =
+                        resolve_path(&json, &api_cfg.mapping.items_path).and_then(|v| v.as_array())
                     {
                         arr.len() as u64
                     } else {
@@ -774,18 +779,13 @@ impl GenericApiConnector {
     /// Convenience: load a `GenericApiConfig` from a `serde_json::Value`
     /// stored in `ConnectorConfig::properties["generic_api"]`.
     pub fn from_connector_config(config: ConnectorConfig) -> Result<Self, ConnectorError> {
-        let api_cfg_val = config
-            .properties
-            .get("generic_api")
-            .ok_or_else(|| {
-                ConnectorError::ConfigError(
-                    "Missing 'generic_api' key in connector properties".to_string(),
-                )
-            })?;
-        let api_config: GenericApiConfig =
-            serde_json::from_value(api_cfg_val.clone()).map_err(|e| {
-                ConnectorError::ConfigError(format!("Invalid generic_api config: {e}"))
-            })?;
+        let api_cfg_val = config.properties.get("generic_api").ok_or_else(|| {
+            ConnectorError::ConfigError(
+                "Missing 'generic_api' key in connector properties".to_string(),
+            )
+        })?;
+        let api_config: GenericApiConfig = serde_json::from_value(api_cfg_val.clone())
+            .map_err(|e| ConnectorError::ConfigError(format!("Invalid generic_api config: {e}")))?;
         Ok(Self::new(config, api_config))
     }
 
@@ -796,9 +796,8 @@ impl GenericApiConnector {
         api_key: &str,
         entity_type: &str,
     ) -> Result<Self, ConnectorError> {
-        let api_config = builtin_template(template, api_key).ok_or_else(|| {
-            ConnectorError::ConfigError(format!("Unknown template: {template}"))
-        })?;
+        let api_config = builtin_template(template, api_key)
+            .ok_or_else(|| ConnectorError::ConfigError(format!("Unknown template: {template}")))?;
         let config = ConnectorConfig {
             connector_id: connector_id.to_string(),
             connector_type: format!("generic_api/{template}"),
@@ -810,8 +809,9 @@ impl GenericApiConnector {
                 let mut m = HashMap::new();
                 m.insert(
                     "generic_api".to_string(),
-                    serde_json::to_value(&api_config)
-                        .map_err(|e| ConnectorError::ConfigError(format!("Failed to serialise api_config: {e}")))?,
+                    serde_json::to_value(&api_config).map_err(|e| {
+                        ConnectorError::ConfigError(format!("Failed to serialise api_config: {e}"))
+                    })?,
                 );
                 m
             },
@@ -1086,11 +1086,21 @@ mod tests {
 
     #[test]
     fn test_all_builtin_templates_valid() {
-        for name in &["shodan", "virustotal", "abuseipdb", "flightaware", "openweathermap", "usgs"] {
+        for name in &[
+            "shodan",
+            "virustotal",
+            "abuseipdb",
+            "flightaware",
+            "openweathermap",
+            "usgs",
+        ] {
             let cfg = builtin_template(name, "dummy_key")
                 .unwrap_or_else(|| panic!("template {name} should exist"));
             assert!(!cfg.url.is_empty(), "template {name} has empty URL");
-            assert!(!cfg.mapping.id_field.is_empty(), "template {name} has empty id_field");
+            assert!(
+                !cfg.mapping.id_field.is_empty(),
+                "template {name} has empty id_field"
+            );
         }
     }
 

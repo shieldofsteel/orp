@@ -149,4 +149,3 @@ mod tests {
         assert_eq!(result, "no variables here");
     }
 }
-
