@@ -19,8 +19,8 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -149,10 +149,7 @@ impl Hl7Message {
         self.segments.iter().find(|s| s.name == name)
     }
 
-    pub fn segments_named<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> impl Iterator<Item = &'a Segment> + 'a {
+    pub fn segments_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Segment> + 'a {
         self.segments.iter().filter(move |s| s.name == name)
     }
 }
@@ -172,7 +169,9 @@ pub fn parse_hl7(body: &[u8]) -> Result<Hl7Message, ConnectorError> {
 
     // MSH-1 = char at byte 3 (field separator); MSH-2 = next 4 chars.
     let mut chars_iter = text.chars();
-    chars_iter.next(); chars_iter.next(); chars_iter.next();
+    chars_iter.next();
+    chars_iter.next();
+    chars_iter.next();
     let field_sep = chars_iter
         .next()
         .ok_or_else(|| ConnectorError::ParseError("missing MSH-1 separator".into()))?;
@@ -214,17 +213,14 @@ fn split_segment(seg_str: &str, enc: &EncodingChars) -> Result<Segment, Connecto
         "MSH" => {
             // MSH-1 = field separator itself, MSH-2 = encoding chars.
             let mut v = vec![enc.field_sep.to_string()];
-            let r = rest.ok_or_else(|| {
-                ConnectorError::ParseError("MSH segment has no fields".into())
-            })?;
+            let r =
+                rest.ok_or_else(|| ConnectorError::ParseError("MSH segment has no fields".into()))?;
             v.extend(r.split(enc.field_sep).map(str::to_string));
             v
         }
         _ => {
             let r = rest.ok_or_else(|| {
-                ConnectorError::ParseError(format!(
-                    "segment {name} missing field separator"
-                ))
+                ConnectorError::ParseError(format!("segment {name} missing field separator"))
             })?;
             r.split(enc.field_sep).map(str::to_string).collect()
         }
@@ -299,8 +295,12 @@ pub fn message_to_event(msg: &Hl7Message, connector_id: &str) -> SourceEvent {
         // PID-3: first repetition's first component.
         let pid3 = pid.field(3);
         let patient_id = pid3
-            .split(rep_sep).next().unwrap_or(pid3)
-            .split(comp_sep).next().unwrap_or("")
+            .split(rep_sep)
+            .next()
+            .unwrap_or(pid3)
+            .split(comp_sep)
+            .next()
+            .unwrap_or("")
             .to_string();
         if !patient_id.is_empty() {
             entity_id = Some(patient_id.clone());
@@ -338,17 +338,27 @@ pub fn message_to_event(msg: &Hl7Message, connector_id: &str) -> SourceEvent {
             }
         }
         if entity_id.is_none() && !test_id.is_empty() {
-            entity_id = Some(test_id.split(comp_sep).next().unwrap_or(test_id).to_string());
+            entity_id = Some(
+                test_id
+                    .split(comp_sep)
+                    .next()
+                    .unwrap_or(test_id)
+                    .to_string(),
+            );
         }
     }
     // OBX: one entry per result, aggregated under obx.<observation_identifier>.
     for obx in msg.segments_named("OBX") {
         let obs_ident = obx.field(3).split(comp_sep).next().unwrap_or("");
-        if obs_ident.is_empty() { continue; }
+        if obs_ident.is_empty() {
+            continue;
+        }
         let mut entry = serde_json::Map::new();
         for (k, v) in [
-            ("value", obx.field(5)), ("units", obx.field(6)),
-            ("abnormal", obx.field(8)), ("status", obx.field(11)),
+            ("value", obx.field(5)),
+            ("units", obx.field(6)),
+            ("abnormal", obx.field(8)),
+            ("status", obx.field(11)),
         ] {
             if !v.is_empty() {
                 entry.insert(k.into(), JsonValue::String(v.to_string()));
@@ -357,7 +367,10 @@ pub fn message_to_event(msg: &Hl7Message, connector_id: &str) -> SourceEvent {
         props.insert(format!("obx.{obs_ident}"), JsonValue::Object(entry));
     }
     let final_entity_id = entity_id.unwrap_or_else(|| {
-        format!("hl7-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0))
+        format!(
+            "hl7-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        )
     });
     SourceEvent {
         connector_id: connector_id.to_string(),
@@ -387,7 +400,10 @@ pub fn build_ack_body(msg: &Hl7Message, ack_code: &str) -> String {
     let ver = msh.map(|m| m.field(12)).unwrap_or("2.5");
     let now = Utc::now().format("%Y%m%d%H%M%S").to_string();
     let new_ctl = format!("ACK{}", Utc::now().timestamp_millis());
-    let ec = format!("{}{}{}{}", enc.component_sep, enc.repetition_sep, enc.escape_char, enc.subcomponent_sep);
+    let ec = format!(
+        "{}{}{}{}",
+        enc.component_sep, enc.repetition_sep, enc.escape_char, enc.subcomponent_sep
+    );
     // ACK MSH: swap sending/receiving (we are ORP), set MSH-9 to ACK.
     format!(
         "MSH{fs}{ec}{fs}ORP{fs}ORP{fs}{in_app}{fs}{in_fac}{fs}{now}{fs}{fs}ACK{fs}{new_ctl}{fs}{proc_id}{fs}{ver}\rMSA{fs}{ack_code}{fs}{in_ctl}\r",
@@ -397,10 +413,14 @@ pub fn build_ack_body(msg: &Hl7Message, ack_code: &str) -> String {
 /// Parse a `mllp://host:port` URL into a SocketAddr.
 pub fn parse_mllp_url(url: &str) -> Result<SocketAddr, ConnectorError> {
     let rest = url.strip_prefix("mllp://").ok_or_else(|| {
-        ConnectorError::ConfigError(format!("hl7 connector URL must use mllp:// scheme, got: {url}"))
+        ConnectorError::ConfigError(format!(
+            "hl7 connector URL must use mllp:// scheme, got: {url}"
+        ))
     })?;
     if rest.is_empty() {
-        return Err(ConnectorError::ConfigError("hl7 mllp:// URL is missing host:port".into()));
+        return Err(ConnectorError::ConfigError(
+            "hl7 mllp:// URL is missing host:port".into(),
+        ));
     }
     rest.parse::<SocketAddr>()
         .map_err(|e| ConnectorError::ConfigError(format!("invalid hl7 bind address {rest}: {e}")))
@@ -421,14 +441,18 @@ impl Hl7Connector {
     pub fn new(config: ConnectorConfig) -> Result<Self, ConnectorError> {
         let bind_addr = match config.url.as_deref() {
             Some(u) if u.starts_with("mllp://") => parse_mllp_url(u)?,
-            Some(u) => return Err(ConnectorError::ConfigError(format!(
-                "hl7 connector URL must use mllp:// scheme, got: {u}"
-            ))),
-            None => DEFAULT_BIND.parse::<SocketAddr>()
+            Some(u) => {
+                return Err(ConnectorError::ConfigError(format!(
+                    "hl7 connector URL must use mllp:// scheme, got: {u}"
+                )))
+            }
+            None => DEFAULT_BIND
+                .parse::<SocketAddr>()
                 .map_err(|e| ConnectorError::ConfigError(format!("default bind invalid: {e}")))?,
         };
         Ok(Self {
-            config, bind_addr,
+            config,
+            bind_addr,
             running: Arc::new(AtomicBool::new(false)),
             events_count: Arc::new(AtomicU64::new(0)),
             errors_count: Arc::new(AtomicU64::new(0)),
@@ -494,7 +518,9 @@ impl Connector for Hl7Connector {
         if self.running.load(Ordering::SeqCst) {
             Ok(())
         } else {
-            Err(ConnectorError::ConnectionError("Hl7Connector not running".into()))
+            Err(ConnectorError::ConnectionError(
+                "Hl7Connector not running".into(),
+            ))
         }
     }
 
@@ -534,7 +560,9 @@ async fn handle_socket(
         };
         buf.extend_from_slice(&tmp[..n]);
         let (frames, consumed) = extract_all_mllp_frames(&buf);
-        if consumed > 0 { buf.drain(..consumed); }
+        if consumed > 0 {
+            buf.drain(..consumed);
+        }
         for body in frames {
             match parse_hl7(&body) {
                 Ok(msg) => {
@@ -545,7 +573,9 @@ async fn handle_socket(
                         errors_count.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
-                    if tx.send(event).await.is_err() { return; }
+                    if tx.send(event).await.is_err() {
+                        return;
+                    }
                     events_count.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
@@ -732,8 +762,14 @@ mod tests {
     #[test]
     fn test_malformed_inputs_do_not_panic() {
         let body = b"MSH|^~\\&|HIS|HOSP|EHR|HOSP|20260101010101||ADT^A01|MSG001|P|2.5\rPID";
-        assert!(matches!(parse_hl7(body), Err(ConnectorError::ParseError(_))));
-        assert!(matches!(parse_hl7(b"MSH"), Err(ConnectorError::ParseError(_))));
+        assert!(matches!(
+            parse_hl7(body),
+            Err(ConnectorError::ParseError(_))
+        ));
+        assert!(matches!(
+            parse_hl7(b"MSH"),
+            Err(ConnectorError::ParseError(_))
+        ));
         assert!(matches!(
             parse_hl7(b"PID|1||PAT1^^^MRN||DOE^JOHN"),
             Err(ConnectorError::ParseError(_))
@@ -759,7 +795,10 @@ mod tests {
         assert_eq!(prop_str(&event, "pid.dob"), Some("19610615"));
         assert_eq!(prop_str(&event, "evn.trigger"), Some("A01"));
         assert_eq!(prop_str(&event, "msh.sending_app"), Some("REGADT"));
-        assert_eq!(prop_str(&event, "msh.message_type"), Some("ADT^A01^ADT_A01"));
+        assert_eq!(
+            prop_str(&event, "msh.message_type"),
+            Some("ADT^A01^ADT_A01")
+        );
         let obx = event.properties.get("obx.1010.1").unwrap();
         assert_eq!(obx.get("value").and_then(|v| v.as_str()), Some("72"));
         assert_eq!(obx.get("units").and_then(|v| v.as_str()), Some("kg"));
@@ -775,7 +814,10 @@ mod tests {
         assert_eq!(out.last().copied(), Some(MLLP_CR));
         assert_eq!(out[out.len() - 2], MLLP_EB);
         let dt = parse_hl7_ts("20260315133000").unwrap();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-03-15 13:30:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-03-15 13:30:00"
+        );
         assert!(parse_hl7_ts("20260315").is_some());
         assert!(parse_hl7_ts("").is_none());
     }

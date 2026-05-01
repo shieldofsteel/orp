@@ -35,7 +35,11 @@ impl WebSocketClientConnector {
             .get("id")
             .or_else(|| json.get("entity_id"))
             .or_else(|| json.get("device_id"))
-            .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_i64().map(|n| n.to_string())))?;
+            .and_then(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })?;
 
         let latitude = json
             .get("latitude")
@@ -179,8 +183,7 @@ mod tests {
     #[test]
     fn test_parse_ws_message() {
         let msg = r#"{"id": "vessel-1", "latitude": 51.92, "longitude": 4.48, "speed": 12.5, "status": "underway"}"#;
-        let event =
-            WebSocketClientConnector::parse_ws_message(msg, "ship", "ws-1");
+        let event = WebSocketClientConnector::parse_ws_message(msg, "ship", "ws-1");
         assert!(event.is_some());
         let event = event.unwrap();
         assert_eq!(event.entity_id, "ship:vessel-1");
@@ -191,8 +194,7 @@ mod tests {
     #[test]
     fn test_parse_ws_message_alt_fields() {
         let msg = r#"{"entity_id": "device-42", "lat": 52.0, "lon": 4.5}"#;
-        let event =
-            WebSocketClientConnector::parse_ws_message(msg, "sensor", "ws-1");
+        let event = WebSocketClientConnector::parse_ws_message(msg, "sensor", "ws-1");
         assert!(event.is_some());
         let event = event.unwrap();
         assert_eq!(event.entity_id, "sensor:device-42");

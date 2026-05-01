@@ -95,14 +95,14 @@ pub struct GribGridDefinition {
     pub source_of_grid_def: u8,
     pub num_data_points: u32,
     pub grid_template_number: u16,
-    pub ni: u32,         // number of points along parallel
-    pub nj: u32,         // number of points along meridian
-    pub lat_first: f64,  // latitude of first grid point (degrees)
-    pub lon_first: f64,  // longitude of first grid point (degrees)
-    pub lat_last: f64,   // latitude of last grid point (degrees)
-    pub lon_last: f64,   // longitude of last grid point (degrees)
-    pub di: f64,         // i-direction increment (degrees)
-    pub dj: f64,         // j-direction increment (degrees)
+    pub ni: u32,        // number of points along parallel
+    pub nj: u32,        // number of points along meridian
+    pub lat_first: f64, // latitude of first grid point (degrees)
+    pub lon_first: f64, // longitude of first grid point (degrees)
+    pub lat_last: f64,  // latitude of last grid point (degrees)
+    pub lon_last: f64,  // longitude of last grid point (degrees)
+    pub di: f64,        // i-direction increment (degrees)
+    pub dj: f64,        // j-direction increment (degrees)
 }
 
 /// GRIB2 Section 4 — Product Definition.
@@ -442,7 +442,9 @@ pub fn parse_grib_product_definition(data: &[u8]) -> Result<GribProductDefinitio
 }
 
 /// Parse Section 5 — Data Representation (template 0, simple packing).
-pub fn parse_grib_data_representation(data: &[u8]) -> Result<GribDataRepresentation, ConnectorError> {
+pub fn parse_grib_data_representation(
+    data: &[u8],
+) -> Result<GribDataRepresentation, ConnectorError> {
     if data.len() < 21 {
         return Err(ConnectorError::ParseError(
             "GRIB: data representation section too short".into(),
@@ -482,10 +484,16 @@ pub fn parse_grib_data_representation(data: &[u8]) -> Result<GribDataRepresentat
 /// Read `nbits` bits from `buf` at `bit_offset` (MSB-first stream).
 /// Returns `None` on out-of-range or `nbits > 64`. `nbits == 0` ⇒ `Some(0)`.
 pub fn read_bits(buf: &[u8], bit_offset: usize, nbits: usize) -> Option<u64> {
-    if nbits == 0 { return Some(0); }
-    if nbits > 64 { return None; }
+    if nbits == 0 {
+        return Some(0);
+    }
+    if nbits > 64 {
+        return None;
+    }
     let end_bit = bit_offset.checked_add(nbits)?;
-    if (end_bit - 1) / 8 >= buf.len() { return None; }
+    if (end_bit - 1) / 8 >= buf.len() {
+        return None;
+    }
     let mut value: u64 = 0;
     let mut bits_remaining = nbits;
     let mut bit_pos = bit_offset;
@@ -519,14 +527,13 @@ pub fn unpack_template_5_0(
     }
     let total_bits = num_data_points
         .checked_mul(nbits)
-        .ok_or_else(|| ConnectorError::ParseError(
-            "GRIB: Section 7 bit count overflow".into(),
-        ))?;
+        .ok_or_else(|| ConnectorError::ParseError("GRIB: Section 7 bit count overflow".into()))?;
     let needed_bytes = (total_bits + 7) / 8;
     if section7_data.len() < needed_bytes {
         return Err(ConnectorError::ParseError(format!(
             "GRIB: Section 7 truncated (need {} bytes, have {})",
-            needed_bytes, section7_data.len()
+            needed_bytes,
+            section7_data.len()
         )));
     }
     let mut out = Vec::with_capacity(num_data_points);
@@ -687,9 +694,19 @@ pub fn lookup_parameter(discipline: u8, category: u8, number: u8) -> GribParamet
 
 fn empty_identification() -> GribIdentification {
     GribIdentification {
-        center_id: 0, subcenter_id: 0, master_tables_version: 0, local_tables_version: 0,
-        significance_of_ref_time: 0, year: 0, month: 0, day: 0, hour: 0, minute: 0,
-        second: 0, production_status: 0, data_type: 0,
+        center_id: 0,
+        subcenter_id: 0,
+        master_tables_version: 0,
+        local_tables_version: 0,
+        significance_of_ref_time: 0,
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        production_status: 0,
+        data_type: 0,
     }
 }
 
@@ -713,34 +730,45 @@ pub fn parse_grib_message(data: &[u8]) -> Result<GribMessage, ConnectorError> {
     // Stop on Section 8 marker "7777" or buffer end.
     let mut cur = 0usize;
     while cur + 5 <= body.len() {
-        if body.get(cur..cur + 4) == Some(b"7777") { break; }
-        let lb = match body.get(cur..cur + 4) { Some(b) => b, None => break };
+        if body.get(cur..cur + 4) == Some(b"7777") {
+            break;
+        }
+        let lb = match body.get(cur..cur + 4) {
+            Some(b) => b,
+            None => break,
+        };
         let sec_len = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
-        if sec_len < 5 || cur + sec_len > body.len() { break; }
+        if sec_len < 5 || cur + sec_len > body.len() {
+            break;
+        }
         let sec_num = body[cur + 4];
         let sec = &body[cur..cur + sec_len];
         match sec_num {
             1 => identification = parse_grib_identification(sec).ok(),
             3 => grid_definition = parse_grib_grid_definition(sec).ok(),
             4 => product_definition = parse_grib_product_definition(sec).ok(),
-            5 => if let Ok(d) = parse_grib_data_representation(sec) {
-                data_template = d.template_number;
-                data_representation = Some(d);
-            },
-            7 => if let Some(ref drep) = data_representation {
-                let payload = sec.get(5..).unwrap_or(&[]);
-                let n = drep.num_data_points as usize;
-                match drep.template_number {
-                    0 => match unpack_template_5_0(drep, payload, n) {
-                        Ok(v) => data_values = Some(v),
-                        Err(e) => tracing::warn!("GRIB Section 7 unpack failed: {}", e),
-                    },
-                    other => tracing::warn!(
-                        "GRIB Section 5 template {} not yet supported, returning metadata only",
-                        other
-                    ),
+            5 => {
+                if let Ok(d) = parse_grib_data_representation(sec) {
+                    data_template = d.template_number;
+                    data_representation = Some(d);
                 }
-            },
+            }
+            7 => {
+                if let Some(ref drep) = data_representation {
+                    let payload = sec.get(5..).unwrap_or(&[]);
+                    let n = drep.num_data_points as usize;
+                    match drep.template_number {
+                        0 => match unpack_template_5_0(drep, payload, n) {
+                            Ok(v) => data_values = Some(v),
+                            Err(e) => tracing::warn!("GRIB Section 7 unpack failed: {}", e),
+                        },
+                        other => tracing::warn!(
+                            "GRIB Section 5 template {} not yet supported, returning metadata only",
+                            other
+                        ),
+                    }
+                }
+            }
             _ => {}
         }
         cur += sec_len;
@@ -762,10 +790,7 @@ pub fn parse_grib_message(data: &[u8]) -> Result<GribMessage, ConnectorError> {
 // ---------------------------------------------------------------------------
 
 /// Convert a GRIB message to a SourceEvent.
-pub fn grib_to_source_event(
-    msg: &GribMessage,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn grib_to_source_event(msg: &GribMessage, connector_id: &str) -> SourceEvent {
     let mut properties = HashMap::new();
     properties.insert("discipline".into(), json!(msg.indicator.discipline));
     properties.insert(
@@ -822,21 +847,25 @@ pub fn grib_to_source_event(
     if let Some(ref drep) = msg.data_representation {
         properties.insert("packing_template".into(), json!(drep.template_number));
         properties.insert("bits_per_value".into(), json!(drep.bits_per_value));
-        properties.insert(
-            "data_points".into(),
-            json!(drep.num_data_points),
-        );
+        properties.insert("data_points".into(), json!(drep.num_data_points));
     }
 
     properties.insert("data_template".into(), json!(msg.data_template));
-    properties.insert("data_values_present".into(), json!(msg.data_values.is_some()));
+    properties.insert(
+        "data_values_present".into(),
+        json!(msg.data_values.is_some()),
+    );
     if let Some(ref values) = msg.data_values {
         if !values.is_empty() {
             let (mut min, mut max, mut sum) = (f64::INFINITY, f64::NEG_INFINITY, 0f64);
             for &v in values.iter() {
                 if v.is_finite() {
-                    if v < min { min = v; }
-                    if v > max { max = v; }
+                    if v < min {
+                        min = v;
+                    }
+                    if v > max {
+                        max = v;
+                    }
                     sum += v;
                 }
             }
@@ -873,23 +902,40 @@ pub fn grib_to_source_event(
 /// Emit one SourceEvent per visited grid cell, using `stride` to subsample.
 async fn emit_cells(
     tx: &tokio::sync::mpsc::Sender<SourceEvent>,
-    msg: &GribMessage, grid: &GribGridDefinition, values: &[f64],
-    connector_id: &str, events_processed: &Arc<AtomicU64>, stride: u32,
+    msg: &GribMessage,
+    grid: &GribGridDefinition,
+    values: &[f64],
+    connector_id: &str,
+    events_processed: &Arc<AtomicU64>,
+    stride: u32,
 ) {
     let ni = grid.ni.max(1);
     let nj = grid.nj.max(1);
     let stride = stride.max(1) as usize;
     let param = msg.product_definition.as_ref().map(|p| {
-        lookup_parameter(msg.indicator.discipline, p.parameter_category, p.parameter_number)
+        lookup_parameter(
+            msg.indicator.discipline,
+            p.parameter_category,
+            p.parameter_number,
+        )
     });
     let ref_time = msg.identification.reference_time_string();
-    let lat_sign = if grid.lat_last < grid.lat_first { -1.0 } else { 1.0 };
-    let pname = param.as_ref().map(|p| p.name).unwrap_or("unknown")
-        .to_lowercase().replace(' ', "_");
+    let lat_sign = if grid.lat_last < grid.lat_first {
+        -1.0
+    } else {
+        1.0
+    };
+    let pname = param
+        .as_ref()
+        .map(|p| p.name)
+        .unwrap_or("unknown")
+        .to_lowercase()
+        .replace(' ', "_");
     for j in (0..nj).step_by(stride) {
         for i in (0..ni).step_by(stride) {
             let v = match values.get((j as usize) * (ni as usize) + i as usize) {
-                Some(v) => *v, None => continue,
+                Some(v) => *v,
+                None => continue,
             };
             let mut props = HashMap::new();
             props.insert("value".into(), json!(v));
@@ -901,15 +947,19 @@ async fn emit_cells(
             }
             let evt = SourceEvent {
                 connector_id: connector_id.to_string(),
-                entity_id: format!("grib:{}:{}:{}:{}x{}",
-                    msg.identification.center_id, pname, ref_time, i, j),
+                entity_id: format!(
+                    "grib:{}:{}:{}:{}x{}",
+                    msg.identification.center_id, pname, ref_time, i, j
+                ),
                 entity_type: "weather_grid_cell".to_string(),
                 properties: props,
                 timestamp: Utc::now(),
                 latitude: Some(grid.lat_first + (j as f64) * grid.dj * lat_sign),
                 longitude: Some(grid.lon_first + (i as f64) * grid.di),
             };
-            if tx.send(evt).await.is_err() { return; }
+            if tx.send(evt).await.is_err() {
+                return;
+            }
             events_processed.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -943,11 +993,8 @@ impl Connector for GribConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
+        let path =
+            self.config.url.as_deref().ok_or_else(|| {
                 ConnectorError::ConfigError("GRIB: url (file path) required".into())
             })?;
 
@@ -972,7 +1019,11 @@ impl Connector for GribConnector {
                 Ok(grib_msg) => {
                     let msg_len = (grib_msg.indicator.total_length as usize).max(16);
                     // Summary event (carries min/max/mean when values present).
-                    if tx.send(grib_to_source_event(&grib_msg, &connector_id)).await.is_err() {
+                    if tx
+                        .send(grib_to_source_event(&grib_msg, &connector_id))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     events_processed.fetch_add(1, Ordering::Relaxed);
@@ -982,8 +1033,16 @@ impl Connector for GribConnector {
                     {
                         let stride = if values.len() > 1000 { 10 } else { 1 };
                         if !values.is_empty() {
-                            emit_cells(&tx, &grib_msg, grid, values,
-                                &connector_id, &events_processed, stride).await;
+                            emit_cells(
+                                &tx,
+                                &grib_msg,
+                                grid,
+                                values,
+                                &connector_id,
+                                &events_processed,
+                                stride,
+                            )
+                            .await;
                         }
                     }
                     offset += msg_len;
@@ -1057,7 +1116,9 @@ mod tests {
 
     #[test]
     fn test_parse_grib_indicator_invalid() {
-        let data = vec![0x00, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 4, 0];
+        let data = vec![
+            0x00, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 4, 0,
+        ];
         assert!(parse_grib_indicator(&data).is_err());
     }
 
@@ -1074,22 +1135,22 @@ mod tests {
         // section length (not validated by parser)
         data[0..4].copy_from_slice(&21u32.to_be_bytes());
         data[4] = 1; // section number
-        // center_id = 7 (NCEP)
+                     // center_id = 7 (NCEP)
         data[5..7].copy_from_slice(&7u16.to_be_bytes());
         // subcenter_id = 0
         data[7..9].copy_from_slice(&0u16.to_be_bytes());
         data[9] = 2; // master tables version
         data[10] = 1; // local tables version
         data[11] = 1; // significance
-        // year = 2026
+                      // year = 2026
         data[12..14].copy_from_slice(&2026u16.to_be_bytes());
-        data[14] = 3;  // month
+        data[14] = 3; // month
         data[15] = 26; // day
         data[16] = 12; // hour
-        data[17] = 0;  // minute
-        data[18] = 0;  // second
-        data[19] = 0;  // production_status
-        data[20] = 1;  // data_type
+        data[17] = 0; // minute
+        data[18] = 0; // second
+        data[19] = 0; // production_status
+        data[20] = 1; // data_type
 
         let id = parse_grib_identification(&data).unwrap();
         assert_eq!(id.center_id, 7);
@@ -1142,7 +1203,7 @@ mod tests {
         data[0..4].copy_from_slice(&34u32.to_be_bytes());
         data[4] = 4; // section number
         data[7..9].copy_from_slice(&0u16.to_be_bytes()); // template 0
-        data[9] = 0;  // parameter_category (Temperature)
+        data[9] = 0; // parameter_category (Temperature)
         data[10] = 0; // parameter_number (Temperature)
         data[11] = 2; // generating_process_type
         data[18..22].copy_from_slice(&6u32.to_be_bytes()); // forecast_time = 6h
@@ -1163,7 +1224,7 @@ mod tests {
         data[4] = 5; // section number
         data[5..9].copy_from_slice(&10000u32.to_be_bytes()); // num_data_points
         data[9..11].copy_from_slice(&0u16.to_be_bytes()); // template 0
-        // reference_value as IEEE float (e.g., 273.15)
+                                                          // reference_value as IEEE float (e.g., 273.15)
         let ref_val = 273.15f32;
         data[11..15].copy_from_slice(&ref_val.to_be_bytes());
         data[15..17].copy_from_slice(&(-2i16).to_be_bytes()); // binary_scale_factor
@@ -1266,7 +1327,10 @@ mod tests {
         assert_eq!(event.entity_type, "weather_grid");
         assert!(event.entity_id.contains("grib:7:temperature"));
         assert_eq!(event.properties["parameter_name"], json!("Temperature"));
-        assert_eq!(event.properties["center_name"], json!("NCEP (US National Weather Service)"));
+        assert_eq!(
+            event.properties["center_name"],
+            json!("NCEP (US National Weather Service)")
+        );
         assert!(event.latitude.is_some());
         assert!(event.longitude.is_some());
     }
@@ -1370,12 +1434,12 @@ mod tests {
     fn test_read_bits_basic() {
         // 0xB2=10110010, 0x59=01011001.
         let buf = [0xB2u8, 0x59u8];
-        assert_eq!(read_bits(&buf, 0, 4), Some(0b1011));      // first nibble
-        assert_eq!(read_bits(&buf, 4, 4), Some(0b0010));      // second nibble
-        assert_eq!(read_bits(&buf, 6, 8), Some(0b10010110));  // cross-byte 8 bits
-        assert_eq!(read_bits(&buf, 0, 0), Some(0));           // nbits=0
-        assert_eq!(read_bits(&buf, 12, 8), None);             // out of range
-        assert_eq!(read_bits(&buf, 0, 65), None);             // nbits > 64
+        assert_eq!(read_bits(&buf, 0, 4), Some(0b1011)); // first nibble
+        assert_eq!(read_bits(&buf, 4, 4), Some(0b0010)); // second nibble
+        assert_eq!(read_bits(&buf, 6, 8), Some(0b10010110)); // cross-byte 8 bits
+        assert_eq!(read_bits(&buf, 0, 0), Some(0)); // nbits=0
+        assert_eq!(read_bits(&buf, 12, 8), None); // out of range
+        assert_eq!(read_bits(&buf, 0, 65), None); // nbits > 64
     }
 
     #[test]
@@ -1406,7 +1470,10 @@ mod tests {
             Err(ConnectorError::ParseError(m)) => {
                 assert!(m.contains("Section 7"), "msg: {}", m);
             }
-            other => panic!("expected ParseError, got Ok or non-ParseError: {:?}", other.is_err()),
+            other => panic!(
+                "expected ParseError, got Ok or non-ParseError: {:?}",
+                other.is_err()
+            ),
         }
     }
 
@@ -1428,7 +1495,7 @@ mod tests {
         msg.extend_from_slice(&[0, 0, 0, 2]); // reserved, reserved, discipline, edition
         let len_pos = msg.len();
         msg.extend_from_slice(&[0u8; 8]); // total length placeholder
-        // Section 5 (length 21)
+                                          // Section 5 (length 21)
         msg.extend_from_slice(&21u32.to_be_bytes());
         msg.push(5);
         msg.extend_from_slice(&4u32.to_be_bytes());
@@ -1438,7 +1505,7 @@ mod tests {
         msg.extend_from_slice(&0i16.to_be_bytes());
         msg.push(8);
         msg.extend_from_slice(&[0u8; 1]); // pad to length 21
-        // Section 7
+                                          // Section 7
         msg.extend_from_slice(&9u32.to_be_bytes());
         msg.push(7);
         msg.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
@@ -1448,14 +1515,19 @@ mod tests {
 
         let parsed = parse_grib_message(&msg).expect("parse should not fail");
         assert_eq!(parsed.data_template, 200);
-        assert!(parsed.data_values.is_none(), "values should be None for template 200");
+        assert!(
+            parsed.data_values.is_none(),
+            "values should be None for template 200"
+        );
     }
 
     #[test]
     fn test_unpack_round_trip_10_elements() {
         // Pack 10 known values with simple packing (R=0, E=0, D=2, nbits=16),
         // then run unpacker and verify ≤ 1e-6 deviation per element.
-        let values: Vec<f64> = vec![1.23, 4.56, 7.89, 0.01, 2.50, 99.99, 50.00, 33.33, 12.34, 0.00];
+        let values: Vec<f64> = vec![
+            1.23, 4.56, 7.89, 0.01, 2.50, 99.99, 50.00, 33.33, 12.34, 0.00,
+        ];
         let mut packed: Vec<u8> = Vec::new();
         for v in &values {
             packed.extend_from_slice(&((v * 100.0).round() as u16).to_be_bytes());
@@ -1463,7 +1535,12 @@ mod tests {
         let s5 = drep(16, 0.0, 0, 2, values.len() as u32);
         let out = unpack_template_5_0(&s5, &packed, values.len()).unwrap();
         for (orig, rec) in values.iter().zip(out.iter()) {
-            assert!((orig - rec).abs() <= 1e-6, "round-trip mismatch: {} vs {}", orig, rec);
+            assert!(
+                (orig - rec).abs() <= 1e-6,
+                "round-trip mismatch: {} vs {}",
+                orig,
+                rec
+            );
         }
     }
 
@@ -1483,10 +1560,7 @@ mod tests {
         // (52 bits total). MSB-first, no padding between values.
         // Concatenation as a 52-bit value:
         //   v = (0x123 << 39) | (0x456 << 26) | (0x789 << 13) | 0xABC
-        let v: u64 = (0x123u64 << 39)
-            | (0x456u64 << 26)
-            | (0x789u64 << 13)
-            | 0xABCu64;
+        let v: u64 = (0x123u64 << 39) | (0x456u64 << 26) | (0x789u64 << 13) | 0xABCu64;
         // Left-align the 52-bit packed value in 7 bytes (56 bits) so the
         // first bit lands at offset 0.
         let v_shifted = v << (56 - 52);

@@ -177,9 +177,9 @@ impl OrpError {
             Self::QueryTimeoutError | Self::TimeoutError => StatusCode::REQUEST_TIMEOUT,
 
             // 503 — backing service is unavailable
-            Self::NetworkError(_)
-            | Self::DataSourceError(_)
-            | Self::ConnectorError(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NetworkError(_) | Self::DataSourceError(_) | Self::ConnectorError(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
 
             // 500 — our fault
             _ => StatusCode::INTERNAL_SERVER_ERROR,

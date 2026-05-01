@@ -201,10 +201,7 @@ pub trait Storage: Send + Sync {
     // ── GRAPH / PATH OPERATIONS ──────────────────────────────────────────────
 
     /// Execute a graph-style query (passthrough to Kuzu or DuckDB recursive SQL).
-    async fn graph_query(
-        &self,
-        query_str: &str,
-    ) -> StorageResult<Vec<HashMap<String, JsonValue>>>;
+    async fn graph_query(&self, query_str: &str) -> StorageResult<Vec<HashMap<String, JsonValue>>>;
 
     /// BFS/DFS path search between two entity IDs up to `max_hops`.
     /// Returns all valid paths as sequences of Relationships.

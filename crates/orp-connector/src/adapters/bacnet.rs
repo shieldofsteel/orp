@@ -426,9 +426,7 @@ pub fn parse_bacnet_packet(data: &[u8]) -> Result<BacnetMessage, ConnectorError>
                     if data.len() > iam_offset + 5 {
                         // Application tag 12 = Object Identifier
                         if data[iam_offset] == 0xC4 {
-                            if let Some(oid) =
-                                parse_bacnet_object_id(&data[iam_offset + 1..])
-                            {
+                            if let Some(oid) = parse_bacnet_object_id(&data[iam_offset + 1..]) {
                                 if oid.object_type == 8 {
                                     device_instance = Some(oid.instance);
                                 }
@@ -481,7 +479,10 @@ pub fn parse_bacnet_json(data: &str) -> Result<BacnetMessage, ConnectorError> {
     let value: JsonValue = serde_json::from_str(data)
         .map_err(|e| ConnectorError::ParseError(format!("BACnet JSON: {}", e)))?;
 
-    let device_instance = value.get("device_instance").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let device_instance = value
+        .get("device_instance")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
 
     let object_type_str = value
         .get("object_type")
@@ -539,9 +540,7 @@ pub fn parse_bacnet_json(data: &str) -> Result<BacnetMessage, ConnectorError> {
         "ReadProperty" => BacnetService::ReadProperty,
         "WriteProperty" => BacnetService::WriteProperty,
         "SubscribeCOV" => BacnetService::SubscribeCov,
-        "COVNotification" | "ConfirmedCOVNotification" => {
-            BacnetService::ConfirmedCovNotification
-        }
+        "COVNotification" | "ConfirmedCOVNotification" => BacnetService::ConfirmedCovNotification,
         "UnconfirmedCOVNotification" => BacnetService::UnconfirmedCovNotification,
         "I-Am" => BacnetService::IAm,
         "Who-Is" => BacnetService::WhoIs,
@@ -576,10 +575,7 @@ pub fn parse_bacnet_json(data: &str) -> Result<BacnetMessage, ConnectorError> {
 // ---------------------------------------------------------------------------
 
 /// Convert a BACnet message to a SourceEvent.
-pub fn bacnet_to_source_event(
-    msg: &BacnetMessage,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn bacnet_to_source_event(msg: &BacnetMessage, connector_id: &str) -> SourceEvent {
     let mut properties = HashMap::new();
     properties.insert("service".into(), json!(msg.service.as_str()));
     properties.insert("apdu_type".into(), json!(msg.apdu_type.as_str()));
@@ -593,7 +589,10 @@ pub fn bacnet_to_source_event(
 
     if let Some(pid) = msg.property_id {
         properties.insert("property_id".into(), json!(pid));
-        properties.insert("property_name".into(), json!(BacnetMessage::property_name(pid)));
+        properties.insert(
+            "property_name".into(),
+            json!(BacnetMessage::property_name(pid)),
+        );
     }
 
     if let Some(dev) = msg.device_instance {
@@ -663,13 +662,9 @@ impl Connector for BacnetConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                ConnectorError::ConfigError("BACnet: url (file path) required".into())
-            })?;
+        let path = self.config.url.as_deref().ok_or_else(|| {
+            ConnectorError::ConfigError("BACnet: url (file path) required".into())
+        })?;
 
         let content = tokio::fs::read_to_string(path)
             .await
@@ -818,9 +813,13 @@ mod tests {
         let oid_bytes = dev_oid.to_be_bytes();
         let packet = vec![
             // BVLC
-            0x81, 0x0B, 0x00, 0x14, // broadcast
+            0x81,
+            0x0B,
+            0x00,
+            0x14, // broadcast
             // NPDU
-            0x01, 0x00, // version=1, control=0
+            0x01,
+            0x00, // version=1, control=0
             // APDU: Unconfirmed-Request
             0x10, // type=1 (unconfirmed)
             0x00, // service_choice=0 (I-Am)
@@ -831,9 +830,13 @@ mod tests {
             oid_bytes[2],
             oid_bytes[3],
             // remaining I-Am fields...
-            0x22, 0x01, 0xE0, // max APDU
-            0x91, 0x00, // segmentation
-            0x21, 0x03, // vendor ID
+            0x22,
+            0x01,
+            0xE0, // max APDU
+            0x91,
+            0x00, // segmentation
+            0x21,
+            0x03, // vendor ID
         ];
 
         let msg = parse_bacnet_packet(&packet).unwrap();
@@ -964,18 +967,9 @@ mod tests {
 
     #[test]
     fn test_bacnet_property_values() {
-        assert_eq!(
-            BacnetPropertyValue::Real(72.5).to_json(),
-            json!(72.5)
-        );
-        assert_eq!(
-            BacnetPropertyValue::Boolean(true).to_json(),
-            json!(true)
-        );
-        assert_eq!(
-            BacnetPropertyValue::UnsignedInt(42).to_json(),
-            json!(42)
-        );
+        assert_eq!(BacnetPropertyValue::Real(72.5).to_json(), json!(72.5));
+        assert_eq!(BacnetPropertyValue::Boolean(true).to_json(), json!(true));
+        assert_eq!(BacnetPropertyValue::UnsignedInt(42).to_json(), json!(42));
         assert_eq!(
             BacnetPropertyValue::CharString("test".into()).to_json(),
             json!("test")

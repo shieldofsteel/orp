@@ -96,9 +96,7 @@ fn validate_security(s: &SecurityConfig, errors: &mut Vec<String>) {
             );
         }
         if s.oidc.client_id.is_none() {
-            errors.push(
-                "security.oidc.client_id must be set when oidc.enabled = true".to_string(),
-            );
+            errors.push("security.oidc.client_id must be set when oidc.enabled = true".to_string());
         }
     }
 }
@@ -109,13 +107,13 @@ fn validate_connectors(connectors: &[ConnectorDef], errors: &mut Vec<String>) {
         if c.name.is_empty() {
             errors.push(format!("connectors[{i}].name must not be empty"));
         } else if !names.insert(c.name.as_str()) {
-            errors.push(format!(
-                "connectors[{i}].name '{}' is duplicated",
-                c.name
-            ));
+            errors.push(format!("connectors[{i}].name '{}' is duplicated", c.name));
         }
         if c.connector_type.is_empty() {
-            errors.push(format!("connectors[{i}] ('{}') type must not be empty", c.name));
+            errors.push(format!(
+                "connectors[{i}] ('{}') type must not be empty",
+                c.name
+            ));
         }
         if c.entity_type.is_empty() {
             errors.push(format!(
@@ -145,9 +143,7 @@ fn validate_entity_resolution(er: &EntityResolutionConfig, errors: &mut Vec<Stri
                 .to_string(),
         );
     }
-    if er.probabilistic.confidence_threshold < 0.0
-        || er.probabilistic.confidence_threshold > 1.0
-    {
+    if er.probabilistic.confidence_threshold < 0.0 || er.probabilistic.confidence_threshold > 1.0 {
         errors.push(format!(
             "entity_resolution.probabilistic.confidence_threshold {} is out of range [0.0, 1.0]",
             er.probabilistic.confidence_threshold
@@ -449,7 +445,9 @@ mod tests {
             ..Config::default()
         };
         let errs = validate_config(&config).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("entity_type must not be empty")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("entity_type must not be empty")));
     }
 
     #[test]

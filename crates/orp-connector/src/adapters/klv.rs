@@ -4,14 +4,10 @@
 //! ST 0601 metadata in-band with H.264/H.265 video. Without parsing it, drone
 //! video can't be fused with ground tracks.
 //!
-//! Wire format:
-//!   ST 0601 packet =
-//!     16-byte Universal Key (06 0E 2B 34 02 0B 01 01 0E 01 03 01 01 00 00 00)
-//!     BER-encoded length
-//!     Local set: { 1-byte tag, BER-encoded length, value bytes }*
-//!
-//! Tag 1 (Checksum) carries a 16-bit BSD checksum over key+length+all bytes
-//! up to (but excluding) the checksum value itself.
+//! Wire format: 16-byte Universal Key + BER-encoded length + local set
+//! (1-byte tag + BER-encoded length + value bytes), repeated. Tag 1 holds a
+//! 16-bit BSD checksum covering key+length+all bytes up to (but excluding)
+//! the checksum value itself.
 //!
 //! URL schemes:
 //!   `klv://0.0.0.0:8000`     — raw KLV over UDP
@@ -19,24 +15,17 @@
 
 #![allow(dead_code)]
 
-use crate::traits::{
-    Connector, ConnectorConfig, ConnectorError, ConnectorStats, SourceEvent,
-};
+use crate::traits::{Connector, ConnectorConfig, ConnectorError, ConnectorStats, SourceEvent};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+use std::sync::Arc;
 
 /// MISB ST 0601 Universal Key (SMPTE 336M UL designator).
 pub const ST0601_UNIVERSAL_KEY: [u8; 16] = [
-    0x06, 0x0E, 0x2B, 0x34, 0x02, 0x0B, 0x01, 0x01,
-    0x0E, 0x01, 0x03, 0x01, 0x01, 0x00, 0x00, 0x00,
+    0x06, 0x0E, 0x2B, 0x34, 0x02, 0x0B, 0x01, 0x01, 0x0E, 0x01, 0x03, 0x01, 0x01, 0x00, 0x00, 0x00,
 ];
 
 /// ST 0601 local-set tag identifiers we decode.
@@ -111,14 +100,18 @@ pub fn parse_ber_length(buf: &[u8]) -> Result<(usize, usize), ConnectorError> {
         )));
     }
     if 1 + n > buf.len() {
-        return Err(ConnectorError::ParseError("KLV: truncated BER length".into()));
+        return Err(ConnectorError::ParseError(
+            "KLV: truncated BER length".into(),
+        ));
     }
     let mut len: u64 = 0;
     for &b in &buf[1..=n] {
         len = (len << 8) | (b as u64);
     }
     if len > usize::MAX as u64 {
-        return Err(ConnectorError::ParseError("KLV: BER length overflow".into()));
+        return Err(ConnectorError::ParseError(
+            "KLV: BER length overflow".into(),
+        ));
     }
     Ok((len as usize, 1 + n))
 }
@@ -146,14 +139,18 @@ pub fn bsd_checksum_16(data: &[u8]) -> u16 {
 /// int32 → ±90° (i32::MIN reserved sentinel).
 pub fn decode_lat_int32(raw: &[u8]) -> Option<f64> {
     let v = (raw.len() == 4).then(|| i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))?;
-    if v == i32::MIN { return None; }
+    if v == i32::MIN {
+        return None;
+    }
     Some(v as f64 * 90.0 / (i32::MAX as f64))
 }
 
 /// int32 → ±180°.
 pub fn decode_lon_int32(raw: &[u8]) -> Option<f64> {
     let v = (raw.len() == 4).then(|| i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))?;
-    if v == i32::MIN { return None; }
+    if v == i32::MIN {
+        return None;
+    }
     Some(v as f64 * 180.0 / (i32::MAX as f64))
 }
 
@@ -166,7 +163,9 @@ pub fn decode_heading_uint16(raw: &[u8]) -> Option<f64> {
 /// int16 → ±20° (i16::MIN reserved).
 pub fn decode_pitch_roll_int16(raw: &[u8]) -> Option<f64> {
     let v = (raw.len() == 2).then(|| i16::from_be_bytes([raw[0], raw[1]]))?;
-    if v == i16::MIN { return None; }
+    if v == i16::MIN {
+        return None;
+    }
     Some(v as f64 * 20.0 / (i16::MAX as f64))
 }
 
@@ -184,7 +183,9 @@ pub fn decode_fov_uint16(raw: &[u8]) -> Option<f64> {
 
 /// 8-byte big-endian u64 microseconds since UNIX epoch.
 pub fn decode_precision_timestamp(raw: &[u8]) -> Option<u64> {
-    if raw.len() != 8 { return None; }
+    if raw.len() != 8 {
+        return None;
+    }
     let mut buf = [0u8; 8];
     buf.copy_from_slice(raw);
     Some(u64::from_be_bytes(buf))
@@ -217,7 +218,9 @@ pub fn parse_st0601_set(buf: &[u8]) -> Result<(St0601Packet, usize), ConnectorEr
     let total_len = header_len + set_len;
     if total_len > buf.len() {
         return Err(parse_err(format!(
-            "KLV: declared length {} exceeds buffer ({})", total_len, buf.len()
+            "KLV: declared length {} exceeds buffer ({})",
+            total_len,
+            buf.len()
         )));
     }
 
@@ -235,7 +238,8 @@ pub fn parse_st0601_set(buf: &[u8]) -> Result<(St0601Packet, usize), ConnectorEr
         idx += vl_consumed;
         if idx + val_len > body.len() {
             return Err(parse_err(format!(
-                "KLV: tag {} value length {} exceeds set body", tag, val_len
+                "KLV: tag {} value length {} exceeds set body",
+                tag, val_len
             )));
         }
         let val = &body[idx..idx + val_len];
@@ -255,7 +259,9 @@ pub fn parse_st0601_set(buf: &[u8]) -> Result<(St0601Packet, usize), ConnectorEr
                     )));
                 }
             }
-            tag::PRECISION_TIMESTAMP => packet.precision_timestamp_us = decode_precision_timestamp(val),
+            tag::PRECISION_TIMESTAMP => {
+                packet.precision_timestamp_us = decode_precision_timestamp(val)
+            }
             tag::MISSION_ID => packet.mission_id = decode_ascii(val),
             tag::PLATFORM_TAIL_NUMBER => packet.platform_tail_number = decode_ascii(val),
             tag::PLATFORM_HEADING_ANGLE => packet.platform_heading_deg = decode_heading_uint16(val),
@@ -264,12 +270,18 @@ pub fn parse_st0601_set(buf: &[u8]) -> Result<(St0601Packet, usize), ConnectorEr
             tag::PLATFORM_DESIGNATION => packet.platform_designation = decode_ascii(val),
             tag::SENSOR_LATITUDE => packet.sensor_latitude_deg = decode_lat_int32(val),
             tag::SENSOR_LONGITUDE => packet.sensor_longitude_deg = decode_lon_int32(val),
-            tag::SENSOR_TRUE_ALTITUDE => packet.sensor_true_altitude_m = decode_altitude_uint16(val),
+            tag::SENSOR_TRUE_ALTITUDE => {
+                packet.sensor_true_altitude_m = decode_altitude_uint16(val)
+            }
             tag::SENSOR_HFOV => packet.sensor_hfov_deg = decode_fov_uint16(val),
             tag::SENSOR_VFOV => packet.sensor_vfov_deg = decode_fov_uint16(val),
             tag::FRAME_CENTRE_LATITUDE => packet.frame_centre_latitude_deg = decode_lat_int32(val),
-            tag::FRAME_CENTRE_LONGITUDE => packet.frame_centre_longitude_deg = decode_lon_int32(val),
-            tag::FRAME_CENTRE_ELEVATION => packet.frame_centre_elevation_m = decode_altitude_uint16(val),
+            tag::FRAME_CENTRE_LONGITUDE => {
+                packet.frame_centre_longitude_deg = decode_lon_int32(val)
+            }
+            tag::FRAME_CENTRE_ELEVATION => {
+                packet.frame_centre_elevation_m = decode_altitude_uint16(val)
+            }
             other => packet.raw_tags.push((other, val.to_vec())),
         }
         idx += val_len;
@@ -289,7 +301,10 @@ pub fn parse_all_sets(buf: &[u8]) -> (Vec<St0601Packet>, Result<(), ConnectorErr
             continue;
         }
         match parse_st0601_set(&buf[offset..]) {
-            Ok((pkt, used)) => { out.push(pkt); offset += used; }
+            Ok((pkt, used)) => {
+                out.push(pkt);
+                offset += used;
+            }
             Err(e) => return (out, Err(e)),
         }
     }
@@ -314,7 +329,13 @@ pub fn packet_to_source_event(
     };
 
     let mut p: HashMap<String, serde_json::Value> = HashMap::new();
-    macro_rules! ins { ($k:expr, $v:expr) => { if let Some(v) = $v { p.insert($k.into(), json!(v)); } }; }
+    macro_rules! ins {
+        ($k:expr, $v:expr) => {
+            if let Some(v) = $v {
+                p.insert($k.into(), json!(v));
+            }
+        };
+    }
     ins!("precision_timestamp_us", pkt.precision_timestamp_us);
     ins!("mission_id", pkt.mission_id.as_ref());
     ins!("platform_tail_number", pkt.platform_tail_number.as_ref());
@@ -367,14 +388,18 @@ pub struct KlvUrl {
 
 pub fn parse_klv_url(url: &str) -> Result<KlvUrl, ConnectorError> {
     let cfg = |m: String| ConnectorError::ConfigError(m);
-    let (scheme, rest) = url.split_once("://")
+    let (scheme, rest) = url
+        .split_once("://")
         .ok_or_else(|| cfg(format!("KLV: URL missing scheme separator: {}", url)))?;
     let transport = match scheme {
         "klv" => KlvTransport::UdpRaw,
         "klv-ts" => KlvTransport::UdpMpegTs,
-        other => return Err(cfg(format!(
-            "KLV: unsupported scheme '{}', expected klv:// or klv-ts://", other
-        ))),
+        other => {
+            return Err(cfg(format!(
+                "KLV: unsupported scheme '{}', expected klv:// or klv-ts://",
+                other
+            )))
+        }
     };
     if rest.is_empty() {
         return Err(cfg("KLV: URL missing host:port".into()));
@@ -382,7 +407,10 @@ pub fn parse_klv_url(url: &str) -> Result<KlvUrl, ConnectorError> {
     if !rest.contains(':') {
         return Err(cfg(format!("KLV: URL missing port: {}", url)));
     }
-    Ok(KlvUrl { transport, bind_addr: rest.to_string() })
+    Ok(KlvUrl {
+        transport,
+        bind_addr: rest.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -421,9 +449,14 @@ impl Connector for KlvConnector {
             ConnectorError::ConfigError("KLV: url required (klv://host:port)".into())
         })?;
         let parsed = parse_klv_url(url)?;
-        let socket = tokio::net::UdpSocket::bind(&parsed.bind_addr).await.map_err(|e| {
-            ConnectorError::ConnectionError(format!("KLV: cannot bind UDP {}: {}", parsed.bind_addr, e))
-        })?;
+        let socket = tokio::net::UdpSocket::bind(&parsed.bind_addr)
+            .await
+            .map_err(|e| {
+                ConnectorError::ConnectionError(format!(
+                    "KLV: cannot bind UDP {}: {}",
+                    parsed.bind_addr, e
+                ))
+            })?;
         tracing::info!(
             connector_id = %self.config.connector_id,
             bind_addr = %parsed.bind_addr,
@@ -444,7 +477,8 @@ impl Connector for KlvConnector {
                 let recv = tokio::time::timeout(
                     std::time::Duration::from_millis(500),
                     socket.recv_from(&mut buf),
-                ).await;
+                )
+                .await;
                 let (n, peer) = match recv {
                     Ok(Ok((n, peer))) => (n, peer),
                     Ok(Err(e)) => {
@@ -457,7 +491,9 @@ impl Connector for KlvConnector {
                 let payload: &[u8] = match transport {
                     KlvTransport::UdpRaw => &buf[..n],
                     KlvTransport::UdpMpegTs => {
-                        tracing::warn!("KLV: klv-ts:// MPEG-TS framing not implemented (TODO); drop");
+                        tracing::warn!(
+                            "KLV: klv-ts:// MPEG-TS framing not implemented (TODO); drop"
+                        );
                         errors_count.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -469,7 +505,9 @@ impl Connector for KlvConnector {
                 }
                 for pkt in &packets {
                     let ev = packet_to_source_event(pkt, &connector_id, &peer.to_string());
-                    if tx.send(ev).await.is_err() { return; }
+                    if tx.send(ev).await.is_err() {
+                        return;
+                    }
                     events_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -491,7 +529,9 @@ impl Connector for KlvConnector {
         }
     }
 
-    fn config(&self) -> &ConnectorConfig { &self.config }
+    fn config(&self) -> &ConnectorConfig {
+        &self.config
+    }
 
     fn stats(&self) -> ConnectorStats {
         ConnectorStats {
@@ -530,7 +570,10 @@ mod tests {
             return;
         }
         let bytes = len.to_be_bytes();
-        let nz = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+        let nz = bytes
+            .iter()
+            .position(|&b| b != 0)
+            .unwrap_or(bytes.len() - 1);
         let n = bytes.len() - nz;
         out.push(0x80 | n as u8);
         out.extend_from_slice(&bytes[nz..]);
@@ -544,7 +587,11 @@ mod tests {
             ber_encode_len(&mut body, v.len());
             body.extend_from_slice(v);
         }
-        let body_total = if with_checksum { body.len() + 4 } else { body.len() };
+        let body_total = if with_checksum {
+            body.len() + 4
+        } else {
+            body.len()
+        };
         let mut packet = Vec::new();
         packet.extend_from_slice(&ST0601_UNIVERSAL_KEY);
         ber_encode_len(&mut packet, body_total);
@@ -575,9 +622,18 @@ mod tests {
     fn test_url_parse_bad_scheme() {
         let err = parse_klv_url("tcp://0.0.0.0:8000").unwrap_err();
         assert!(matches!(err, ConnectorError::ConfigError(ref m) if m.contains("scheme")));
-        assert!(matches!(parse_klv_url("not-a-url"), Err(ConnectorError::ConfigError(_))));
-        assert!(matches!(parse_klv_url("klv://"), Err(ConnectorError::ConfigError(_))));
-        assert!(matches!(parse_klv_url("klv://0.0.0.0"), Err(ConnectorError::ConfigError(_))));
+        assert!(matches!(
+            parse_klv_url("not-a-url"),
+            Err(ConnectorError::ConfigError(_))
+        ));
+        assert!(matches!(
+            parse_klv_url("klv://"),
+            Err(ConnectorError::ConfigError(_))
+        ));
+        assert!(matches!(
+            parse_klv_url("klv://0.0.0.0"),
+            Err(ConnectorError::ConfigError(_))
+        ));
     }
 
     // 3. Universal Key: 16-byte key match → continue, mismatch → drop.
@@ -618,9 +674,9 @@ mod tests {
         assert_eq!((len, used), (65536, 5));
 
         assert!(parse_ber_length(&[0x82, 0x01]).is_err()); // truncated
-        assert!(parse_ber_length(&[]).is_err());           // empty
-        assert!(parse_ber_length(&[0x80]).is_err());       // indefinite
-        assert!(parse_ber_length(&[0x89]).is_err());       // n > 8
+        assert!(parse_ber_length(&[]).is_err()); // empty
+        assert!(parse_ber_length(&[0x80]).is_err()); // indefinite
+        assert!(parse_ber_length(&[0x89]).is_err()); // n > 8
     }
 
     // 6. Tag 13/14 lat/lon decode.
@@ -695,7 +751,10 @@ mod tests {
         packet.push(tag::PLATFORM_TAIL_NUMBER);
         packet.push(0x10); // claims 16 bytes, only 1 available
         packet.push(0xAA);
-        assert!(matches!(parse_st0601_set(&packet), Err(ConnectorError::ParseError(_))));
+        assert!(matches!(
+            parse_st0601_set(&packet),
+            Err(ConnectorError::ParseError(_))
+        ));
     }
 
     // 10. Multiple metadata sets in one buffer → all decoded.
@@ -769,16 +828,25 @@ mod tests {
             platform_tail_number: Some("AF-9".into()),
             ..Default::default()
         };
-        assert_eq!(packet_to_source_event(&p, "k", "1.1.1.1:1").entity_id, "OP1-AF-9");
+        assert_eq!(
+            packet_to_source_event(&p, "k", "1.1.1.1:1").entity_id,
+            "OP1-AF-9"
+        );
 
         let p = St0601Packet {
             platform_tail_number: Some("AF-9".into()),
             ..Default::default()
         };
-        assert_eq!(packet_to_source_event(&p, "k", "1.1.1.1:1").entity_id, "klv-AF-9");
+        assert_eq!(
+            packet_to_source_event(&p, "k", "1.1.1.1:1").entity_id,
+            "klv-AF-9"
+        );
 
         let p = St0601Packet::default();
-        assert_eq!(packet_to_source_event(&p, "k", "1.1.1.1:1").entity_id, "klv-1.1.1.1:1");
+        assert_eq!(
+            packet_to_source_event(&p, "k", "1.1.1.1:1").entity_id,
+            "klv-1.1.1.1:1"
+        );
     }
 
     #[test]
@@ -797,13 +865,19 @@ mod tests {
     async fn test_klv_start_invalid_scheme_returns_config_error() {
         let c = KlvConnector::new(cfg("klv-bad", Some("tcp://127.0.0.1:0")));
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        assert!(matches!(c.start(tx).await, Err(ConnectorError::ConfigError(_))));
+        assert!(matches!(
+            c.start(tx).await,
+            Err(ConnectorError::ConfigError(_))
+        ));
     }
 
     #[tokio::test]
     async fn test_klv_start_no_url_returns_config_error() {
         let c = KlvConnector::new(cfg("klv-nourl", None));
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        assert!(matches!(c.start(tx).await, Err(ConnectorError::ConfigError(_))));
+        assert!(matches!(
+            c.start(tx).await,
+            Err(ConnectorError::ConfigError(_))
+        ));
     }
 }

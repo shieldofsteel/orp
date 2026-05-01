@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use base64::Engine;
 use chrono::Utc;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// CCSDS primary header fixed length in bytes (CCSDS 133.0-B-2 §4.1.3).
 pub const CCSDS_PRIMARY_HEADER_LEN: usize = 6;
@@ -55,7 +55,9 @@ pub fn parse_url(url: &str) -> Result<CcsdsMode, ConnectorError> {
                 "tle+ URL must wrap http(s)://, got '{rest}'"
             )));
         }
-        return Ok(CcsdsMode::Tle { url: rest.to_string() });
+        return Ok(CcsdsMode::Tle {
+            url: rest.to_string(),
+        });
     }
     if let Some(addr) = url.strip_prefix("ccsds-udp://") {
         if addr.is_empty() {
@@ -63,7 +65,9 @@ pub fn parse_url(url: &str) -> Result<CcsdsMode, ConnectorError> {
                 "ccsds-udp:// URL is missing host:port".to_string(),
             ));
         }
-        return Ok(CcsdsMode::Ccsds { addr: addr.to_string() });
+        return Ok(CcsdsMode::Ccsds {
+            addr: addr.to_string(),
+        });
     }
     Err(ConnectorError::ConfigError(format!(
         "unsupported CCSDS URL scheme: '{url}' (expected tle+https:// or ccsds-udp://)"
@@ -85,7 +89,9 @@ pub struct CcsdsPrimaryHeader {
 impl CcsdsPrimaryHeader {
     /// Total bytes of (secondary header + user data) the primary header
     /// claims follows it. CCSDS encodes this as `len - 1`, so we add 1.
-    pub fn data_field_length(&self) -> usize { self.packet_length as usize + 1 }
+    pub fn data_field_length(&self) -> usize {
+        self.packet_length as usize + 1
+    }
 
     /// Encode to the wire-format 6 bytes — inverse of [`Self::decode`].
     pub fn encode(&self) -> [u8; CCSDS_PRIMARY_HEADER_LEN] {
@@ -107,7 +113,8 @@ impl CcsdsPrimaryHeader {
         if buf.len() < CCSDS_PRIMARY_HEADER_LEN {
             return Err(ConnectorError::ParseError(format!(
                 "CCSDS packet too small: {} < {} bytes",
-                buf.len(), CCSDS_PRIMARY_HEADER_LEN
+                buf.len(),
+                CCSDS_PRIMARY_HEADER_LEN
             )));
         }
         let word0 = u16::from_be_bytes([buf[0], buf[1]]);
@@ -147,7 +154,8 @@ pub fn decode_ccsds_packet(
     if buf.len() < total_required {
         return Err(ConnectorError::ParseError(format!(
             "CCSDS packet truncated: claimed {} bytes, only {} available",
-            claimed, buf.len() - CCSDS_PRIMARY_HEADER_LEN
+            claimed,
+            buf.len() - CCSDS_PRIMARY_HEADER_LEN
         )));
     }
     let data_field = &buf[CCSDS_PRIMARY_HEADER_LEN..total_required];
@@ -155,7 +163,8 @@ pub fn decode_ccsds_packet(
         if data_field.len() < secondary_header_len {
             return Err(ConnectorError::ParseError(format!(
                 "CCSDS secondary header truncated: need {} bytes, have {}",
-                secondary_header_len, data_field.len()
+                secondary_header_len,
+                data_field.len()
             )));
         }
         let (sh, ud) = data_field.split_at(secondary_header_len);
@@ -163,7 +172,11 @@ pub fn decode_ccsds_packet(
     } else {
         (Vec::new(), data_field.to_vec())
     };
-    Ok(CcsdsPacket { header, secondary_header, user_data })
+    Ok(CcsdsPacket {
+        header,
+        secondary_header,
+        user_data,
+    })
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -172,18 +185,36 @@ fn b64(bytes: &[u8]) -> String {
 
 fn ccsds_packet_to_event(pkt: &CcsdsPacket, connector_id: &str, entity_type: &str) -> SourceEvent {
     let mut properties = HashMap::new();
-    properties.insert("apid".into(), serde_json::Value::Number(pkt.header.apid.into()));
-    properties.insert("sequence_count".into(), serde_json::Value::Number(pkt.header.sequence_count.into()));
-    properties.insert("packet_length".into(), serde_json::Value::Number(pkt.header.packet_length.into()));
-    properties.insert("packet_type".into(), serde_json::Value::Number(pkt.header.packet_type.into()));
-    properties.insert("sec_hdr_flag".into(), serde_json::Value::Bool(pkt.header.sec_hdr_flag));
+    properties.insert(
+        "apid".into(),
+        serde_json::Value::Number(pkt.header.apid.into()),
+    );
+    properties.insert(
+        "sequence_count".into(),
+        serde_json::Value::Number(pkt.header.sequence_count.into()),
+    );
+    properties.insert(
+        "packet_length".into(),
+        serde_json::Value::Number(pkt.header.packet_length.into()),
+    );
+    properties.insert(
+        "packet_type".into(),
+        serde_json::Value::Number(pkt.header.packet_type.into()),
+    );
+    properties.insert(
+        "sec_hdr_flag".into(),
+        serde_json::Value::Bool(pkt.header.sec_hdr_flag),
+    );
     if !pkt.secondary_header.is_empty() {
         properties.insert(
             "secondary_header_b64".into(),
             serde_json::Value::String(b64(&pkt.secondary_header)),
         );
     }
-    properties.insert("user_data_b64".into(), serde_json::Value::String(b64(&pkt.user_data)));
+    properties.insert(
+        "user_data_b64".into(),
+        serde_json::Value::String(b64(&pkt.user_data)),
+    );
     SourceEvent {
         connector_id: connector_id.to_string(),
         entity_id: format!("ccsds-apid-{}", pkt.header.apid),
@@ -233,18 +264,39 @@ fn tle_to_event(
 ) -> SourceEvent {
     let (lat, lon, alt) = teme_to_geodetic(prediction.position, elements.epoch());
     let mut properties = HashMap::new();
-    properties.insert("norad_cat_id".into(), serde_json::Value::Number(elements.norad_id.into()));
+    properties.insert(
+        "norad_cat_id".into(),
+        serde_json::Value::Number(elements.norad_id.into()),
+    );
     if let Some(ref name) = elements.object_name {
-        properties.insert("object_name".into(), serde_json::Value::String(name.clone()));
+        properties.insert(
+            "object_name".into(),
+            serde_json::Value::String(name.clone()),
+        );
     }
     if let Some(ref id) = elements.international_designator {
-        properties.insert("international_designator".into(), serde_json::Value::String(id.clone()));
+        properties.insert(
+            "international_designator".into(),
+            serde_json::Value::String(id.clone()),
+        );
     }
     insert_f64(&mut properties, "inclination_deg", elements.inclination);
     insert_f64(&mut properties, "eccentricity", elements.eccentricity);
-    insert_f64(&mut properties, "mean_motion_rev_per_day", elements.mean_motion);
-    insert_f64(&mut properties, "right_ascension_deg", elements.right_ascension);
-    insert_f64(&mut properties, "argument_of_perigee_deg", elements.argument_of_perigee);
+    insert_f64(
+        &mut properties,
+        "mean_motion_rev_per_day",
+        elements.mean_motion,
+    );
+    insert_f64(
+        &mut properties,
+        "right_ascension_deg",
+        elements.right_ascension,
+    );
+    insert_f64(
+        &mut properties,
+        "argument_of_perigee_deg",
+        elements.argument_of_perigee,
+    );
     insert_f64(&mut properties, "mean_anomaly_deg", elements.mean_anomaly);
     insert_f64(&mut properties, "altitude_km", alt);
     insert_f64(&mut properties, "velocity_x_km_s", prediction.velocity[0]);
@@ -320,135 +372,145 @@ impl CcsdsConnector {
     }
 
     fn poll_interval_secs(&self) -> u64 {
-        self.config.properties.get("poll_interval_secs")
+        self.config
+            .properties
+            .get("poll_interval_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
     }
 
     fn secondary_header_len(&self) -> usize {
-        self.config.properties.get("secondary_header_len")
+        self.config
+            .properties
+            .get("secondary_header_len")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_SECONDARY_HEADER_LEN)
     }
 
-    async fn run_tle_loop(
-        url: String, running: Arc<AtomicBool>, events_count: Arc<AtomicU64>,
-        errors_count: Arc<AtomicU64>, tx: tokio::sync::mpsc::Sender<SourceEvent>,
-        connector_id: String, entity_type: String, poll_secs: u64,
-    ) {
+    async fn run_tle_loop(ctx: RunCtx, url: String, poll_secs: u64) {
         let client = reqwest::Client::new();
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll_secs.max(1)));
-        while running.load(Ordering::SeqCst) {
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(poll_secs.max(1)));
+        while ctx.running.load(Ordering::SeqCst) {
             interval.tick().await;
             let body = match client.get(&url).send().await {
                 Ok(r) => match r.text().await {
                     Ok(t) => t,
                     Err(e) => {
-                        tracing::warn!("CCSDS/TLE body read failed: {}", e);
-                        errors_count.fetch_add(1, Ordering::Relaxed);
+                        ctx.bump_err(format!("body read failed: {e}"));
                         continue;
                     }
                 },
                 Err(e) => {
-                    tracing::warn!("CCSDS/TLE fetch failed: {}", e);
-                    errors_count.fetch_add(1, Ordering::Relaxed);
+                    ctx.bump_err(format!("fetch failed: {e}"));
                     continue;
                 }
             };
             let elements_vec = match parse_tle_feed(&body) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!("CCSDS/TLE parse failed: {}", e);
-                    errors_count.fetch_add(1, Ordering::Relaxed);
+                    ctx.bump_err(format!("parse failed: {e}"));
                     continue;
                 }
             };
             for elements in &elements_vec {
                 match propagate_to_now(elements) {
                     Ok(pred) => {
-                        let event = tle_to_event(elements, &pred, &connector_id, &entity_type);
-                        if tx.send(event).await.is_err() {
+                        let event =
+                            tle_to_event(elements, &pred, &ctx.connector_id, &ctx.entity_type);
+                        if ctx.tx.send(event).await.is_err() {
                             return;
                         }
-                        events_count.fetch_add(1, Ordering::Relaxed);
+                        ctx.events_count.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(e) => {
-                        tracing::warn!("CCSDS/SGP4 propagation failed for sat {}: {}", elements.norad_id, e);
-                        errors_count.fetch_add(1, Ordering::Relaxed);
-                    }
+                    Err(e) => ctx.bump_err(format!("SGP4 sat {}: {e}", elements.norad_id)),
                 }
             }
         }
     }
 
-    async fn run_ccsds_udp_loop(
-        addr: String, running: Arc<AtomicBool>, events_count: Arc<AtomicU64>,
-        errors_count: Arc<AtomicU64>, tx: tokio::sync::mpsc::Sender<SourceEvent>,
-        connector_id: String, entity_type: String, secondary_header_len: usize,
-    ) {
+    async fn run_ccsds_udp_loop(ctx: RunCtx, addr: String, secondary_header_len: usize) {
         let socket = match tokio::net::UdpSocket::bind(&addr).await {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("CCSDS UDP bind {} failed: {}", addr, e);
-                errors_count.fetch_add(1, Ordering::Relaxed);
+                ctx.bump_err(format!("UDP bind {addr} failed: {e}"));
                 return;
             }
         };
         tracing::info!("CCSDS connector listening on UDP {}", addr);
         let mut buf = vec![0u8; 65535];
-        while running.load(Ordering::SeqCst) {
+        while ctx.running.load(Ordering::SeqCst) {
             match socket.recv_from(&mut buf).await {
-                Ok((n, _from)) => match decode_ccsds_packet(&buf[..n], secondary_header_len) {
+                Ok((n, _)) => match decode_ccsds_packet(&buf[..n], secondary_header_len) {
                     Ok(pkt) => {
-                        let event = ccsds_packet_to_event(&pkt, &connector_id, &entity_type);
-                        if tx.send(event).await.is_err() {
+                        let event =
+                            ccsds_packet_to_event(&pkt, &ctx.connector_id, &ctx.entity_type);
+                        if ctx.tx.send(event).await.is_err() {
                             return;
                         }
-                        events_count.fetch_add(1, Ordering::Relaxed);
+                        ctx.events_count.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(e) => {
-                        tracing::warn!("CCSDS packet decode error: {}", e);
-                        errors_count.fetch_add(1, Ordering::Relaxed);
-                    }
+                    Err(e) => ctx.bump_err(format!("decode: {e}")),
                 },
-                Err(e) => {
-                    tracing::warn!("CCSDS UDP recv error: {}", e);
-                    errors_count.fetch_add(1, Ordering::Relaxed);
-                }
+                Err(e) => ctx.bump_err(format!("UDP recv: {e}")),
             }
         }
     }
 }
 
+/// Shared state passed to each background loop. Lets the loops bump
+/// counters and emit events without copying many `Arc`s as separate
+/// arguments.
+#[derive(Clone)]
+struct RunCtx {
+    running: Arc<AtomicBool>,
+    events_count: Arc<AtomicU64>,
+    errors_count: Arc<AtomicU64>,
+    tx: tokio::sync::mpsc::Sender<SourceEvent>,
+    connector_id: String,
+    entity_type: String,
+}
+
+impl RunCtx {
+    fn bump_err(&self, msg: String) {
+        tracing::warn!("CCSDS: {}", msg);
+        self.errors_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[async_trait]
 impl Connector for CcsdsConnector {
-    fn connector_id(&self) -> &str { &self.config.connector_id }
+    fn connector_id(&self) -> &str {
+        &self.config.connector_id
+    }
 
-    async fn start(&self, tx: tokio::sync::mpsc::Sender<SourceEvent>) -> Result<(), ConnectorError> {
-        let url = self.config.url.clone()
-            .ok_or_else(|| ConnectorError::ConfigError("CCSDS connector requires a URL".into()))?;
+    async fn start(
+        &self,
+        tx: tokio::sync::mpsc::Sender<SourceEvent>,
+    ) -> Result<(), ConnectorError> {
+        let url =
+            self.config.url.clone().ok_or_else(|| {
+                ConnectorError::ConfigError("CCSDS connector requires a URL".into())
+            })?;
         let mode = parse_url(&url)?;
         self.running.store(true, Ordering::SeqCst);
-        let running = self.running.clone();
-        let events_count = self.events_count.clone();
-        let errors_count = self.errors_count.clone();
-        let connector_id = self.config.connector_id.clone();
-        let entity_type = self.config.entity_type.clone();
+        let ctx = RunCtx {
+            running: self.running.clone(),
+            events_count: self.events_count.clone(),
+            errors_count: self.errors_count.clone(),
+            tx,
+            connector_id: self.config.connector_id.clone(),
+            entity_type: self.config.entity_type.clone(),
+        };
         match mode {
             CcsdsMode::Tle { url } => {
                 let poll_secs = self.poll_interval_secs();
-                tokio::spawn(Self::run_tle_loop(
-                    url, running, events_count, errors_count, tx,
-                    connector_id, entity_type, poll_secs,
-                ));
+                tokio::spawn(Self::run_tle_loop(ctx, url, poll_secs));
             }
             CcsdsMode::Ccsds { addr } => {
                 let sh_len = self.secondary_header_len();
-                tokio::spawn(Self::run_ccsds_udp_loop(
-                    addr, running, events_count, errors_count, tx,
-                    connector_id, entity_type, sh_len,
-                ));
+                tokio::spawn(Self::run_ccsds_udp_loop(ctx, addr, sh_len));
             }
         }
         Ok(())
@@ -467,7 +529,9 @@ impl Connector for CcsdsConnector {
         }
     }
 
-    fn config(&self) -> &ConnectorConfig { &self.config }
+    fn config(&self) -> &ConnectorConfig {
+        &self.config
+    }
 
     fn stats(&self) -> ConnectorStats {
         ConnectorStats {
@@ -507,7 +571,9 @@ mod tests {
     fn test_parse_url_tle_https() {
         assert_eq!(
             parse_url("tle+https://celestrak.org/x.txt").expect("ok"),
-            CcsdsMode::Tle { url: "https://celestrak.org/x.txt".into() }
+            CcsdsMode::Tle {
+                url: "https://celestrak.org/x.txt".into()
+            }
         );
     }
 
@@ -515,7 +581,9 @@ mod tests {
     fn test_parse_url_tle_http() {
         assert_eq!(
             parse_url("tle+http://example.com/tle").expect("ok"),
-            CcsdsMode::Tle { url: "http://example.com/tle".into() }
+            CcsdsMode::Tle {
+                url: "http://example.com/tle".into()
+            }
         );
     }
 
@@ -523,22 +591,38 @@ mod tests {
     fn test_parse_url_ccsds_udp() {
         assert_eq!(
             parse_url("ccsds-udp://0.0.0.0:14000").expect("ok"),
-            CcsdsMode::Ccsds { addr: "0.0.0.0:14000".into() }
+            CcsdsMode::Ccsds {
+                addr: "0.0.0.0:14000".into()
+            }
         );
     }
 
     #[test]
     fn test_parse_url_bad_scheme() {
-        assert!(matches!(parse_url("kafka://nope"), Err(ConnectorError::ConfigError(_))));
-        assert!(matches!(parse_url("tle+ftp://nope.com"), Err(ConnectorError::ConfigError(_))));
-        assert!(matches!(parse_url("ccsds-udp://"), Err(ConnectorError::ConfigError(_))));
+        assert!(matches!(
+            parse_url("kafka://nope"),
+            Err(ConnectorError::ConfigError(_))
+        ));
+        assert!(matches!(
+            parse_url("tle+ftp://nope.com"),
+            Err(ConnectorError::ConfigError(_))
+        ));
+        assert!(matches!(
+            parse_url("ccsds-udp://"),
+            Err(ConnectorError::ConfigError(_))
+        ));
     }
 
     #[test]
     fn test_ccsds_primary_header_roundtrip() {
         let h = CcsdsPrimaryHeader {
-            version: 0, packet_type: 1, sec_hdr_flag: false,
-            apid: 100, seq_flags: 0b11, sequence_count: 42, packet_length: 128,
+            version: 0,
+            packet_type: 1,
+            sec_hdr_flag: false,
+            apid: 100,
+            seq_flags: 0b11,
+            sequence_count: 42,
+            packet_length: 128,
         };
         let bytes = h.encode();
         assert_eq!(bytes.len(), 6);
@@ -552,8 +636,13 @@ mod tests {
     #[test]
     fn test_ccsds_secondary_header_flag_respected() {
         let h_no = CcsdsPrimaryHeader {
-            version: 0, packet_type: 0, sec_hdr_flag: false,
-            apid: 7, seq_flags: 0b11, sequence_count: 1, packet_length: 3,
+            version: 0,
+            packet_type: 0,
+            sec_hdr_flag: false,
+            apid: 7,
+            seq_flags: 0b11,
+            sequence_count: 1,
+            packet_length: 3,
         };
         let mut buf = Vec::from(h_no.encode());
         buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
@@ -561,7 +650,11 @@ mod tests {
         assert!(pkt.secondary_header.is_empty());
         assert_eq!(pkt.user_data, vec![0xAA, 0xBB, 0xCC, 0xDD]);
 
-        let h_yes = CcsdsPrimaryHeader { sec_hdr_flag: true, packet_length: 7, ..h_no };
+        let h_yes = CcsdsPrimaryHeader {
+            sec_hdr_flag: true,
+            packet_length: 7,
+            ..h_no
+        };
         let mut buf = Vec::from(h_yes.encode());
         buf.extend_from_slice(&[1, 2, 3, 4, 0xAA, 0xBB, 0xCC, 0xDD]);
         let pkt = decode_ccsds_packet(&buf, 4).expect("decode");
@@ -572,17 +665,31 @@ mod tests {
     #[test]
     fn test_ccsds_packet_smaller_than_primary_header() {
         let buf = [0u8; 3];
-        assert!(matches!(decode_ccsds_packet(&buf, 0), Err(ConnectorError::ParseError(_))));
-        assert!(matches!(CcsdsPrimaryHeader::decode(&buf), Err(ConnectorError::ParseError(_))));
+        assert!(matches!(
+            decode_ccsds_packet(&buf, 0),
+            Err(ConnectorError::ParseError(_))
+        ));
+        assert!(matches!(
+            CcsdsPrimaryHeader::decode(&buf),
+            Err(ConnectorError::ParseError(_))
+        ));
     }
 
     #[test]
     fn test_ccsds_claimed_length_exceeds_buffer() {
         let h = CcsdsPrimaryHeader {
-            version: 0, packet_type: 0, sec_hdr_flag: false,
-            apid: 1, seq_flags: 0, sequence_count: 0, packet_length: 999,
+            version: 0,
+            packet_type: 0,
+            sec_hdr_flag: false,
+            apid: 1,
+            seq_flags: 0,
+            sequence_count: 0,
+            packet_length: 999,
         };
-        assert!(matches!(decode_ccsds_packet(&h.encode(), 0), Err(ConnectorError::ParseError(_))));
+        assert!(matches!(
+            decode_ccsds_packet(&h.encode(), 0),
+            Err(ConnectorError::ParseError(_))
+        ));
     }
 
     #[test]
@@ -592,12 +699,15 @@ mod tests {
             .expect("parse TLE");
         assert_eq!(elements.norad_id, 25544);
         let constants = sgp4::Constants::from_elements(&elements).expect("constants");
-        let pred = constants.propagate(sgp4::MinutesSinceEpoch(0.0)).expect("propagate");
+        let pred = constants
+            .propagate(sgp4::MinutesSinceEpoch(0.0))
+            .expect("propagate");
         let (lat, lon, _) = teme_to_geodetic(pred.position, elements.epoch());
         // ISS inclination 51.6° — lat must lie within that band.
         assert!(lat.abs() < 60.0, "ISS lat {lat} not within band");
         assert!((-180.0..=180.0).contains(&lon));
-        let r = (pred.position[0].powi(2) + pred.position[1].powi(2) + pred.position[2].powi(2)).sqrt();
+        let r =
+            (pred.position[0].powi(2) + pred.position[1].powi(2) + pred.position[2].powi(2)).sqrt();
         assert!((6700.0..7100.0).contains(&r), "ISS radius {r} km not LEO");
     }
 
@@ -633,7 +743,9 @@ mod tests {
             .expect("parse TLE");
         // Propagate to "now" (years past epoch). Must not panic.
         if let Ok(pred) = propagate_to_now(&elements) {
-            let r = (pred.position[0].powi(2) + pred.position[1].powi(2) + pred.position[2].powi(2)).sqrt();
+            let r =
+                (pred.position[0].powi(2) + pred.position[1].powi(2) + pred.position[2].powi(2))
+                    .sqrt();
             assert!(r.is_finite(), "stale TLE produced non-finite radius");
         }
     }
@@ -642,7 +754,9 @@ mod tests {
     async fn test_ccsds_polling_tick_increments_events_count() {
         // Bind ephemeral, free it, hand the addr to the connector; send
         // one synthetic packet; verify events_count == 1.
-        let listen = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let listen = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listen.local_addr().expect("addr");
         drop(listen);
 
@@ -652,17 +766,25 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
         let h = CcsdsPrimaryHeader {
-            version: 0, packet_type: 0, sec_hdr_flag: false,
-            apid: 100, seq_flags: 0b11, sequence_count: 7, packet_length: 3,
+            version: 0,
+            packet_type: 0,
+            sec_hdr_flag: false,
+            apid: 100,
+            seq_flags: 0b11,
+            sequence_count: 7,
+            packet_length: 3,
         };
         let mut packet = Vec::from(h.encode());
         packet.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         sender.send_to(&packet, addr).await.expect("send");
 
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(3), rx.recv(),
-        ).await.expect("timeout").expect("channel closed");
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
         assert_eq!(event.entity_id, "ccsds-apid-100");
         assert_eq!(event.entity_type, "satellite");
         assert_eq!(connector.stats().events_processed, 1);
@@ -672,24 +794,40 @@ mod tests {
     #[test]
     fn test_ccsds_packet_to_event_includes_b64() {
         let h = CcsdsPrimaryHeader {
-            version: 0, packet_type: 1, sec_hdr_flag: false,
-            apid: 256, seq_flags: 0, sequence_count: 0, packet_length: 3,
+            version: 0,
+            packet_type: 1,
+            sec_hdr_flag: false,
+            apid: 256,
+            seq_flags: 0,
+            sequence_count: 0,
+            packet_length: 3,
         };
         let pkt = CcsdsPacket {
-            header: h, secondary_header: Vec::new(),
+            header: h,
+            secondary_header: Vec::new(),
             user_data: vec![0x01, 0x02, 0x03, 0x04],
         };
         let evt = ccsds_packet_to_event(&pkt, "test", "satellite");
         assert_eq!(evt.entity_id, "ccsds-apid-256");
-        let b64 = evt.properties.get("user_data_b64").and_then(|v| v.as_str()).expect("b64");
+        let b64 = evt
+            .properties
+            .get("user_data_b64")
+            .and_then(|v| v.as_str())
+            .expect("b64");
         assert_eq!(b64, "AQIDBA==");
-        assert_eq!(evt.properties.get("apid").and_then(|v| v.as_u64()), Some(256));
+        assert_eq!(
+            evt.properties.get("apid").and_then(|v| v.as_u64()),
+            Some(256)
+        );
     }
 
     #[test]
     fn test_health_check_states() {
         let connector = CcsdsConnector::new(cfg("ccsds-udp://127.0.0.1:0"));
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("rt");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             assert!(connector.health_check().await.is_err());
             connector.running.store(true, Ordering::SeqCst);
@@ -703,10 +841,16 @@ mod tests {
         let mut config = cfg("ccsds-udp://127.0.0.1:0");
         config.url = None;
         let connector = CcsdsConnector::new(config);
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("rt");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             let (tx, _rx) = tokio::sync::mpsc::channel(1);
-            assert!(matches!(connector.start(tx).await, Err(ConnectorError::ConfigError(_))));
+            assert!(matches!(
+                connector.start(tx).await,
+                Err(ConnectorError::ConfigError(_))
+            ));
         });
     }
 }

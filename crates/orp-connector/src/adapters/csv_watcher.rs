@@ -40,8 +40,13 @@ impl CsvWatcherConnector {
         parse_errors: Option<&AtomicU64>,
     ) -> Vec<SourceEvent> {
         Self::parse_csv_bytes_with_headers(
-            content.as_bytes(), entity_type, connector_id,
-            id_column, lat_column, lon_column, parse_errors,
+            content.as_bytes(),
+            entity_type,
+            connector_id,
+            id_column,
+            lat_column,
+            lon_column,
+            parse_errors,
         )
     }
 
@@ -67,7 +72,9 @@ impl CsvWatcherConnector {
             Err(e) => {
                 tracing::warn!(connector_id = %connector_id, error = %e,
                     "CSV header parse failed; skipping file");
-                if let Some(c) = parse_errors { c.fetch_add(1, Ordering::Relaxed); }
+                if let Some(c) = parse_errors {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
                 return vec![];
             }
         };
@@ -84,7 +91,9 @@ impl CsvWatcherConnector {
                     let line = e.position().map(|p| p.line()).unwrap_or(0);
                     tracing::warn!(connector_id = %connector_id, line, error = %e,
                         "CSV row parse failed; dropping row");
-                    if let Some(c) = parse_errors { c.fetch_add(1, Ordering::Relaxed); }
+                    if let Some(c) = parse_errors {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
                     continue;
                 }
             };
@@ -282,7 +291,13 @@ mod tests {
                     ship-2,52.00,4.50,Other Ship,8.0";
 
         let events = CsvWatcherConnector::parse_csv_with_headers(
-            csv, "ship", "csv-1", "id", "latitude", "longitude", None,
+            csv,
+            "ship",
+            "csv-1",
+            "id",
+            "latitude",
+            "longitude",
+            None,
         );
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].entity_id, "ship:ship-1");
@@ -331,13 +346,25 @@ mod tests {
 
         let counter = AtomicU64::new(0);
         let events = CsvWatcherConnector::parse_csv_bytes_with_headers(
-            &bytes, "ship", "csv-malformed", "id", "latitude", "longitude",
+            &bytes,
+            "ship",
+            "csv-malformed",
+            "id",
+            "latitude",
+            "longitude",
             Some(&counter),
         );
         let ids: Vec<&str> = events.iter().map(|e| e.entity_id.as_str()).collect();
-        assert!(ids.contains(&"ship:ship-1"),
-            "good row before the malformed one was dropped: {:?}", ids);
-        assert_eq!(counter.load(Ordering::Relaxed), 1,
-            "expected exactly one parse error (events={:?})", ids);
+        assert!(
+            ids.contains(&"ship:ship-1"),
+            "good row before the malformed one was dropped: {:?}",
+            ids
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "expected exactly one parse error (events={:?})",
+            ids
+        );
     }
 }

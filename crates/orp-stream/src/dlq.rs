@@ -222,12 +222,8 @@ mod tests {
     fn test_get_failures_limit() {
         let (q, _dir) = open_tmp();
         for i in 0..10 {
-            q.record_failure(
-                &format!("evt-{:03}", i),
-                b"payload",
-                "test error",
-            )
-            .unwrap();
+            q.record_failure(&format!("evt-{:03}", i), b"payload", "test error")
+                .unwrap();
         }
         let failures = q.get_failures(5).unwrap();
         assert_eq!(failures.len(), 5);
@@ -392,12 +388,7 @@ impl FederationOutbox {
     }
 
     /// Enqueue an outbound event for `peer_id`.
-    pub fn enqueue(
-        &self,
-        peer_id: &str,
-        entity_id: &str,
-        payload_json: &str,
-    ) -> DlqResult<()> {
+    pub fn enqueue(&self, peer_id: &str, entity_id: &str, payload_json: &str) -> DlqResult<()> {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let key = Self::make_key(peer_id, seq)?;
         let entry = OutboxEntry {
@@ -418,11 +409,7 @@ impl FederationOutbox {
 
     /// Return up to `max` oldest entries for `peer_id` as `(key, entry)` tuples.
     /// Caller passes the key back to `ack` when delivery succeeds.
-    pub fn next_batch(
-        &self,
-        peer_id: &str,
-        max: usize,
-    ) -> DlqResult<Vec<(Vec<u8>, OutboxEntry)>> {
+    pub fn next_batch(&self, peer_id: &str, max: usize) -> DlqResult<Vec<(Vec<u8>, OutboxEntry)>> {
         if max == 0 {
             return Ok(Vec::new());
         }
@@ -476,11 +463,7 @@ impl FederationOutbox {
 
     /// Evict entries for `peer_id` whose `queued_at` is older than `max_age_secs`.
     /// Returns the number of entries removed.
-    pub fn evict_older_than(
-        &self,
-        peer_id: &str,
-        max_age_secs: u64,
-    ) -> DlqResult<u64> {
+    pub fn evict_older_than(&self, peer_id: &str, max_age_secs: u64) -> DlqResult<u64> {
         let prefix = Self::peer_prefix(peer_id)?;
         let cutoff = Utc::now().timestamp() - max_age_secs as i64;
         let mut readopts = rocksdb::ReadOptions::default();
@@ -606,9 +589,7 @@ mod outbox_tests {
         }
 
         // Evict entries older than 7 days.
-        let removed = outbox
-            .evict_older_than("peer-a", 7 * 86_400)
-            .unwrap();
+        let removed = outbox.evict_older_than("peer-a", 7 * 86_400).unwrap();
         assert_eq!(removed, 2);
         let remaining = outbox.next_batch("peer-a", 10).unwrap();
         assert_eq!(remaining.len(), 1);

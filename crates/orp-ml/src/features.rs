@@ -141,8 +141,7 @@ fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let phi2 = lat2.to_radians();
     let dphi = (lat2 - lat1).to_radians();
     let dlambda = (lon2 - lon1).to_radians();
-    let a = (dphi / 2.0).sin().powi(2)
-        + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
+    let a = (dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
     2.0 * R_KM * a.sqrt().asin()
 }
 
@@ -173,7 +172,11 @@ mod tests {
             .collect();
         let feats = extract_kinematic_features("e", &history).unwrap();
         assert_eq!(feats.len(), KINEMATIC_FEATURE_DIM);
-        assert!(feats[0].abs() < 0.01, "speed_z should be ~0, got {}", feats[0]);
+        assert!(
+            feats[0].abs() < 0.01,
+            "speed_z should be ~0, got {}",
+            feats[0]
+        );
     }
 
     #[test]
@@ -206,7 +209,11 @@ mod tests {
             .collect();
         let feats = extract_kinematic_features("e", &history).unwrap();
         // Index 2 is dwell_ratio.
-        assert!(feats[2] < 0.5, "dwell_ratio should be low, got {}", feats[2]);
+        assert!(
+            feats[2] < 0.5,
+            "dwell_ratio should be low, got {}",
+            feats[2]
+        );
     }
 
     #[test]
@@ -309,8 +316,16 @@ mod tests {
         let feats = extract_kinematic_features("e", &history).unwrap();
         let s = feats[3];
         let c = feats[4];
-        assert!((-1.0..=1.0).contains(&s), "hour_sin must be in [-1, 1], got {}", s);
-        assert!((-1.0..=1.0).contains(&c), "hour_cos must be in [-1, 1], got {}", c);
+        assert!(
+            (-1.0..=1.0).contains(&s),
+            "hour_sin must be in [-1, 1], got {}",
+            s
+        );
+        assert!(
+            (-1.0..=1.0).contains(&c),
+            "hour_cos must be in [-1, 1], got {}",
+            c
+        );
         for (i, v) in feats.iter().enumerate() {
             assert!(v.is_finite(), "feature {} not finite: {}", i, v);
         }

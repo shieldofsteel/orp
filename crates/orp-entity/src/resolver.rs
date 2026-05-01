@@ -178,7 +178,11 @@ impl EntityResolver for StructuralEntityResolver {
         }
 
         // Sort by descending confidence then truncate to candidate_count
-        matches.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        matches.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         matches.truncate(candidate_count);
         Ok(matches)
     }
@@ -224,7 +228,9 @@ impl EntityResolver for StructuralEntityResolver {
         target.last_updated = Utc::now();
 
         self.storage.insert_entity(&target).await?;
-        self.storage.set_canonical_id(entity_id_1, canonical_id).await?;
+        self.storage
+            .set_canonical_id(entity_id_1, canonical_id)
+            .await?;
 
         // Soft-delete the source entity (it's been merged)
         self.storage.delete_entity(entity_id_1).await?;
@@ -367,7 +373,11 @@ mod tests {
             entity_type: "ship".to_string(),
             name: Some("Source Ship".to_string()),
             properties: props1,
-            geometry: Some(GeoPoint { lat: 51.0, lon: 4.0, alt: None }),
+            geometry: Some(GeoPoint {
+                lat: 51.0,
+                lon: 4.0,
+                alt: None,
+            }),
             ..Entity::default()
         };
         let target = Entity {
@@ -387,8 +397,14 @@ mod tests {
             .unwrap();
 
         let merged = storage.get_entity("ship-tgt").await.unwrap().unwrap();
-        assert!(merged.properties.contains_key("speed"), "should inherit speed from source");
-        assert!(merged.properties.contains_key("heading"), "target heading preserved");
+        assert!(
+            merged.properties.contains_key("speed"),
+            "should inherit speed from source"
+        );
+        assert!(
+            merged.properties.contains_key("heading"),
+            "target heading preserved"
+        );
         assert_eq!(merged.name, Some("Source Ship".to_string()));
         assert!(merged.geometry.is_some());
         assert_eq!(merged.canonical_id, Some("canonical-ship-1".to_string()));
@@ -399,9 +415,7 @@ mod tests {
     async fn test_record_match_ok() {
         let storage = make_storage();
         let resolver = StructuralEntityResolver::new(storage);
-        let result = resolver
-            .record_match("entity-a", "entity-b", true)
-            .await;
+        let result = resolver.record_match("entity-a", "entity-b", true).await;
         assert!(result.is_ok());
     }
 

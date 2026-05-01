@@ -64,28 +64,85 @@ CREATE INDEX IF NOT EXISTS idx_gedges_active    ON graph_edges(is_active);
 
 // Views are created separately, with DROP IF EXISTS first.
 const GRAPH_NODE_VIEWS: &[(&str, &str)] = &[
-    ("ship_nodes",         "SELECT * FROM graph_nodes WHERE node_type = 'ship'"),
-    ("port_nodes",         "SELECT * FROM graph_nodes WHERE node_type = 'port'"),
-    ("aircraft_nodes",     "SELECT * FROM graph_nodes WHERE node_type = 'aircraft'"),
-    ("weather_nodes",      "SELECT * FROM graph_nodes WHERE node_type = 'weather'"),
-    ("organization_nodes", "SELECT * FROM graph_nodes WHERE node_type = 'organization'"),
-    ("route_nodes",        "SELECT * FROM graph_nodes WHERE node_type = 'route'"),
-    ("sensor_nodes",       "SELECT * FROM graph_nodes WHERE node_type = 'sensor'"),
+    (
+        "ship_nodes",
+        "SELECT * FROM graph_nodes WHERE node_type = 'ship'",
+    ),
+    (
+        "port_nodes",
+        "SELECT * FROM graph_nodes WHERE node_type = 'port'",
+    ),
+    (
+        "aircraft_nodes",
+        "SELECT * FROM graph_nodes WHERE node_type = 'aircraft'",
+    ),
+    (
+        "weather_nodes",
+        "SELECT * FROM graph_nodes WHERE node_type = 'weather'",
+    ),
+    (
+        "organization_nodes",
+        "SELECT * FROM graph_nodes WHERE node_type = 'organization'",
+    ),
+    (
+        "route_nodes",
+        "SELECT * FROM graph_nodes WHERE node_type = 'route'",
+    ),
+    (
+        "sensor_nodes",
+        "SELECT * FROM graph_nodes WHERE node_type = 'sensor'",
+    ),
 ];
 
 const GRAPH_EDGE_VIEWS: &[(&str, &str)] = &[
-    ("docked_at",     "SELECT * FROM graph_edges WHERE edge_type = 'docked_at'"),
-    ("heading_to",    "SELECT * FROM graph_edges WHERE edge_type = 'heading_to'"),
-    ("owned_by",      "SELECT * FROM graph_edges WHERE edge_type = 'owned_by'"),
-    ("managed_by",    "SELECT * FROM graph_edges WHERE edge_type = 'managed_by'"),
-    ("insures",       "SELECT * FROM graph_edges WHERE edge_type = 'insures'"),
-    ("threatens",     "SELECT * FROM graph_edges WHERE edge_type = 'threatens'"),
-    ("near_rel",      "SELECT * FROM graph_edges WHERE edge_type = 'near'"),
-    ("follows_route", "SELECT * FROM graph_edges WHERE edge_type = 'follows'"),
-    ("traverse_rel",  "SELECT * FROM graph_edges WHERE edge_type = 'traverse'"),
-    ("deployed_on",   "SELECT * FROM graph_edges WHERE edge_type = 'deployed_on'"),
-    ("measures_at",   "SELECT * FROM graph_edges WHERE edge_type = 'measures_at'"),
-    ("in_region",     "SELECT * FROM graph_edges WHERE edge_type = 'in_region'"),
+    (
+        "docked_at",
+        "SELECT * FROM graph_edges WHERE edge_type = 'docked_at'",
+    ),
+    (
+        "heading_to",
+        "SELECT * FROM graph_edges WHERE edge_type = 'heading_to'",
+    ),
+    (
+        "owned_by",
+        "SELECT * FROM graph_edges WHERE edge_type = 'owned_by'",
+    ),
+    (
+        "managed_by",
+        "SELECT * FROM graph_edges WHERE edge_type = 'managed_by'",
+    ),
+    (
+        "insures",
+        "SELECT * FROM graph_edges WHERE edge_type = 'insures'",
+    ),
+    (
+        "threatens",
+        "SELECT * FROM graph_edges WHERE edge_type = 'threatens'",
+    ),
+    (
+        "near_rel",
+        "SELECT * FROM graph_edges WHERE edge_type = 'near'",
+    ),
+    (
+        "follows_route",
+        "SELECT * FROM graph_edges WHERE edge_type = 'follows'",
+    ),
+    (
+        "traverse_rel",
+        "SELECT * FROM graph_edges WHERE edge_type = 'traverse'",
+    ),
+    (
+        "deployed_on",
+        "SELECT * FROM graph_edges WHERE edge_type = 'deployed_on'",
+    ),
+    (
+        "measures_at",
+        "SELECT * FROM graph_edges WHERE edge_type = 'measures_at'",
+    ),
+    (
+        "in_region",
+        "SELECT * FROM graph_edges WHERE edge_type = 'in_region'",
+    ),
 ];
 
 // ── In-memory edge record ──────────────────────────────────────────────────────
@@ -176,16 +233,19 @@ impl GraphEngine {
         .map_err(|e| StorageError::DatabaseError(format!("graph node sync: {e}")))?;
 
         // Prune deactivated entities.
-        conn.execute_batch(r#"
+        conn.execute_batch(
+            r#"
             DELETE FROM graph_nodes
             WHERE node_id NOT IN (
                 SELECT entity_id FROM entities WHERE is_active = TRUE
             );
-        "#)
+        "#,
+        )
         .map_err(|e| StorageError::DatabaseError(format!("graph node prune: {e}")))?;
 
         // Sync edges (denormalise node types for speed).
-        conn.execute_batch(r#"
+        conn.execute_batch(
+            r#"
             INSERT OR REPLACE INTO graph_edges
                 (edge_id, from_node, to_node, from_type, to_type, edge_type,
                  weight, properties, confidence, is_active, last_synced)
@@ -204,7 +264,8 @@ impl GraphEngine {
             FROM relationships r
             LEFT JOIN graph_nodes src ON src.node_id = r.source_entity_id
             LEFT JOIN graph_nodes tgt ON tgt.node_id = r.target_entity_id;
-        "#)
+        "#,
+        )
         .map_err(|e| StorageError::DatabaseError(format!("graph edge sync: {e}")))?;
 
         tracing::debug!("graph sync completed");
@@ -238,7 +299,10 @@ impl GraphEngine {
     #[allow(clippy::type_complexity)]
     fn load_adjacency(
         conn: &Connection,
-    ) -> StorageResult<(HashMap<String, Vec<EdgeRecord>>, HashMap<String, EdgeRecord>)> {
+    ) -> StorageResult<(
+        HashMap<String, Vec<EdgeRecord>>,
+        HashMap<String, EdgeRecord>,
+    )> {
         let mut stmt = conn
             .prepare(
                 "SELECT edge_id, from_node, to_node, edge_type, \
@@ -267,7 +331,9 @@ impl GraphEngine {
                 confidence: row.get(5).unwrap_or(1.0),
                 is_active: row.get(6).unwrap_or(true),
             };
-            out.entry(rec.from_node.clone()).or_default().push(rec.clone());
+            out.entry(rec.from_node.clone())
+                .or_default()
+                .push(rec.clone());
             by_id.insert(rec.edge_id.clone(), rec);
         }
 
@@ -368,11 +434,24 @@ impl GraphEngine {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?
         {
             let mut m = HashMap::new();
-            m.insert("node_id".into(), JsonValue::String(row.get(0).unwrap_or_default()));
-            m.insert("node_type".into(), opt_jstr(row.get::<_, Option<String>>(1).ok().flatten()));
-            m.insert("label".into(), opt_jstr(row.get::<_, Option<String>>(2).ok().flatten()));
+            m.insert(
+                "node_id".into(),
+                JsonValue::String(row.get(0).unwrap_or_default()),
+            );
+            m.insert(
+                "node_type".into(),
+                opt_jstr(row.get::<_, Option<String>>(1).ok().flatten()),
+            );
+            m.insert(
+                "label".into(),
+                opt_jstr(row.get::<_, Option<String>>(2).ok().flatten()),
+            );
 
-            let props_raw: String = row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default();
+            let props_raw: String = row
+                .get::<_, Option<String>>(3)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             let props: JsonValue = serde_json::from_str(&props_raw).unwrap_or(JsonValue::Null);
             m.insert("properties".into(), props);
 
@@ -511,10 +590,7 @@ impl GraphEngine {
     /// - `MATCH (a)-[r:docked_at]->(b) WHERE a.node_id = 'ship_x' RETURN a, b`
     /// - `MATCH (a)-[*..3]->(b) WHERE a.node_id = 'ship_x' RETURN b`
     /// - Raw SQL passthrough when no MATCH keyword is found
-    pub fn cypher_query(
-        &self,
-        query: &str,
-    ) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
+    pub fn cypher_query(&self, query: &str) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
         let q = query.trim();
 
         if let Some(sql) = try_translate_cypher(q) {
@@ -526,10 +602,7 @@ impl GraphEngine {
     }
 
     /// Execute arbitrary SQL against the graph tables.
-    pub fn execute_raw_sql(
-        &self,
-        sql: &str,
-    ) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
+    pub fn execute_raw_sql(&self, sql: &str) -> StorageResult<Vec<HashMap<String, JsonValue>>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(sql)
@@ -558,7 +631,9 @@ impl GraphEngine {
                         || row.get::<_, bool>(c).is_ok()
                     {
                         c += 1;
-                        if c > 50 { break; }
+                        if c > 50 {
+                            break;
+                        }
                     }
                     col_count = c;
                 }
@@ -584,7 +659,10 @@ impl GraphEngine {
             .map(|vals| {
                 let mut m = HashMap::new();
                 for (i, val) in vals.into_iter().enumerate() {
-                    let name = col_names.get(i).cloned().unwrap_or_else(|| format!("col_{i}"));
+                    let name = col_names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("col_{i}"));
                     m.insert(name, val);
                 }
                 m
@@ -603,7 +681,11 @@ impl GraphEngine {
             .query_row("SELECT COUNT(*) FROM graph_nodes", [], |r| r.get(0))
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
         let edges: i64 = conn
-            .query_row("SELECT COUNT(*) FROM graph_edges WHERE is_active = TRUE", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM graph_edges WHERE is_active = TRUE",
+                [],
+                |r| r.get(0),
+            )
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
         Ok((nodes as u64, edges as u64))
     }
@@ -658,7 +740,7 @@ fn translate_single_node_match(q: &str) -> Option<String> {
 fn translate_edge_match(q: &str) -> Option<String> {
     let upper = q.to_uppercase();
     // Must have ]->(  pattern
-    if !upper.contains("]->(") && !upper.contains("]->" ) {
+    if !upper.contains("]->(") && !upper.contains("]->") {
         return None;
     }
     // Extract edge type between : and ]
@@ -716,14 +798,14 @@ fn translate_multihop_match(q: &str) -> Option<String> {
 
 fn node_type_to_table(node_type: &str) -> &'static str {
     match node_type.to_lowercase().as_str() {
-        "ship"                    => "ship_nodes",
-        "port"                    => "port_nodes",
-        "aircraft"                => "aircraft_nodes",
+        "ship" => "ship_nodes",
+        "port" => "port_nodes",
+        "aircraft" => "aircraft_nodes",
         "weather" | "weather_system" => "weather_nodes",
-        "organization" | "org"   => "organization_nodes",
-        "route"                   => "route_nodes",
-        "sensor"                  => "sensor_nodes",
-        _                         => "graph_nodes",
+        "organization" | "org" => "organization_nodes",
+        "route" => "route_nodes",
+        "sensor" => "sensor_nodes",
+        _ => "graph_nodes",
     }
 }
 
@@ -1104,7 +1186,9 @@ mod tests {
         let ships = engine.execute_raw_sql("SELECT * FROM ship_nodes").unwrap();
         assert_eq!(ships.len(), 1);
 
-        let aircraft = engine.execute_raw_sql("SELECT * FROM aircraft_nodes").unwrap();
+        let aircraft = engine
+            .execute_raw_sql("SELECT * FROM aircraft_nodes")
+            .unwrap();
         assert_eq!(aircraft.len(), 1);
 
         let ports = engine.execute_raw_sql("SELECT * FROM port_nodes").unwrap();
@@ -1145,11 +1229,17 @@ mod tests {
 
         // max_hops=2: path a->b->c->d needs 3 hops, should NOT be found
         let paths_2 = engine.path_query("a", "d", 2).unwrap();
-        assert!(paths_2.is_empty(), "should not find 3-hop path with max_hops=2");
+        assert!(
+            paths_2.is_empty(),
+            "should not find 3-hop path with max_hops=2"
+        );
 
         // max_hops=3: should find path
         let paths_3 = engine.path_query("a", "d", 3).unwrap();
-        assert!(!paths_3.is_empty(), "should find 3-hop path with max_hops=3");
+        assert!(
+            !paths_3.is_empty(),
+            "should find 3-hop path with max_hops=3"
+        );
         assert_eq!(paths_3[0].len(), 3);
     }
 }

@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use orp_query::QueryExecutor;
 use orp_storage::DuckDbStorage;
 use orp_testbed::{generate_synthetic_ports, generate_synthetic_ships};
@@ -12,13 +12,15 @@ fn setup_storage_with_data(ship_count: usize, port_count: usize) -> Arc<DuckDbSt
     // Insert synthetic ships
     let ships = generate_synthetic_ships(ship_count);
     for ship in &ships {
-        rt.block_on(storage.insert_entity(ship)).expect("insert ship");
+        rt.block_on(storage.insert_entity(ship))
+            .expect("insert ship");
     }
 
     // Insert synthetic ports
     let ports = generate_synthetic_ports(port_count);
     for port in &ports {
-        rt.block_on(storage.insert_entity(port)).expect("insert port");
+        rt.block_on(storage.insert_entity(port))
+            .expect("insert port");
     }
 
     storage
@@ -41,7 +43,9 @@ fn bench_simple_query(c: &mut Criterion) {
                 b.iter(|| {
                     rt.block_on(async {
                         executor
-                            .execute("MATCH (s:Ship) WHERE s.speed > 10 RETURN s.id, s.name, s.speed")
+                            .execute(
+                                "MATCH (s:Ship) WHERE s.speed > 10 RETURN s.id, s.name, s.speed",
+                            )
                             .await
                             .expect("query failed");
                     });

@@ -283,11 +283,9 @@ pub fn parse_nffi_xml_with_counter(
 
                         // Check for id attribute
                         for attr in e.attributes().flatten() {
-                            let key =
-                                String::from_utf8_lossy(attr.key.as_ref()).to_lowercase();
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_lowercase();
                             if key == "id" || key == "trackid" {
-                                track_id =
-                                    String::from_utf8_lossy(&attr.value).to_string();
+                                track_id = String::from_utf8_lossy(&attr.value).to_string();
                             }
                         }
                     }
@@ -314,8 +312,7 @@ pub fn parse_nffi_xml_with_counter(
                                 // No <trackId> in source XML — synthesise a
                                 // restart-stable SHA-256 fallback so entity
                                 // resolution survives connector restarts.
-                                track_id =
-                                    anon_track_id(name.as_deref(), lat, lon, &affiliation);
+                                track_id = anon_track_id(name.as_deref(), lat, lon, &affiliation);
                                 tracing::warn!(
                                     name = ?name, lat, lon,
                                     affiliation = affiliation.as_str(),
@@ -432,10 +429,7 @@ pub fn parse_nffi_xml_with_counter(
 // ---------------------------------------------------------------------------
 
 /// Convert an NFFI track to a SourceEvent.
-pub fn nffi_track_to_source_event(
-    track: &NffiTrack,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn nffi_track_to_source_event(track: &NffiTrack, connector_id: &str) -> SourceEvent {
     let mut properties = HashMap::new();
     properties.insert("track_id".into(), json!(track.track_id));
     properties.insert("affiliation".into(), json!(track.affiliation.as_str()));
@@ -526,13 +520,9 @@ impl Connector for NffiConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                ConnectorError::ConfigError("NFFI: url (XML file path) required".into())
-            })?;
+        let path = self.config.url.as_deref().ok_or_else(|| {
+            ConnectorError::ConfigError("NFFI: url (XML file path) required".into())
+        })?;
 
         let content = tokio::fs::read_to_string(path)
             .await
@@ -637,7 +627,10 @@ mod tests {
         assert_eq!(tracks[0].affiliation, NffiAffiliation::Friendly);
         assert_eq!(tracks[0].platform_type, NffiPlatformType::GroundVehicle);
         assert_eq!(tracks[0].nationality, Some("GBR".to_string()));
-        assert_eq!(tracks[0].operational_status, NffiOperationalStatus::Operational);
+        assert_eq!(
+            tracks[0].operational_status,
+            NffiOperationalStatus::Operational
+        );
     }
 
     #[test]

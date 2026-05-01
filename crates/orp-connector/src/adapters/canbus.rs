@@ -31,8 +31,8 @@ use std::sync::Arc;
 /// CAN frame type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanFrameType {
-    Standard,  // 11-bit ID
-    Extended,  // 29-bit ID
+    Standard, // 11-bit ID
+    Extended, // 29-bit ID
 }
 
 /// Parsed CAN frame.
@@ -40,7 +40,7 @@ pub enum CanFrameType {
 pub struct CanFrame {
     pub frame_type: CanFrameType,
     pub id: u32,
-    pub dlc: u8,        // data length code (0–8, or 0–64 for CAN FD)
+    pub dlc: u8, // data length code (0–8, or 0–64 for CAN FD)
     pub data: Vec<u8>,
     pub timestamp: Option<f64>, // optional timestamp (seconds)
 }
@@ -67,16 +67,16 @@ pub struct J1939Header {
 /// Well-known J1939 PGN definitions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum J1939Pgn {
-    EngineSpeed,               // PGN 61444 (0xF004)
-    VehicleSpeed,              // PGN 65265 (0xFEF1)
-    EngineTemperature,         // PGN 65262 (0xFEEE)
-    FuelConsumption,           // PGN 65266 (0xFEF2)
-    TransmissionOilTemp,       // PGN 65272 (0xFEF8)
-    BrakeSystemPressure,       // PGN 65267 (0xFEF3)
-    AmbientConditions,         // PGN 65269 (0xFEF5)
-    VehicleElectricalPower,    // PGN 65271 (0xFEF7)
-    DashDisplay,               // PGN 65276 (0xFEFC)
-    EngineHours,               // PGN 65253 (0xFEE5)
+    EngineSpeed,            // PGN 61444 (0xF004)
+    VehicleSpeed,           // PGN 65265 (0xFEF1)
+    EngineTemperature,      // PGN 65262 (0xFEEE)
+    FuelConsumption,        // PGN 65266 (0xFEF2)
+    TransmissionOilTemp,    // PGN 65272 (0xFEF8)
+    BrakeSystemPressure,    // PGN 65267 (0xFEF3)
+    AmbientConditions,      // PGN 65269 (0xFEF5)
+    VehicleElectricalPower, // PGN 65271 (0xFEF7)
+    DashDisplay,            // PGN 65276 (0xFEFC)
+    EngineHours,            // PGN 65253 (0xFEE5)
     Unknown(u32),
 }
 
@@ -333,10 +333,7 @@ pub fn parse_can_frame_bytes(data: &[u8]) -> Option<CanFrame> {
 // ---------------------------------------------------------------------------
 
 /// Convert a CAN frame (with optional J1939 decoding) to a SourceEvent.
-pub fn can_frame_to_source_event(
-    frame: &CanFrame,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn can_frame_to_source_event(frame: &CanFrame, connector_id: &str) -> SourceEvent {
     let mut properties = HashMap::new();
     properties.insert("can_id".into(), json!(format!("{:08X}", frame.id)));
     properties.insert("dlc".into(), json!(frame.dlc));
@@ -371,10 +368,7 @@ pub fn can_frame_to_source_event(
             format!("canbus:j1939:sa-{}", header.source_address),
         )
     } else {
-        (
-            "vehicle".to_string(),
-            format!("canbus:{:03X}", frame.id),
-        )
+        ("vehicle".to_string(), format!("canbus:{:03X}", frame.id))
     };
 
     SourceEvent {
@@ -425,13 +419,9 @@ impl Connector for CanBusConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                ConnectorError::ConfigError("CAN Bus: url (log file path) required".into())
-            })?;
+        let path = self.config.url.as_deref().ok_or_else(|| {
+            ConnectorError::ConfigError("CAN Bus: url (log file path) required".into())
+        })?;
 
         let content = tokio::fs::read_to_string(path)
             .await
@@ -556,7 +546,7 @@ mod tests {
         let mut data = vec![0x00u8; 8];
         data[3] = 0x00; // low byte of RPM raw
         data[4] = 0x32; // high byte: 0x3200 = 12800
-        // Actually: bytes [3..5] = 0x0032 → that's 0x3200 LE = 12800
+                        // Actually: bytes [3..5] = 0x0032 → that's 0x3200 LE = 12800
         data[3] = 0x00;
         data[4] = 0x32;
         let decoded = decode_j1939_data(&header, &data);

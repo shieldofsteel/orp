@@ -347,8 +347,8 @@ impl IsolationForestScorer {
     /// [`ISOLATION_FOREST_SCHEMA_VERSION`] — silently mis-decoding a stale
     /// model is worse than refusing to load it.
     pub fn from_bytes(model_id: &str, bytes: &[u8], feature_dim: usize) -> MlResult<Self> {
-        let model: IsolationForestModel = bincode::deserialize(bytes)
-            .map_err(|e| MlError::Deserialize(e.to_string()))?;
+        let model: IsolationForestModel =
+            bincode::deserialize(bytes).map_err(|e| MlError::Deserialize(e.to_string()))?;
         if model.schema_version != ISOLATION_FOREST_SCHEMA_VERSION {
             return Err(MlError::ModelVersionMismatch {
                 got: model.schema_version,
@@ -601,11 +601,7 @@ mod tests {
         // Tiny training set: a tight cluster around the origin in 4-D.
         let mut rng = StdRng::seed_from_u64(7);
         let data: Vec<Vec<f32>> = (0..256)
-            .map(|_| {
-                (0..4)
-                    .map(|_| rng.gen_range(-0.5..0.5_f32))
-                    .collect()
-            })
+            .map(|_| (0..4).map(|_| rng.gen_range(-0.5..0.5_f32)).collect())
             .collect();
         let model = IsolationForestModel::fit(&data, 32, 64, 1).unwrap();
         let bytes = model.to_bytes().unwrap();
@@ -631,7 +627,13 @@ mod tests {
         let model = IsolationForestModel::fit(&data, 8, 16, 0).unwrap();
         let bytes = model.to_bytes().unwrap();
         let err = IsolationForestScorer::from_bytes("if", &bytes, 5).unwrap_err();
-        assert!(matches!(err, MlError::FeatureDimMismatch { expected: 2, got: 5 }));
+        assert!(matches!(
+            err,
+            MlError::FeatureDimMismatch {
+                expected: 2,
+                got: 5
+            }
+        ));
     }
 
     #[test]
@@ -722,7 +724,11 @@ mod tests {
         );
         // Conversely, a value far below the envelope should flag.
         let outlier = s.score(&[-100.0]);
-        assert!(outlier > 50.0, "far-below outlier should be flagged, got {}", outlier);
+        assert!(
+            outlier > 50.0,
+            "far-below outlier should be flagged, got {}",
+            outlier
+        );
     }
 
     #[test]

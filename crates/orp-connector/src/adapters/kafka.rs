@@ -47,7 +47,10 @@ const DEFAULT_AUTO_OFFSET_RESET: &str = "latest";
 /// Parsed broker list + topic from `kafka://...` URL. `brokers` is comma-joined
 /// for direct use as `bootstrap.servers`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct KafkaTarget { brokers: String, topic: String }
+struct KafkaTarget {
+    brokers: String,
+    topic: String,
+}
 
 /// Auth + transport security knobs pulled out of `ConnectorConfig.properties`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -81,7 +84,10 @@ impl KafkaConnector {
         let group_id = group_id_from(&config);
         let security = SecurityConfig::from_properties(&config.properties);
         Ok(Self {
-            config, target, group_id, security,
+            config,
+            target,
+            group_id,
+            security,
             events_count: Arc::new(AtomicU64::new(0)),
             errors_count: Arc::new(AtomicU64::new(0)),
             last_event_ts: Arc::new(AtomicI64::new(0)),
@@ -97,11 +103,17 @@ impl KafkaConnector {
             .url
             .as_deref()
             .and_then(|u| parse_kafka_url(Some(u)).ok())
-            .unwrap_or_else(|| KafkaTarget { brokers: String::new(), topic: String::new() });
+            .unwrap_or_else(|| KafkaTarget {
+                brokers: String::new(),
+                topic: String::new(),
+            });
         let group_id = group_id_from(&config);
         let security = SecurityConfig::from_properties(&config.properties);
         Self {
-            config, target, group_id, security,
+            config,
+            target,
+            group_id,
+            security,
             events_count: Arc::new(AtomicU64::new(0)),
             errors_count: Arc::new(AtomicU64::new(0)),
             last_event_ts: Arc::new(AtomicI64::new(0)),
@@ -117,8 +129,8 @@ impl KafkaConnector {
         payload: &[u8],
         timestamp: DateTime<Utc>,
     ) -> Result<SourceEvent, String> {
-        let value: JsonValue = serde_json::from_slice(payload)
-            .map_err(|e| format!("invalid JSON envelope: {e}"))?;
+        let value: JsonValue =
+            serde_json::from_slice(payload).map_err(|e| format!("invalid JSON envelope: {e}"))?;
         let obj = value
             .as_object()
             .ok_or_else(|| "JSON envelope must be a top-level object".to_string())?;
@@ -170,9 +182,13 @@ impl KafkaConnector {
     }
 
     #[cfg(test)]
-    fn target(&self) -> &KafkaTarget { &self.target }
+    fn target(&self) -> &KafkaTarget {
+        &self.target
+    }
     #[cfg(test)]
-    fn group_id_str(&self) -> &str { &self.group_id }
+    fn group_id_str(&self) -> &str {
+        &self.group_id
+    }
 }
 
 /// Consumer-group fallback: `orp-{connector_id}` whenever the operator hasn't
@@ -242,11 +258,9 @@ fn parse_kafka_url(url: Option<&str>) -> Result<KafkaTarget, ConnectorError> {
 
     // Split on the first '/' — everything before is the broker list, after is
     // the topic. We deliberately reject empty segments either side.
-    let (brokers_part, topic_part) = rest
-        .split_once('/')
-        .ok_or_else(|| ConnectorError::ConfigError(format!(
-            "kafka connector URL is missing /TOPIC: {url}"
-        )))?;
+    let (brokers_part, topic_part) = rest.split_once('/').ok_or_else(|| {
+        ConnectorError::ConfigError(format!("kafka connector URL is missing /TOPIC: {url}"))
+    })?;
 
     if brokers_part.is_empty() {
         return Err(ConnectorError::ConfigError(
@@ -474,11 +488,8 @@ mod tests {
 
     /// Helper: build a connector with the canonical test URL and given props.
     fn make_conn(props: HashMap<String, JsonValue>) -> KafkaConnector {
-        KafkaConnector::from_connector_config(build_config(
-            Some("kafka://b1:9092/topic"),
-            props,
-        ))
-        .expect("test config must parse")
+        KafkaConnector::from_connector_config(build_config(Some("kafka://b1:9092/topic"), props))
+            .expect("test config must parse")
     }
 
     fn assert_config_err<T: std::fmt::Debug>(r: Result<T, ConnectorError>, ctx: &str) {
@@ -505,7 +516,10 @@ mod tests {
 
     #[test]
     fn url_rejects_bad_scheme() {
-        assert_config_err(parse_kafka_url(Some("http://localhost:9092/orp-events")), "bad scheme");
+        assert_config_err(
+            parse_kafka_url(Some("http://localhost:9092/orp-events")),
+            "bad scheme",
+        );
     }
 
     #[test]
@@ -516,7 +530,10 @@ mod tests {
 
     #[test]
     fn url_rejects_empty_broker_entry() {
-        assert_config_err(parse_kafka_url(Some("kafka://b1:9092,/orp")), "empty broker");
+        assert_config_err(
+            parse_kafka_url(Some("kafka://b1:9092,/orp")),
+            "empty broker",
+        );
     }
 
     #[test]

@@ -136,16 +136,14 @@ fn build_cors_layer() -> CorsLayer {
         .allow_headers(tower_http::cors::Any)
 }
 
-/// Middleware that injects Arc<AuthState> into request extensions so the
-/// AuthContext extractor (in orp-security) can find it.
+/// Middleware that injects `Arc<AuthState>` into request extensions so the
+/// `AuthContext` extractor (in `orp-security`) can find it.
 async fn inject_auth_state(
     State(state): axum::extract::State<Arc<AppState>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    request
-        .extensions_mut()
-        .insert(state.auth_state.clone());
+    request.extensions_mut().insert(state.auth_state.clone());
     next.run(request).await
 }
 
@@ -172,7 +170,7 @@ async fn rate_limit_middleware(
 
     // Exempt high-throughput and static paths from rate limiting
     let path = request.uri().path();
-    if path.starts_with("/api/v1/ingest") 
+    if path.starts_with("/api/v1/ingest")
         || path.starts_with("/assets/")
         || path.starts_with("/api/v1/health")
         || path == "/"
@@ -240,35 +238,33 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
     // `ORP_FED_OUTBOX_PATH` or `~/.local/share/orp/federation-outbox` by
     // default. Failure to open is non-fatal — federation degrades to "no
     // buffering" and `pending_count` always reads as 0.
-    let federation_outbox: Option<Arc<FederationOutbox>> =
-        if config.federation_registry.is_some() {
-            let path = std::env::var("ORP_FED_OUTBOX_PATH")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                    std::path::PathBuf::from(home)
-                        .join(".local/share/orp/federation-outbox")
-                });
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+    let federation_outbox: Option<Arc<FederationOutbox>> = if config.federation_registry.is_some() {
+        let path = std::env::var("ORP_FED_OUTBOX_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                std::path::PathBuf::from(home).join(".local/share/orp/federation-outbox")
+            });
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match FederationOutbox::open(&path) {
+            Ok(o) => {
+                tracing::info!(path = %path.display(), "Federation outbox opened");
+                Some(Arc::new(o))
             }
-            match FederationOutbox::open(&path) {
-                Ok(o) => {
-                    tracing::info!(path = %path.display(), "Federation outbox opened");
-                    Some(Arc::new(o))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "Failed to open federation outbox; outbound buffering disabled"
-                    );
-                    None
-                }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to open federation outbox; outbound buffering disabled"
+                );
+                None
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     let state = Arc::new(AppState {
         storage: config.storage,
@@ -299,9 +295,10 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
     let rate_limiter = RateLimiter::new(100, 100); // 100 tokens, refill 100/sec
 
     // Build the optional layers sub-router
-    let layers_subrouter = state.layer_registry.as_ref().map(|registry| {
-        layers::layers_router(Arc::clone(registry))
-    });
+    let layers_subrouter = state
+        .layer_registry
+        .as_ref()
+        .map(|registry| layers::layers_router(Arc::clone(registry)));
 
     // Core API routes (always present regardless of headless mode)
     let api_routes = Router::new()
@@ -327,10 +324,7 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
             get(handlers::get_entity_events),
         )
         // Relationships
-        .route(
-            "/api/v1/relationships",
-            post(handlers::create_relationship),
-        )
+        .route("/api/v1/relationships", post(handlers::create_relationship))
         // Query
         .route("/api/v1/query", post(handlers::execute_query))
         // Graph
@@ -338,10 +332,7 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         // Connectors
         .route("/api/v1/connectors", get(handlers::list_connectors))
         .route("/api/v1/connectors", post(handlers::create_connector))
-        .route(
-            "/api/v1/connectors/{id}",
-            put(handlers::update_connector),
-        )
+        .route("/api/v1/connectors/{id}", put(handlers::update_connector))
         .route(
             "/api/v1/connectors/{id}",
             delete(handlers::delete_connector),
@@ -350,10 +341,7 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         .route("/api/v1/monitors", get(handlers::list_monitors))
         .route("/api/v1/monitors", post(handlers::create_monitor))
         .route("/api/v1/monitors/{id}", get(handlers::get_monitor))
-        .route(
-            "/api/v1/monitors/{id}",
-            put(handlers::update_monitor),
-        )
+        .route("/api/v1/monitors/{id}", put(handlers::update_monitor))
         .route("/api/v1/monitors/{id}", delete(handlers::delete_monitor))
         // Alerts
         .route("/api/v1/alerts", get(handlers::list_alerts))

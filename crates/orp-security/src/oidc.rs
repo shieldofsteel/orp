@@ -407,12 +407,10 @@ impl OidcClient {
     /// Otherwise returns permissive dev claims when OIDC is disabled.
     pub fn validate_token(&self, token: &str) -> Result<Claims, SecurityError> {
         if let Some(jwt) = &self.jwt_service {
-            return jwt
-                .validate_token(token)
-                .map_err(|e| match e {
-                    crate::jwt::JwtError::TokenExpired => SecurityError::TokenExpired,
-                    other => SecurityError::TokenInvalid(other.to_string()),
-                });
+            return jwt.validate_token(token).map_err(|e| match e {
+                crate::jwt::JwtError::TokenExpired => SecurityError::TokenExpired,
+                other => SecurityError::TokenInvalid(other.to_string()),
+            });
         }
 
         if !self.config.enabled {
@@ -449,11 +447,7 @@ impl OidcClient {
     }
 
     /// Build the httpOnly cookie Set-Cookie header value.
-    pub fn build_auth_cookie(
-        &self,
-        token: &str,
-        expires_in: u64,
-    ) -> String {
+    pub fn build_auth_cookie(&self, token: &str, expires_in: u64) -> String {
         format!(
             "{}={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
             self.config.cookie_name, token, expires_in
@@ -528,9 +522,7 @@ fn csrf_secret(oidc: &OidcClient) -> String {
 }
 
 /// GET /auth/login — redirect to OIDC provider.
-async fn handle_login(
-    State(state): State<AuthRouterState>,
-) -> Response {
+async fn handle_login(State(state): State<AuthRouterState>) -> Response {
     let oidc = state.oidc.read().await;
 
     if !oidc.config.enabled {
@@ -611,12 +603,10 @@ async fn handle_callback(
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .and_then(|cookies| {
-            cookies
-                .split(';')
-                .find_map(|c| {
-                    let c = c.trim();
-                    c.strip_prefix("orp_csrf=").map(|v| v.to_string())
-                })
+            cookies.split(';').find_map(|c| {
+                let c = c.trim();
+                c.strip_prefix("orp_csrf=").map(|v| v.to_string())
+            })
         });
 
     if let Some(ref callback_state) = params.state {
@@ -807,12 +797,21 @@ mod tests {
     fn test_validate_token_with_jwt_service() {
         use crate::jwt::JwtService;
 
-        let jwt_svc = Arc::new(JwtService::new(crate::jwt::JwtConfig {
-            hs256_secret: Some(b"test-secret-for-unit-tests-32bytes!".to_vec()),
-            ..crate::jwt::JwtConfig::default()
-        }).unwrap());
+        let jwt_svc = Arc::new(
+            JwtService::new(crate::jwt::JwtConfig {
+                hs256_secret: Some(b"test-secret-for-unit-tests-32bytes!".to_vec()),
+                ..crate::jwt::JwtConfig::default()
+            })
+            .unwrap(),
+        );
         let token = jwt_svc
-            .issue_token("user-1", Some("test@example.com"), None, None, vec!["entities:read".to_string()])
+            .issue_token(
+                "user-1",
+                Some("test@example.com"),
+                None,
+                None,
+                vec!["entities:read".to_string()],
+            )
             .unwrap();
 
         let cfg = OidcConfig::default();
@@ -903,9 +902,10 @@ mod tests {
                     Err(_) => break,
                 };
                 let idx = counter_c.fetch_add(1, Ordering::SeqCst);
-                let resp = script.get(idx).copied().unwrap_or_else(|| {
-                    *script.last().unwrap_or(&MockResp::Status503)
-                });
+                let resp = script
+                    .get(idx)
+                    .copied()
+                    .unwrap_or_else(|| *script.last().unwrap_or(&MockResp::Status503));
                 tokio::spawn(async move {
                     // Drain the request just enough to know the client
                     // sent something. We don't bother parsing it.
@@ -957,7 +957,11 @@ mod tests {
             .with_discovery_ttl(std::time::Duration::from_millis(500));
         client.discover().await.expect("first fetch ok");
         client.discover().await.expect("second fetch ok (cached)");
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "second call must be served from cache");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "second call must be served from cache"
+        );
     }
 
     #[tokio::test]
@@ -1011,7 +1015,10 @@ mod tests {
         let mut client = OidcClient::new(enabled_cfg(base))
             .with_discovery_ttl(std::time::Duration::from_millis(10))
             .with_discovery_max_staleness(std::time::Duration::from_millis(30));
-        client.discover().await.expect("first fetch primes the cache");
+        client
+            .discover()
+            .await
+            .expect("first fetch primes the cache");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let result = client.discover().await;
         assert!(

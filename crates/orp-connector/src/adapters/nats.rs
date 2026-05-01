@@ -137,7 +137,11 @@ impl NatsConnector {
             }
             Err(_) => Self::with_target(
                 config,
-                NatsTarget { server: String::new(), stream: None, subject: String::new() },
+                NatsTarget {
+                    server: String::new(),
+                    stream: None,
+                    subject: String::new(),
+                },
                 NatsAuth::Anonymous,
             ),
         }
@@ -279,7 +283,11 @@ fn parse_url(url: Option<&str>) -> Result<NatsTarget, ConnectorError> {
             "nats subject must not be empty".into(),
         ));
     }
-    Ok(NatsTarget { server, stream, subject })
+    Ok(NatsTarget {
+        server,
+        stream,
+        subject,
+    })
 }
 
 /// Build `ConnectOptions` from the auth selection.
@@ -350,8 +358,16 @@ impl Connector for NatsConnector {
 
         let handle = tokio::spawn(async move {
             run_driver(
-                target, auth, connector_id, entity_type, running, connected, events_count,
-                errors_count, last_event_epoch, tx,
+                target,
+                auth,
+                connector_id,
+                entity_type,
+                running,
+                connected,
+                events_count,
+                errors_count,
+                last_event_epoch,
+                tx,
             )
             .await;
         });
@@ -443,14 +459,28 @@ async fn run_driver(
 
     let result = if target.is_jetstream() {
         drive_jetstream(
-            client, &target, &connector_id, &entity_type, &running, &events_count, &errors_count,
-            &last_event_epoch, &tx,
+            client,
+            &target,
+            &connector_id,
+            &entity_type,
+            &running,
+            &events_count,
+            &errors_count,
+            &last_event_epoch,
+            &tx,
         )
         .await
     } else {
         drive_core(
-            client, &target, &connector_id, &entity_type, &running, &events_count, &errors_count,
-            &last_event_epoch, &tx,
+            client,
+            &target,
+            &connector_id,
+            &entity_type,
+            &running,
+            &events_count,
+            &errors_count,
+            &last_event_epoch,
+            &tx,
         )
         .await
     };
@@ -488,7 +518,12 @@ async fn drive_core(
             Err(_) => continue,
         };
         process_payload(
-            &msg.payload, connector_id, entity_type, events_count, errors_count, last_event_epoch,
+            &msg.payload,
+            connector_id,
+            entity_type,
+            events_count,
+            errors_count,
+            last_event_epoch,
             tx,
         )
         .await;
@@ -555,7 +590,12 @@ async fn drive_jetstream(
         };
 
         let sent = process_payload(
-            &msg.payload, connector_id, entity_type, events_count, errors_count, last_event_epoch,
+            &msg.payload,
+            connector_id,
+            entity_type,
+            events_count,
+            errors_count,
+            last_event_epoch,
             tx,
         )
         .await;
@@ -704,7 +744,10 @@ mod tests {
         p.insert("nats_creds_path".into(), json!("/etc/nats.creds"));
         assert_eq!(
             NatsAuth::from_properties(&p),
-            NatsAuth::UserPass { user: "alice".into(), pass: "hunter2".into() }
+            NatsAuth::UserPass {
+                user: "alice".into(),
+                pass: "hunter2".into()
+            }
         );
 
         // creds-path alone.
@@ -716,7 +759,10 @@ mod tests {
         );
 
         // No auth properties → anonymous.
-        assert_eq!(NatsAuth::from_properties(&HashMap::new()), NatsAuth::Anonymous);
+        assert_eq!(
+            NatsAuth::from_properties(&HashMap::new()),
+            NatsAuth::Anonymous
+        );
 
         // Empty values are not treated as set.
         let mut p = HashMap::new();
@@ -781,7 +827,13 @@ mod tests {
         let last_event_epoch = Arc::new(AtomicI64::new(0));
         let (tx, _rx) = tokio::sync::mpsc::channel::<SourceEvent>(8);
         let sent = process_payload(
-            b"\xff\xff not json", "c", "t", &events_count, &errors_count, &last_event_epoch, &tx,
+            b"\xff\xff not json",
+            "c",
+            "t",
+            &events_count,
+            &errors_count,
+            &last_event_epoch,
+            &tx,
         )
         .await;
         assert!(!sent);
@@ -797,7 +849,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SourceEvent>(8);
         let sent = process_payload(
             br#"{"entity_id":"x","lat":10.0,"lon":20.0}"#,
-            "c", "t", &events_count, &errors_count, &last_event_epoch, &tx,
+            "c",
+            "t",
+            &events_count,
+            &errors_count,
+            &last_event_epoch,
+            &tx,
         )
         .await;
         assert!(sent);
@@ -814,7 +871,10 @@ mod tests {
         for (url, expected) in [
             ("nats://h:4222/subject/orp.>", "orp.>"),
             ("nats://h:4222/subject/orp.*", "orp.*"),
-            ("nats://h:4222/subject/orp.events.*.east", "orp.events.*.east"),
+            (
+                "nats://h:4222/subject/orp.events.*.east",
+                "orp.events.*.east",
+            ),
             ("nats://h:4222/stream/S/subject/orp.>", "orp.>"),
             ("nats://h:4222/stream/S/subject/a.*.b.>", "a.*.b.>"),
         ] {
@@ -843,7 +903,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             conn.auth(),
-            &NatsAuth::UserPass { user: "alice".into(), pass: "secret".into() }
+            &NatsAuth::UserPass {
+                user: "alice".into(),
+                pass: "secret".into()
+            }
         );
     }
 

@@ -80,26 +80,17 @@ impl NodeId {
         let namespace = parts[0]
             .strip_prefix("ns=")
             .ok_or_else(|| {
-                ConnectorError::ParseError(format!(
-                    "OPC-UA: NodeId missing ns= prefix: {}",
-                    s
-                ))
+                ConnectorError::ParseError(format!("OPC-UA: NodeId missing ns= prefix: {}", s))
             })?
             .parse::<u16>()
             .map_err(|e| {
-                ConnectorError::ParseError(format!(
-                    "OPC-UA: invalid namespace index: {}",
-                    e
-                ))
+                ConnectorError::ParseError(format!("OPC-UA: invalid namespace index: {}", e))
             })?;
 
         let id_part = parts[1];
         if let Some(num_str) = id_part.strip_prefix("i=") {
             let num = num_str.parse::<u32>().map_err(|e| {
-                ConnectorError::ParseError(format!(
-                    "OPC-UA: invalid numeric id: {}",
-                    e
-                ))
+                ConnectorError::ParseError(format!("OPC-UA: invalid numeric id: {}", e))
             })?;
             Ok(NodeId::numeric(namespace, num))
         } else if let Some(str_id) = id_part.strip_prefix("s=") {
@@ -292,14 +283,9 @@ impl OpcDataChange {
         connector_id: &str,
         monitored: Option<&MonitoredNode>,
     ) -> SourceEvent {
-        let entity_type = monitored
-            .map(|m| m.entity_type.clone())
-            .unwrap_or_else(|| {
-                auto_detect_entity_type(
-                    self.display_name.as_deref().unwrap_or(""),
-                    &self.node_id,
-                )
-            });
+        let entity_type = monitored.map(|m| m.entity_type.clone()).unwrap_or_else(|| {
+            auto_detect_entity_type(self.display_name.as_deref().unwrap_or(""), &self.node_id)
+        });
 
         let mut properties: HashMap<String, serde_json::Value> = HashMap::new();
         properties.insert(
@@ -307,10 +293,7 @@ impl OpcDataChange {
             serde_json::json!(self.node_id.to_string_id()),
         );
         properties.insert("value".into(), self.value.to_json());
-        properties.insert(
-            "status".into(),
-            serde_json::json!(self.status.as_str()),
-        );
+        properties.insert("status".into(), serde_json::json!(self.status.as_str()));
         properties.insert(
             "status_good".into(),
             serde_json::json!(self.status.is_good()),
@@ -320,10 +303,7 @@ impl OpcDataChange {
             properties.insert("display_name".into(), serde_json::json!(name));
         }
         if let Some(numeric) = self.value.as_f64() {
-            properties.insert(
-                "numeric_value".into(),
-                serde_json::json!(numeric),
-            );
+            properties.insert("numeric_value".into(), serde_json::json!(numeric));
         }
         if let Some(ref ts) = self.source_timestamp {
             properties.insert(
@@ -356,9 +336,8 @@ impl OpcDataChange {
 /// Parse an OPC-UA data change from a JSON payload (e.g. from an OPC-UA
 /// to MQTT/REST gateway like Prosys, Kepware, or Node-RED).
 pub fn parse_opcua_json(json: &str) -> Result<OpcDataChange, ConnectorError> {
-    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| {
-        ConnectorError::ParseError(format!("OPC-UA JSON parse error: {}", e))
-    })?;
+    let v: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| ConnectorError::ParseError(format!("OPC-UA JSON parse error: {}", e)))?;
 
     let node_id_str = v
         .get("NodeId")
@@ -366,9 +345,7 @@ pub fn parse_opcua_json(json: &str) -> Result<OpcDataChange, ConnectorError> {
         .or_else(|| v.get("node_id"))
         .and_then(|n| n.as_str())
         .ok_or_else(|| {
-            ConnectorError::ParseError(
-                "OPC-UA JSON: missing NodeId field".to_string(),
-            )
+            ConnectorError::ParseError("OPC-UA JSON: missing NodeId field".to_string())
         })?;
 
     let node_id = NodeId::from_string(node_id_str)?;
@@ -499,9 +476,8 @@ impl Connector for OpcuaConnector {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(5);
 
-                    let mut interval = tokio::time::interval(
-                        tokio::time::Duration::from_secs(poll_secs),
-                    );
+                    let mut interval =
+                        tokio::time::interval(tokio::time::Duration::from_secs(poll_secs));
 
                     while running.load(Ordering::SeqCst) {
                         interval.tick().await;
@@ -509,55 +485,36 @@ impl Connector for OpcuaConnector {
                             Ok(resp) => match resp.text().await {
                                 Ok(body) => {
                                     // Try array of data changes
-                                    if let Ok(changes) = serde_json::from_str::<
-                                        Vec<serde_json::Value>,
-                                    >(
-                                        &body
-                                    ) {
+                                    if let Ok(changes) =
+                                        serde_json::from_str::<Vec<serde_json::Value>>(&body)
+                                    {
                                         for change_json in changes {
                                             let json_str = change_json.to_string();
                                             match parse_opcua_json(&json_str) {
                                                 Ok(dc) => {
-                                                    let event = dc.to_source_event(
-                                                        &connector_id,
-                                                        None,
-                                                    );
-                                                    if tx.send(event).await.is_err()
-                                                    {
+                                                    let event =
+                                                        dc.to_source_event(&connector_id, None);
+                                                    if tx.send(event).await.is_err() {
                                                         return;
                                                     }
-                                                    events_count.fetch_add(
-                                                        1,
-                                                        Ordering::Relaxed,
-                                                    );
+                                                    events_count.fetch_add(1, Ordering::Relaxed);
                                                 }
                                                 Err(e) => {
-                                                    tracing::warn!(
-                                                        "OPC-UA parse error: {}",
-                                                        e
-                                                    );
-                                                    errors_count.fetch_add(
-                                                        1,
-                                                        Ordering::Relaxed,
-                                                    );
+                                                    tracing::warn!("OPC-UA parse error: {}", e);
+                                                    errors_count.fetch_add(1, Ordering::Relaxed);
                                                 }
                                             }
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!(
-                                        "OPC-UA response error: {}",
-                                        e
-                                    );
-                                    errors_count
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    tracing::warn!("OPC-UA response error: {}", e);
+                                    errors_count.fetch_add(1, Ordering::Relaxed);
                                 }
                             },
                             Err(e) => {
                                 tracing::warn!("OPC-UA request error: {}", e);
-                                errors_count
-                                    .fetch_add(1, Ordering::Relaxed);
+                                errors_count.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -645,9 +602,7 @@ mod tests {
 
     #[test]
     fn test_node_id_parse_guid() {
-        let nid =
-            NodeId::from_string("ns=1;g=550e8400-e29b-41d4-a716-446655440000")
-                .unwrap();
+        let nid = NodeId::from_string("ns=1;g=550e8400-e29b-41d4-a716-446655440000").unwrap();
         assert_eq!(nid.namespace, 1);
         assert!(matches!(nid.identifier, NodeIdentifier::Guid(_)));
     }
@@ -674,10 +629,7 @@ mod tests {
 
     #[test]
     fn test_opc_value_to_json() {
-        assert_eq!(
-            OpcValue::Double(23.5).to_json(),
-            serde_json::json!(23.5)
-        );
+        assert_eq!(OpcValue::Double(23.5).to_json(), serde_json::json!(23.5));
         assert_eq!(OpcValue::Boolean(true).to_json(), serde_json::json!(true));
         assert_eq!(
             OpcValue::String("test".into()).to_json(),
@@ -793,22 +745,10 @@ mod tests {
             auto_detect_entity_type("Main Pressure Gauge", &nid),
             "pressure_sensor"
         );
-        assert_eq!(
-            auto_detect_entity_type("Flow Meter 1", &nid),
-            "flow_sensor"
-        );
-        assert_eq!(
-            auto_detect_entity_type("Tank Level", &nid),
-            "level_sensor"
-        );
-        assert_eq!(
-            auto_detect_entity_type("Safety Valve 3", &nid),
-            "valve"
-        );
-        assert_eq!(
-            auto_detect_entity_type("Feed Pump", &nid),
-            "pump"
-        );
+        assert_eq!(auto_detect_entity_type("Flow Meter 1", &nid), "flow_sensor");
+        assert_eq!(auto_detect_entity_type("Tank Level", &nid), "level_sensor");
+        assert_eq!(auto_detect_entity_type("Safety Valve 3", &nid), "valve");
+        assert_eq!(auto_detect_entity_type("Feed Pump", &nid), "pump");
         assert_eq!(
             auto_detect_entity_type("Generic Sensor XYZ", &nid),
             "sensor"
@@ -818,10 +758,7 @@ mod tests {
     #[test]
     fn test_auto_detect_power_voltage_current() {
         let nid = NodeId::numeric(0, 1);
-        assert_eq!(
-            auto_detect_entity_type("Power Meter", &nid),
-            "power_meter"
-        );
+        assert_eq!(auto_detect_entity_type("Power Meter", &nid), "power_meter");
         assert_eq!(
             auto_detect_entity_type("Voltage Sensor", &nid),
             "voltage_sensor"

@@ -153,12 +153,24 @@ impl TcpHeader {
     /// TCP flag mnemonics.
     pub fn flags_str(&self) -> String {
         let mut s = String::new();
-        if self.flags & 0x01 != 0 { s.push_str("FIN "); }
-        if self.flags & 0x02 != 0 { s.push_str("SYN "); }
-        if self.flags & 0x04 != 0 { s.push_str("RST "); }
-        if self.flags & 0x08 != 0 { s.push_str("PSH "); }
-        if self.flags & 0x10 != 0 { s.push_str("ACK "); }
-        if self.flags & 0x20 != 0 { s.push_str("URG "); }
+        if self.flags & 0x01 != 0 {
+            s.push_str("FIN ");
+        }
+        if self.flags & 0x02 != 0 {
+            s.push_str("SYN ");
+        }
+        if self.flags & 0x04 != 0 {
+            s.push_str("RST ");
+        }
+        if self.flags & 0x08 != 0 {
+            s.push_str("PSH ");
+        }
+        if self.flags & 0x10 != 0 {
+            s.push_str("ACK ");
+        }
+        if self.flags & 0x20 != 0 {
+            s.push_str("URG ");
+        }
         s.trim().to_string()
     }
 
@@ -212,7 +224,12 @@ fn read_u32(data: &[u8], offset: usize, endian: PcapEndian) -> Option<u32> {
     if offset + 4 > data.len() {
         return None;
     }
-    let bytes: [u8; 4] = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+    let bytes: [u8; 4] = [
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ];
     Some(match endian {
         PcapEndian::Little => u32::from_le_bytes(bytes),
         PcapEndian::Big => u32::from_be_bytes(bytes),
@@ -223,7 +240,12 @@ fn read_i32(data: &[u8], offset: usize, endian: PcapEndian) -> Option<i32> {
     if offset + 4 > data.len() {
         return None;
     }
-    let bytes: [u8; 4] = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+    let bytes: [u8; 4] = [
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ];
     Some(match endian {
         PcapEndian::Little => i32::from_le_bytes(bytes),
         PcapEndian::Big => i32::from_be_bytes(bytes),
@@ -264,18 +286,24 @@ pub fn parse_pcap_global_header(data: &[u8]) -> Result<PcapGlobalHeader, Connect
     Ok(PcapGlobalHeader {
         endian,
         ts_resolution,
-        version_major: read_u16(data, 4, endian)
-            .ok_or_else(|| ConnectorError::ParseError("PCAP: global header truncated at version_major".into()))?,
-        version_minor: read_u16(data, 6, endian)
-            .ok_or_else(|| ConnectorError::ParseError("PCAP: global header truncated at version_minor".into()))?,
-        thiszone: read_i32(data, 8, endian)
-            .ok_or_else(|| ConnectorError::ParseError("PCAP: global header truncated at thiszone".into()))?,
-        sigfigs: read_u32(data, 12, endian)
-            .ok_or_else(|| ConnectorError::ParseError("PCAP: global header truncated at sigfigs".into()))?,
-        snaplen: read_u32(data, 16, endian)
-            .ok_or_else(|| ConnectorError::ParseError("PCAP: global header truncated at snaplen".into()))?,
-        network: read_u32(data, 20, endian)
-            .ok_or_else(|| ConnectorError::ParseError("PCAP: global header truncated at network".into()))?,
+        version_major: read_u16(data, 4, endian).ok_or_else(|| {
+            ConnectorError::ParseError("PCAP: global header truncated at version_major".into())
+        })?,
+        version_minor: read_u16(data, 6, endian).ok_or_else(|| {
+            ConnectorError::ParseError("PCAP: global header truncated at version_minor".into())
+        })?,
+        thiszone: read_i32(data, 8, endian).ok_or_else(|| {
+            ConnectorError::ParseError("PCAP: global header truncated at thiszone".into())
+        })?,
+        sigfigs: read_u32(data, 12, endian).ok_or_else(|| {
+            ConnectorError::ParseError("PCAP: global header truncated at sigfigs".into())
+        })?,
+        snaplen: read_u32(data, 16, endian).ok_or_else(|| {
+            ConnectorError::ParseError("PCAP: global header truncated at snaplen".into())
+        })?,
+        network: read_u32(data, 20, endian).ok_or_else(|| {
+            ConnectorError::ParseError("PCAP: global header truncated at network".into())
+        })?,
     })
 }
 
@@ -290,14 +318,18 @@ pub fn parse_pcap_packet_header(
             "PCAP: packet header truncated".into(),
         ));
     }
-    let ts_sec = read_u32(data, offset, endian)
-        .ok_or_else(|| ConnectorError::ParseError("PCAP: packet header truncated at ts_sec".into()))?;
-    let ts_usec = read_u32(data, offset + 4, endian)
-        .ok_or_else(|| ConnectorError::ParseError("PCAP: packet header truncated at ts_usec".into()))?;
-    let incl_len = read_u32(data, offset + 8, endian)
-        .ok_or_else(|| ConnectorError::ParseError("PCAP: packet header truncated at incl_len".into()))?;
-    let orig_len = read_u32(data, offset + 12, endian)
-        .ok_or_else(|| ConnectorError::ParseError("PCAP: packet header truncated at orig_len".into()))?;
+    let ts_sec = read_u32(data, offset, endian).ok_or_else(|| {
+        ConnectorError::ParseError("PCAP: packet header truncated at ts_sec".into())
+    })?;
+    let ts_usec = read_u32(data, offset + 4, endian).ok_or_else(|| {
+        ConnectorError::ParseError("PCAP: packet header truncated at ts_usec".into())
+    })?;
+    let incl_len = read_u32(data, offset + 8, endian).ok_or_else(|| {
+        ConnectorError::ParseError("PCAP: packet header truncated at incl_len".into())
+    })?;
+    let orig_len = read_u32(data, offset + 12, endian).ok_or_else(|| {
+        ConnectorError::ParseError("PCAP: packet header truncated at orig_len".into())
+    })?;
     let next = offset + 16 + incl_len as usize;
     if next > data.len() {
         return Err(ConnectorError::ParseError(
@@ -519,10 +551,7 @@ pub fn parse_packet(
 }
 
 /// Convert a `PacketSummary` into a `SourceEvent`.
-pub fn packet_to_source_event(
-    summary: &PacketSummary,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn packet_to_source_event(summary: &PacketSummary, connector_id: &str) -> SourceEvent {
     let entity_id = match (&summary.src_port, &summary.dst_port) {
         (Some(sp), Some(dp)) => {
             format!("pcap:{}:{}-{}:{}", summary.src_ip, sp, summary.dst_ip, dp)
@@ -615,11 +644,10 @@ impl Connector for PcapConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| ConnectorError::ConfigError("PCAP: url (file path) required".into()))?;
+        let path =
+            self.config.url.as_deref().ok_or_else(|| {
+                ConnectorError::ConfigError("PCAP: url (file path) required".into())
+            })?;
 
         let data = tokio::fs::read(path)
             .await

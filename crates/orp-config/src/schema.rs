@@ -1,7 +1,9 @@
 //! Configuration schema (BUILD_CORE_ENGINE.md §6).
 //!
 //! Supports environment variable substitution using `${env.VAR}` syntax in
-//! string values. Call [`Config::resolve_env_vars`] before validating.
+//! string values. (Env-var resolution helper is on the roadmap; for now the
+//! values are passed through verbatim and consumed by the appropriate
+//! component at runtime.)
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -398,15 +400,13 @@ pub struct TemplateConfig {
 
 // ── Config impl ───────────────────────────────────────────────────────────────
 
-
-
 impl Config {
     /// Load from a YAML file, apply env var substitution, then validate.
     pub fn load_from_file(path: &str) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
         let content = Self::substitute_env_vars(&content);
-        let config: Config = serde_yaml::from_str(&content)
-            .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        let config: Config =
+            serde_yaml::from_str(&content).map_err(|e| ConfigError::ParseError(e.to_string()))?;
         config.validate().map_err(ConfigError::ValidationError)?;
         Ok(config)
     }
@@ -414,8 +414,8 @@ impl Config {
     /// Load from a YAML string directly (useful for testing).
     pub fn from_yaml(yaml: &str) -> Result<Self, ConfigError> {
         let yaml = Self::substitute_env_vars(yaml);
-        let config: Config = serde_yaml::from_str(&yaml)
-            .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        let config: Config =
+            serde_yaml::from_str(&yaml).map_err(|e| ConfigError::ParseError(e.to_string()))?;
         Ok(config)
     }
 

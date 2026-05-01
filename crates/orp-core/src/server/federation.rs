@@ -576,10 +576,7 @@ pub fn spawn_federation_sync(state: Arc<AppState>) {
                 if !peer.sync_enabled {
                     continue;
                 }
-                let due = next_run_at
-                    .get(&peer.id)
-                    .map(|t| now >= *t)
-                    .unwrap_or(true);
+                let due = next_run_at.get(&peer.id).map(|t| now >= *t).unwrap_or(true);
                 if !due {
                     continue;
                 }
@@ -596,10 +593,7 @@ pub fn spawn_federation_sync(state: Arc<AppState>) {
                         next_run_at.insert(peer.id.clone(), now + base_interval);
                     }
                     Err(e) => {
-                        let prev = backoff
-                            .get(&peer.id)
-                            .copied()
-                            .unwrap_or(base_interval);
+                        let prev = backoff.get(&peer.id).copied().unwrap_or(base_interval);
                         let next = (prev.saturating_mul(2)).min(max_interval);
                         warn!(
                             peer_id = %peer.id,
@@ -627,8 +621,7 @@ pub(crate) fn evict_stale_peer_state<V1, V2>(
     backoff: &mut HashMap<String, V2>,
 ) {
     use std::collections::HashSet;
-    let current_ids: HashSet<&str> =
-        current_peers.iter().map(|p| p.id.as_str()).collect();
+    let current_ids: HashSet<&str> = current_peers.iter().map(|p| p.id.as_str()).collect();
     next_run_at.retain(|k, _| current_ids.contains(k.as_str()));
     backoff.retain(|k, _| current_ids.contains(k.as_str()));
 }
@@ -910,7 +903,11 @@ mod tests {
 
         let stored = storage.get_entity(entity_id).await.unwrap().unwrap();
         // DuckDB stores confidence as FLOAT (f32); allow for f32 precision loss.
-        assert!((stored.confidence - 0.9).abs() < 1e-6, "confidence was {}", stored.confidence);
+        assert!(
+            (stored.confidence - 0.9).abs() < 1e-6,
+            "confidence was {}",
+            stored.confidence
+        );
         assert_eq!(stored.properties["source"], "peer:alpha");
     }
 
@@ -975,7 +972,11 @@ mod tests {
 
         let stored = storage.get_entity("ship-upgrade").await.unwrap().unwrap();
         // DuckDB stores confidence as FLOAT (f32); allow for f32 precision loss.
-        assert!((stored.confidence - 0.95).abs() < 1e-6, "confidence was {}", stored.confidence);
+        assert!(
+            (stored.confidence - 0.95).abs() < 1e-6,
+            "confidence was {}",
+            stored.confidence
+        );
     }
 
     // ── Per-peer state map eviction ───────────────────────────────────────────

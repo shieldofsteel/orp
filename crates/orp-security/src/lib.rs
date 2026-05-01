@@ -67,6 +67,6 @@ pub use middleware::{AuthContext, AuthError, AuthMethod, AuthState};
 pub use oidc::{OidcClient, OidcConfig, OidcError, SecurityError, TokenResponse};
 
 pub use rbac::{
-    check_role_permission, check_role_permission_str, register_rbac_policies,
-    Action as RbacAction, Role, RolePermissions,
+    check_role_permission, check_role_permission_str, register_rbac_policies, Action as RbacAction,
+    Role, RolePermissions,
 };

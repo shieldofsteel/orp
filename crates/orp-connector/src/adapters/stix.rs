@@ -156,16 +156,14 @@ pub fn stix_type_to_entity(stix_type: &str) -> &'static str {
 
 /// Parse a STIX 2.1 bundle from a JSON string.
 pub fn parse_stix_bundle(json: &str) -> Result<StixBundle, ConnectorError> {
-    serde_json::from_str(json).map_err(|e| {
-        ConnectorError::ParseError(format!("STIX bundle parse error: {}", e))
-    })
+    serde_json::from_str(json)
+        .map_err(|e| ConnectorError::ParseError(format!("STIX bundle parse error: {}", e)))
 }
 
 /// Parse a single STIX 2.1 object from a JSON string.
 pub fn parse_stix_object(json: &str) -> Result<StixObject, ConnectorError> {
-    serde_json::from_str(json).map_err(|e| {
-        ConnectorError::ParseError(format!("STIX object parse error: {}", e))
-    })
+    serde_json::from_str(json)
+        .map_err(|e| ConnectorError::ParseError(format!("STIX object parse error: {}", e)))
 }
 
 // ---------------------------------------------------------------------------
@@ -178,10 +176,7 @@ impl StixObject {
         let entity_type = stix_type_to_entity(&self.object_type);
 
         let mut properties: HashMap<String, serde_json::Value> = HashMap::new();
-        properties.insert(
-            "stix_type".into(),
-            serde_json::json!(self.object_type),
-        );
+        properties.insert("stix_type".into(), serde_json::json!(self.object_type));
         properties.insert("stix_id".into(), serde_json::json!(self.id));
         properties.insert("spec_version".into(), serde_json::json!(self.spec_version));
 
@@ -210,19 +205,13 @@ impl StixObject {
             properties.insert("malware_types".into(), serde_json::json!(mt));
         }
         if let Some(ref ta) = self.threat_actor_types {
-            properties.insert(
-                "threat_actor_types".into(),
-                serde_json::json!(ta),
-            );
+            properties.insert("threat_actor_types".into(), serde_json::json!(ta));
         }
         if let Some(ref aliases) = self.aliases {
             properties.insert("aliases".into(), serde_json::json!(aliases));
         }
         if let Some(ref soph) = self.sophistication {
-            properties.insert(
-                "sophistication".into(),
-                serde_json::json!(soph),
-            );
+            properties.insert("sophistication".into(), serde_json::json!(soph));
         }
         if let Some(ref kc) = self.kill_chain_phases {
             let kc_json: Vec<serde_json::Value> = kc
@@ -237,10 +226,7 @@ impl StixObject {
             properties.insert("kill_chain_phases".into(), serde_json::json!(kc_json));
         }
         if let Some(ref rt) = self.relationship_type {
-            properties.insert(
-                "relationship_type".into(),
-                serde_json::json!(rt),
-            );
+            properties.insert("relationship_type".into(), serde_json::json!(rt));
         }
         if let Some(ref sr) = self.source_ref {
             properties.insert("source_ref".into(), serde_json::json!(sr));
@@ -265,10 +251,7 @@ impl StixObject {
                     })
                 })
                 .collect();
-            properties.insert(
-                "external_references".into(),
-                serde_json::json!(refs_json),
-            );
+            properties.insert("external_references".into(), serde_json::json!(refs_json));
         }
         if let Some(ref fs) = self.first_seen {
             properties.insert("first_seen".into(), serde_json::json!(fs));
@@ -335,21 +318,14 @@ pub struct TaxiiCollections {
 
 /// Parse TAXII discovery response.
 pub fn parse_taxii_discovery(json: &str) -> Result<TaxiiDiscovery, ConnectorError> {
-    serde_json::from_str(json).map_err(|e| {
-        ConnectorError::ParseError(format!("TAXII discovery parse error: {}", e))
-    })
+    serde_json::from_str(json)
+        .map_err(|e| ConnectorError::ParseError(format!("TAXII discovery parse error: {}", e)))
 }
 
 /// Parse TAXII collections response.
-pub fn parse_taxii_collections(
-    json: &str,
-) -> Result<TaxiiCollections, ConnectorError> {
-    serde_json::from_str(json).map_err(|e| {
-        ConnectorError::ParseError(format!(
-            "TAXII collections parse error: {}",
-            e
-        ))
-    })
+pub fn parse_taxii_collections(json: &str) -> Result<TaxiiCollections, ConnectorError> {
+    serde_json::from_str(json)
+        .map_err(|e| ConnectorError::ParseError(format!("TAXII collections parse error: {}", e)))
 }
 
 // ---------------------------------------------------------------------------
@@ -410,19 +386,15 @@ impl Connector for StixConnector {
                     .get("collection_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
-                let api_root = props
-                    .get("api_root")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let api_root = props.get("api_root").and_then(|v| v.as_str()).unwrap_or("");
 
                 let objects_url = format!(
                     "{}{}/collections/{}/objects/",
                     base_url, api_root, collection_id
                 );
 
-                let mut interval = tokio::time::interval(
-                    tokio::time::Duration::from_secs(poll_secs),
-                );
+                let mut interval =
+                    tokio::time::interval(tokio::time::Duration::from_secs(poll_secs));
 
                 while running.load(Ordering::SeqCst) {
                     interval.tick().await;
@@ -436,25 +408,21 @@ impl Connector for StixConnector {
                             Ok(body) => match parse_stix_bundle(&body) {
                                 Ok(bundle) => {
                                     for obj in &bundle.objects {
-                                        let event =
-                                            obj.to_source_event(&connector_id);
+                                        let event = obj.to_source_event(&connector_id);
                                         if tx.send(event).await.is_err() {
                                             return;
                                         }
-                                        events_count
-                                            .fetch_add(1, Ordering::Relaxed);
+                                        events_count.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                                 Err(e) => {
                                     tracing::warn!("STIX parse error: {}", e);
-                                    errors_count
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    errors_count.fetch_add(1, Ordering::Relaxed);
                                 }
                             },
                             Err(e) => {
                                 tracing::warn!("TAXII response error: {}", e);
-                                errors_count
-                                    .fetch_add(1, Ordering::Relaxed);
+                                errors_count.fetch_add(1, Ordering::Relaxed);
                             }
                         },
                         Err(e) => {
@@ -595,10 +563,7 @@ mod tests {
         assert_eq!(malware.is_family, Some(true));
         assert_eq!(
             malware.malware_types,
-            Some(vec![
-                "remote-access-trojan".into(),
-                "backdoor".into()
-            ])
+            Some(vec!["remote-access-trojan".into(), "backdoor".into()])
         );
     }
 
@@ -608,10 +573,7 @@ mod tests {
         let ta = &bundle.objects[2];
         assert_eq!(ta.object_type, "threat-actor");
         assert_eq!(ta.name, Some("APT-Phantom".into()));
-        assert_eq!(
-            ta.threat_actor_types,
-            Some(vec!["nation-state".into()])
-        );
+        assert_eq!(ta.threat_actor_types, Some(vec!["nation-state".into()]));
         assert_eq!(ta.sophistication, Some("expert".into()));
     }
 
@@ -621,10 +583,7 @@ mod tests {
         let rel = &bundle.objects[3];
         assert_eq!(rel.object_type, "relationship");
         assert_eq!(rel.relationship_type, Some("uses".into()));
-        assert_eq!(
-            rel.source_ref,
-            Some("threat-actor--9999".into())
-        );
+        assert_eq!(rel.source_ref, Some("threat-actor--9999".into()));
         assert_eq!(rel.target_ref, Some("malware--5678".into()));
     }
 

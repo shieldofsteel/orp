@@ -37,13 +37,9 @@ pub enum MonitorCondition {
         trigger_on: GeofenceTrigger,
     },
     /// Entity has not been updated in a certain duration
-    Stale {
-        max_age_seconds: u64,
-    },
+    Stale { max_age_seconds: u64 },
     /// Speed change exceeds threshold
-    SpeedAnomaly {
-        max_change_knots: f64,
-    },
+    SpeedAnomaly { max_change_knots: f64 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -130,7 +126,12 @@ impl MonitorEngine {
 
     /// Get a rule by ID
     pub async fn get_rule(&self, rule_id: &str) -> Option<MonitorRule> {
-        self.rules.lock().await.iter().find(|r| r.rule_id == rule_id).cloned()
+        self.rules
+            .lock()
+            .await
+            .iter()
+            .find(|r| r.rule_id == rule_id)
+            .cloned()
     }
 
     /// Update a rule
@@ -211,10 +212,7 @@ impl MonitorEngine {
                 self.alerts.lock().await.push(alert);
 
                 // Update cooldown
-                self.cooldowns
-                    .lock()
-                    .await
-                    .insert(cooldown_key, Utc::now());
+                self.cooldowns.lock().await.insert(cooldown_key, Utc::now());
             }
         }
 
@@ -298,10 +296,7 @@ impl MonitorEngine {
     }
 
     fn format_alert_message(&self, rule: &MonitorRule, entity: &Entity) -> String {
-        let name = entity
-            .name
-            .as_deref()
-            .unwrap_or(&entity.entity_id);
+        let name = entity.name.as_deref().unwrap_or(&entity.entity_id);
         format!(
             "[{}] {} triggered for '{}' ({})",
             match rule.severity {
@@ -326,7 +321,10 @@ impl MonitorEngine {
                 })
             }
             MonitorCondition::Geofence {
-                lat, lon, radius_km, ..
+                lat,
+                lon,
+                radius_km,
+                ..
             } => {
                 serde_json::json!({
                     "rule_id": rule.rule_id,

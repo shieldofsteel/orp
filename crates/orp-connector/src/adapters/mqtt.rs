@@ -36,7 +36,11 @@ impl MqttConnector {
             .get("id")
             .or_else(|| json.get("entity_id"))
             .or_else(|| json.get("device_id"))
-            .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_i64().map(|n| n.to_string())))
+            .and_then(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
             .unwrap_or_else(|| {
                 // Derive entity_id from topic
                 topic.replace('/', "_")
@@ -100,10 +104,38 @@ impl Connector for MqttConnector {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
             let sensors = vec![
-                ("sensor/port/rotterdam/tide", "sensor", 51.92, 4.48, "tide_level", 2.5),
-                ("sensor/port/rotterdam/wind", "sensor", 51.92, 4.48, "wind_speed", 15.0),
-                ("sensor/port/antwerp/tide", "sensor", 51.22, 4.40, "tide_level", 1.8),
-                ("sensor/buoy/north_sea_1", "sensor", 53.0, 3.5, "wave_height", 3.2),
+                (
+                    "sensor/port/rotterdam/tide",
+                    "sensor",
+                    51.92,
+                    4.48,
+                    "tide_level",
+                    2.5,
+                ),
+                (
+                    "sensor/port/rotterdam/wind",
+                    "sensor",
+                    51.92,
+                    4.48,
+                    "wind_speed",
+                    15.0,
+                ),
+                (
+                    "sensor/port/antwerp/tide",
+                    "sensor",
+                    51.22,
+                    4.40,
+                    "tide_level",
+                    1.8,
+                ),
+                (
+                    "sensor/buoy/north_sea_1",
+                    "sensor",
+                    53.0,
+                    3.5,
+                    "wave_height",
+                    3.2,
+                ),
             ];
 
             let mut counter = 0u64;
@@ -187,7 +219,8 @@ mod tests {
 
     #[test]
     fn test_parse_mqtt_payload() {
-        let payload = r#"{"id": "sensor-1", "latitude": 51.92, "longitude": 4.48, "temperature": 18.5}"#;
+        let payload =
+            r#"{"id": "sensor-1", "latitude": 51.92, "longitude": 4.48, "temperature": 18.5}"#;
         let event =
             MqttConnector::parse_mqtt_payload("sensors/temp/1", payload, "sensor", "mqtt-1");
         assert!(event.is_some());
@@ -199,16 +232,14 @@ mod tests {
 
     #[test]
     fn test_parse_mqtt_invalid_json() {
-        let event =
-            MqttConnector::parse_mqtt_payload("topic", "not json", "sensor", "mqtt-1");
+        let event = MqttConnector::parse_mqtt_payload("topic", "not json", "sensor", "mqtt-1");
         assert!(event.is_none());
     }
 
     #[test]
     fn test_parse_mqtt_derive_id_from_topic() {
         let payload = r#"{"temperature": 20.0}"#;
-        let event =
-            MqttConnector::parse_mqtt_payload("sensor/port/1", payload, "sensor", "mqtt-1");
+        let event = MqttConnector::parse_mqtt_payload("sensor/port/1", payload, "sensor", "mqtt-1");
         assert!(event.is_some());
         let event = event.unwrap();
         assert_eq!(event.entity_id, "sensor:sensor_port_1");

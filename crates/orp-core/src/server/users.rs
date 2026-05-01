@@ -181,8 +181,12 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
     if parts.len() != 4 || parts[1] != "sha256" {
         return false;
     }
-    let Ok(salt) = hex::decode(parts[2]) else { return false; };
-    let Ok(expected_hash) = hex::decode(parts[3]) else { return false; };
+    let Ok(salt) = hex::decode(parts[2]) else {
+        return false;
+    };
+    let Ok(expected_hash) = hex::decode(parts[3]) else {
+        return false;
+    };
     let actual_hash = sha256_hash_with_salt(password, &salt);
     // Constant-time comparison
     constant_time_eq(&actual_hash, &expected_hash)
@@ -257,14 +261,11 @@ impl UserRegistry {
     pub fn create(&self, req: CreateUserRequest) -> Result<UserProfile, UserError> {
         // Validate role
         let role_str = req.role.as_deref().unwrap_or("viewer");
-        Role::from_str(role_str)
-            .ok_or_else(|| UserError::InvalidRole(role_str.to_string()))?;
+        Role::from_str(role_str).ok_or_else(|| UserError::InvalidRole(role_str.to_string()))?;
 
         let user_id = Uuid::new_v4().to_string();
         let now = Utc::now();
-        let display_name = req
-            .display_name
-            .unwrap_or_else(|| req.username.clone());
+        let display_name = req.display_name.unwrap_or_else(|| req.username.clone());
         let password_hash = hash_password(&req.password);
 
         let c = self.conn.lock().map_err(|_| UserError::Lock)?;
@@ -326,9 +327,7 @@ impl UserRegistry {
                     is_active: row.get(5)?,
                     created_at: parse_ts(row.get::<_, String>(6)?),
                     updated_at: parse_ts(row.get::<_, String>(7)?),
-                    last_login: row
-                        .get::<_, Option<String>>(8)?
-                        .map(parse_ts),
+                    last_login: row.get::<_, Option<String>>(8)?.map(parse_ts),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -398,8 +397,7 @@ impl UserRegistry {
 
     /// Change a user's role.
     pub fn change_role(&self, user_id: &str, new_role: &str) -> Result<UserProfile, UserError> {
-        Role::from_str(new_role)
-            .ok_or_else(|| UserError::InvalidRole(new_role.to_string()))?;
+        Role::from_str(new_role).ok_or_else(|| UserError::InvalidRole(new_role.to_string()))?;
 
         let now = Utc::now();
         let c = self.conn.lock().map_err(|_| UserError::Lock)?;
@@ -448,8 +446,7 @@ fn parse_ts(s: String) -> DateTime<Utc> {
     s.parse::<DateTime<Utc>>()
         .or_else(|_| {
             // DuckDB may return TIMESTAMP as "YYYY-MM-DD HH:MM:SS.ffffff +00:00"
-            DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f %z")
-                .map(|dt| dt.with_timezone(&Utc))
+            DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f %z").map(|dt| dt.with_timezone(&Utc))
         })
         .unwrap_or_else(|_| Utc::now())
 }
@@ -529,8 +526,12 @@ pub async fn create_user(
     }
 
     if req.username.trim().is_empty() || req.email.trim().is_empty() || req.password.is_empty() {
-        return error_resp("VALIDATION_ERROR", StatusCode::BAD_REQUEST, "username, email, and password are required")
-            .into_response();
+        return error_resp(
+            "VALIDATION_ERROR",
+            StatusCode::BAD_REQUEST,
+            "username, email, and password are required",
+        )
+        .into_response();
     }
 
     match state.registry.create(req) {
@@ -549,17 +550,18 @@ pub async fn create_user(
         .into_response(),
         Err(e) => {
             tracing::error!("create_user error: {e}");
-            error_resp("INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR, "Failed to create user")
-                .into_response()
+            error_resp(
+                "INTERNAL_ERROR",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create user",
+            )
+            .into_response()
         }
     }
 }
 
 /// GET /api/v1/users — list users (Admin+)
-pub async fn list_users(
-    State(state): State<UserState>,
-    auth: AuthContext,
-) -> impl IntoResponse {
+pub async fn list_users(State(state): State<UserState>, auth: AuthContext) -> impl IntoResponse {
     if let Err(e) = require_role(&auth, &Action::UsersView) {
         return e.into_response();
     }
@@ -571,8 +573,12 @@ pub async fn list_users(
         }
         Err(e) => {
             tracing::error!("list_users error: {e}");
-            error_resp("INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR, "Failed to list users")
-                .into_response()
+            error_resp(
+                "INTERNAL_ERROR",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to list users",
+            )
+            .into_response()
         }
     }
 }
@@ -624,8 +630,12 @@ pub async fn change_user_role(
         .into_response(),
         Err(e) => {
             tracing::error!("change_user_role error: {e}");
-            error_resp("INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR, "Failed to change role")
-                .into_response()
+            error_resp(
+                "INTERNAL_ERROR",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to change role",
+            )
+            .into_response()
         }
     }
 }
@@ -831,7 +841,8 @@ mod tests {
     fn list_users_returns_all() {
         let reg = test_registry();
         reg.create(create_req("u1", "u1@ex.com", "viewer")).unwrap();
-        reg.create(create_req("u2", "u2@ex.com", "analyst")).unwrap();
+        reg.create(create_req("u2", "u2@ex.com", "analyst"))
+            .unwrap();
         let users = reg.list().expect("list");
         assert_eq!(users.len(), 2);
     }
@@ -839,7 +850,9 @@ mod tests {
     #[test]
     fn get_user_by_id() {
         let reg = test_registry();
-        let created = reg.create(create_req("getme", "getme@ex.com", "viewer")).unwrap();
+        let created = reg
+            .create(create_req("getme", "getme@ex.com", "viewer"))
+            .unwrap();
         let fetched = reg.get(&created.user_id).expect("get");
         assert_eq!(fetched.user_id, created.user_id);
         assert_eq!(fetched.email, "getme@ex.com");
@@ -855,23 +868,33 @@ mod tests {
     #[test]
     fn change_role_success() {
         let reg = test_registry();
-        let user = reg.create(create_req("rolechange", "rc@ex.com", "viewer")).unwrap();
-        let updated = reg.change_role(&user.user_id, "analyst").expect("change role");
+        let user = reg
+            .create(create_req("rolechange", "rc@ex.com", "viewer"))
+            .unwrap();
+        let updated = reg
+            .change_role(&user.user_id, "analyst")
+            .expect("change role");
         assert_eq!(updated.role, "analyst");
     }
 
     #[test]
     fn change_role_invalid_fails() {
         let reg = test_registry();
-        let user = reg.create(create_req("badrc", "brc@ex.com", "viewer")).unwrap();
-        let err = reg.change_role(&user.user_id, "god").expect_err("should fail");
+        let user = reg
+            .create(create_req("badrc", "brc@ex.com", "viewer"))
+            .unwrap();
+        let err = reg
+            .change_role(&user.user_id, "god")
+            .expect_err("should fail");
         assert!(matches!(err, UserError::InvalidRole(_)));
     }
 
     #[test]
     fn deactivate_user_success() {
         let reg = test_registry();
-        let user = reg.create(create_req("deact", "deact@ex.com", "viewer")).unwrap();
+        let user = reg
+            .create(create_req("deact", "deact@ex.com", "viewer"))
+            .unwrap();
         reg.deactivate(&user.user_id).expect("deactivate");
         // Re-fetch — user should be inactive
         let fetched = reg.get(&user.user_id).expect("still findable");
@@ -888,7 +911,9 @@ mod tests {
     #[test]
     fn find_by_email_success() {
         let reg = test_registry();
-        let created = reg.create(create_req("emailfind", "ef@ex.com", "analyst")).unwrap();
+        let created = reg
+            .create(create_req("emailfind", "ef@ex.com", "analyst"))
+            .unwrap();
         let user = reg.find_by_email("ef@ex.com").expect("find by email");
         assert_eq!(user.user_id, created.user_id);
     }
@@ -896,7 +921,9 @@ mod tests {
     #[test]
     fn record_login_updates_timestamp() {
         let reg = test_registry();
-        let user = reg.create(create_req("loginrec", "lr@ex.com", "viewer")).unwrap();
+        let user = reg
+            .create(create_req("loginrec", "lr@ex.com", "viewer"))
+            .unwrap();
         assert!(user.last_login.is_none());
         reg.record_login(&user.user_id).expect("record login");
         let updated = reg.get(&user.user_id).expect("get");
@@ -923,7 +950,10 @@ mod tests {
     fn role_from_auth_operator() {
         let auth = AuthContext {
             subject: "op".to_string(),
-            permissions: vec!["entities:read".to_string(), "alerts:acknowledge".to_string()],
+            permissions: vec![
+                "entities:read".to_string(),
+                "alerts:acknowledge".to_string(),
+            ],
             email: None,
             name: None,
             org_id: None,

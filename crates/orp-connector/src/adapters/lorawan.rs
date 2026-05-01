@@ -264,9 +264,7 @@ pub fn parse_lorawan_frame(data: &[u8]) -> Result<LoRaWanFrame, ConnectorError> 
                 dev_nonce,
             })
         }
-        LoRaWanMType::JoinAccept => {
-            LoRaWanPayload::JoinAccept(mac_payload.to_vec())
-        }
+        LoRaWanMType::JoinAccept => LoRaWanPayload::JoinAccept(mac_payload.to_vec()),
         mtype if mtype.is_data() => {
             let (fhdr, consumed) = parse_lorawan_fhdr(mac_payload)?;
             let remaining = &mac_payload[consumed..];
@@ -284,11 +282,7 @@ pub fn parse_lorawan_frame(data: &[u8]) -> Result<LoRaWanFrame, ConnectorError> 
         _ => LoRaWanPayload::Raw(mac_payload.to_vec()),
     };
 
-    Ok(LoRaWanFrame {
-        mhdr,
-        payload,
-        mic,
-    })
+    Ok(LoRaWanFrame { mhdr, payload, mic })
 }
 
 /// Parse LoRaWAN frame from hex string.
@@ -315,10 +309,7 @@ pub fn parse_lorawan_hex(hex_str: &str) -> Result<LoRaWanFrame, ConnectorError> 
 // ---------------------------------------------------------------------------
 
 /// Convert a LoRaWAN frame to a SourceEvent.
-pub fn lorawan_to_source_event(
-    frame: &LoRaWanFrame,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn lorawan_to_source_event(frame: &LoRaWanFrame, connector_id: &str) -> SourceEvent {
     let mut properties = HashMap::new();
     properties.insert("mtype".into(), json!(frame.mhdr.mtype.as_str()));
     properties.insert("major".into(), json!(frame.mhdr.major));
@@ -333,10 +324,7 @@ pub fn lorawan_to_source_event(
             properties.insert("fcnt".into(), json!(data.fhdr.fcnt));
             properties.insert("adr".into(), json!(data.fhdr.fctrl.adr));
             properties.insert("ack".into(), json!(data.fhdr.fctrl.ack));
-            properties.insert(
-                "fopts_len".into(),
-                json!(data.fhdr.fctrl.fopts_len),
-            );
+            properties.insert("fopts_len".into(), json!(data.fhdr.fctrl.fopts_len));
 
             if let Some(fport) = data.fport {
                 properties.insert("fport".into(), json!(fport));
@@ -356,23 +344,14 @@ pub fn lorawan_to_source_event(
                     .map(|b| format!("{:02X}", b))
                     .collect();
                 properties.insert("frm_payload_hex".into(), json!(hex));
-                properties.insert(
-                    "frm_payload_length".into(),
-                    json!(data.frm_payload.len()),
-                );
+                properties.insert("frm_payload_length".into(), json!(data.frm_payload.len()));
             }
 
             format!("lorawan:{:08X}", data.fhdr.dev_addr)
         }
         LoRaWanPayload::JoinRequest(jr) => {
-            properties.insert(
-                "app_eui".into(),
-                json!(format!("{:016X}", jr.app_eui)),
-            );
-            properties.insert(
-                "dev_eui".into(),
-                json!(format!("{:016X}", jr.dev_eui)),
-            );
+            properties.insert("app_eui".into(), json!(format!("{:016X}", jr.app_eui)));
+            properties.insert("dev_eui".into(), json!(format!("{:016X}", jr.dev_eui)));
             properties.insert("dev_nonce".into(), json!(jr.dev_nonce));
             format!("lorawan:join:{:016X}", jr.dev_eui)
         }
@@ -431,13 +410,9 @@ impl Connector for LoRaWanConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                ConnectorError::ConfigError("LoRaWAN: url (file path) required".into())
-            })?;
+        let path = self.config.url.as_deref().ok_or_else(|| {
+            ConnectorError::ConfigError("LoRaWAN: url (file path) required".into())
+        })?;
 
         let content = tokio::fs::read_to_string(path)
             .await
@@ -464,8 +439,7 @@ impl Connector for LoRaWanConnector {
                     if let Some(hex) = val.get("payload_hex").and_then(|v| v.as_str()) {
                         match parse_lorawan_hex(hex) {
                             Ok(frame) => {
-                                let event =
-                                    lorawan_to_source_event(&frame, &connector_id);
+                                let event = lorawan_to_source_event(&frame, &connector_id);
                                 if tx.send(event).await.is_err() {
                                     break;
                                 }
@@ -708,7 +682,7 @@ mod tests {
     fn test_lorawan_join_request() {
         // Join Request: MHDR(0x00) + AppEUI(8) + DevEUI(8) + DevNonce(2) + MIC(4)
         let mut frame = vec![0x00]; // MHDR: JoinRequest
-        // AppEUI (LE)
+                                    // AppEUI (LE)
         frame.extend_from_slice(&0x0102030405060708u64.to_le_bytes());
         // DevEUI (LE)
         frame.extend_from_slice(&0x1112131415161718u64.to_le_bytes());

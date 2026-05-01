@@ -1,11 +1,11 @@
 use crate::server::http::AppState;
 use crate::server::websocket::BroadcastEvent;
-use orp_audit::crypto::compute_hash;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
 };
+use orp_audit::crypto::compute_hash;
 use orp_proto::{Entity, GeoPoint, Relationship};
 use orp_security::middleware::AuthContext;
 use orp_security::{AbacEngine, EvaluationContext, EvaluationResult, Resource, Subject};
@@ -141,7 +141,13 @@ async fn audit_log(
 
     if let Err(e) = state
         .storage
-        .log_audit(operation, entity_type, entity_id, Some(user_id), enriched_details)
+        .log_audit(
+            operation,
+            entity_type,
+            entity_id,
+            Some(user_id),
+            enriched_details,
+        )
         .await
     {
         tracing::warn!("Audit log write failed: {}", e);
@@ -319,10 +325,7 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResp
     })
 }
 
-pub async fn metrics(
-    auth: AuthContext,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn metrics(auth: AuthContext, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Require auth — the AuthContext extractor already validated credentials.
     // Additionally check ABAC for metrics access.
     if let Err(resp) = check_abac(&state.abac_engine, &auth, "admin", "system", "metrics") {
@@ -508,8 +511,13 @@ pub async fn create_entity(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateEntityRequest>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:write", "entity", &body.id)
-    {
+    if let Err(resp) = check_abac(
+        &state.abac_engine,
+        &auth,
+        "entities:write",
+        "entity",
+        &body.id,
+    ) {
         return resp.into_response();
     }
 
@@ -582,7 +590,7 @@ pub async fn create_entity(
     match state.storage.insert_entity(&entity).await {
         Ok(()) => {
             audit_log(
-        state.as_ref(),
+                state.as_ref(),
                 "entity_created",
                 Some(&entity.entity_type),
                 Some(&entity.entity_id),
@@ -596,9 +604,10 @@ pub async fn create_entity(
                 entity_type: entity.entity_type.clone(),
                 entity_name: entity.name.clone(),
                 properties: serde_json::to_value(&entity.properties).unwrap_or_default(),
-                geometry: entity.geometry.as_ref().map(|g| {
-                    serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})
-                }),
+                geometry: entity
+                    .geometry
+                    .as_ref()
+                    .map(|g| serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})),
                 timestamp: chrono::Utc::now().to_rfc3339(),
             });
             (StatusCode::CREATED, Json(entity_to_response(&entity))).into_response()
@@ -692,7 +701,7 @@ pub async fn update_entity(
             match state.storage.insert_entity(&entity).await {
                 Ok(()) => {
                     audit_log(
-        state.as_ref(),
+                        state.as_ref(),
                         "entity_updated",
                         Some(&entity.entity_type),
                         Some(&entity.entity_id),
@@ -705,9 +714,9 @@ pub async fn update_entity(
                         entity_id: entity.entity_id.clone(),
                         entity_type: entity.entity_type.clone(),
                         changes: serde_json::to_value(&entity.properties).unwrap_or_default(),
-                        geometry: entity.geometry.as_ref().map(|g| {
-                            serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]})
-                        }),
+                        geometry: entity.geometry.as_ref().map(
+                            |g| serde_json::json!({"type": "Point", "coordinates": [g.lon, g.lat]}),
+                        ),
                         timestamp: chrono::Utc::now().to_rfc3339(),
                     });
                     Json(entity_to_response(&entity)).into_response()
@@ -748,7 +757,7 @@ pub async fn delete_entity(
         Ok(Some(deleted_entity)) => match state.storage.delete_entity(&id).await {
             Ok(()) => {
                 audit_log(
-        state.as_ref(),
+                    state.as_ref(),
                     "entity_deleted",
                     Some("entity"),
                     Some(&id),
@@ -840,8 +849,11 @@ pub async fn search_entities(
                     .await
                 {
                     Ok(entities) => {
-                        let data: Vec<EntityResponse> =
-                            entities.iter().take(limit).map(entity_to_response).collect();
+                        let data: Vec<EntityResponse> = entities
+                            .iter()
+                            .take(limit)
+                            .map(entity_to_response)
+                            .collect();
                         let search_time = start.elapsed().as_secs_f64() * 1000.0;
                         return Json(serde_json::json!({
                             "data": data,
@@ -1151,7 +1163,7 @@ pub async fn create_relationship(
     match state.storage.insert_relationship(&rel).await {
         Ok(()) => {
             audit_log(
-        state.as_ref(),
+                state.as_ref(),
                 "relationship_created",
                 Some("relationship"),
                 Some(&rel.relationship_id),
@@ -1164,14 +1176,16 @@ pub async fn create_relationship(
             )
             .await;
             // Emit broadcast event
-            let _ = state.broadcast_tx.send(BroadcastEvent::RelationshipChanged {
-                relationship_id: rel.relationship_id.clone(),
-                source_id: rel.source_entity_id.clone(),
-                target_id: rel.target_entity_id.clone(),
-                relationship_type: rel.relationship_type.clone(),
-                event: "created".to_string(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            });
+            let _ = state
+                .broadcast_tx
+                .send(BroadcastEvent::RelationshipChanged {
+                    relationship_id: rel.relationship_id.clone(),
+                    source_id: rel.source_entity_id.clone(),
+                    target_id: rel.target_entity_id.clone(),
+                    relationship_type: rel.relationship_type.clone(),
+                    event: "created".to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                });
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
@@ -1209,9 +1223,7 @@ pub async fn execute_query(
     State(state): State<Arc<AppState>>,
     Json(body): Json<QueryRequest>,
 ) -> impl IntoResponse {
-    if let Err(resp) =
-        check_abac(&state.abac_engine, &auth, "query:execute", "query", "*")
-    {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "query:execute", "query", "*") {
         return resp.into_response();
     }
 
@@ -1246,8 +1258,9 @@ pub async fn execute_query(
             }
         }))
         .into_response(),
-        Err(e) => error_response("INVALID_QUERY", StatusCode::BAD_REQUEST, &e.to_string())
-            .into_response(),
+        Err(e) => {
+            error_response("INVALID_QUERY", StatusCode::BAD_REQUEST, &e.to_string()).into_response()
+        }
     }
 }
 
@@ -1361,7 +1374,7 @@ pub async fn create_connector(
     match state.storage.register_data_source(&source).await {
         Ok(()) => {
             audit_log(
-        state.as_ref(),
+                state.as_ref(),
                 "connector_created",
                 Some("connector"),
                 Some(&source.source_id),
@@ -1428,7 +1441,7 @@ pub async fn update_connector(
             match state.storage.update_data_source(&source).await {
                 Ok(_) => {
                     audit_log(
-        state.as_ref(),
+                        state.as_ref(),
                         "connector_updated",
                         Some("connector"),
                         Some(&id),
@@ -1480,7 +1493,7 @@ pub async fn delete_connector(
     match state.storage.delete_data_source(&id).await {
         Ok(true) => {
             audit_log(
-        state.as_ref(),
+                state.as_ref(),
                 "connector_deleted",
                 Some("connector"),
                 Some(&id),
@@ -1511,13 +1524,7 @@ pub async fn list_monitors(
     auth: AuthContext,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_abac(
-        &state.abac_engine,
-        &auth,
-        "monitors:read",
-        "monitor",
-        "*",
-    ) {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "monitors:read", "monitor", "*") {
         return resp.into_response();
     }
 
@@ -1550,11 +1557,7 @@ pub enum MonitorConditionRequest {
         value: f64,
     },
     #[serde(rename = "geofence")]
-    Geofence {
-        lat: f64,
-        lon: f64,
-        radius_km: f64,
-    },
+    Geofence { lat: f64, lon: f64, radius_km: f64 },
     #[serde(rename = "stale")]
     Stale { max_age_seconds: u64 },
     #[serde(rename = "speed_anomaly")]
@@ -1630,13 +1633,7 @@ pub async fn create_monitor(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateMonitorRequest>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_abac(
-        &state.abac_engine,
-        &auth,
-        "monitors:write",
-        "monitor",
-        "*",
-    ) {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "monitors:write", "monitor", "*") {
         return resp.into_response();
     }
 
@@ -1725,7 +1722,7 @@ pub async fn delete_monitor(
 
     if state.monitor_engine.remove_rule(&id).await {
         audit_log(
-        state.as_ref(),
+            state.as_ref(),
             "monitor_deleted",
             Some("monitor"),
             Some(&id),
@@ -1780,7 +1777,7 @@ pub async fn acknowledge_alert(
 
     if state.monitor_engine.acknowledge_alert(&id).await {
         audit_log(
-        state.as_ref(),
+            state.as_ref(),
             "alert_acknowledged",
             Some("alert"),
             Some(&id),
@@ -1815,13 +1812,7 @@ pub async fn create_api_key(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateApiKeyRequestBody>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_abac(
-        &state.abac_engine,
-        &auth,
-        "api-keys:manage",
-        "api_key",
-        "*",
-    ) {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "api-keys:manage", "api_key", "*") {
         return resp.into_response();
     }
 
@@ -1836,7 +1827,7 @@ pub async fn create_api_key(
     match state.api_key_service.create_key(req) {
         Ok(resp) => {
             audit_log(
-        state.as_ref(),
+                state.as_ref(),
                 "api_key_created",
                 Some("api_key"),
                 Some(&resp.id),
@@ -1859,13 +1850,7 @@ pub async fn list_api_keys(
     auth: AuthContext,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_abac(
-        &state.abac_engine,
-        &auth,
-        "api-keys:manage",
-        "api_key",
-        "*",
-    ) {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "api-keys:manage", "api_key", "*") {
         return resp.into_response();
     }
 
@@ -1908,20 +1893,14 @@ pub async fn delete_api_key(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_abac(
-        &state.abac_engine,
-        &auth,
-        "api-keys:manage",
-        "api_key",
-        &id,
-    ) {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "api-keys:manage", "api_key", &id) {
         return resp.into_response();
     }
 
     match state.api_key_service.revoke_key(&id) {
         Ok(()) => {
             audit_log(
-        state.as_ref(),
+                state.as_ref(),
                 "api_key_revoked",
                 Some("api_key"),
                 Some(&id),
@@ -1974,11 +1953,16 @@ mod tests {
         let storage: Arc<dyn orp_storage::traits::Storage> =
             Arc::new(DuckDbStorage::new_in_memory().unwrap());
 
-        let dedup_path = std::env::temp_dir().join(format!("orp-test-dedup-{}", uuid::Uuid::new_v4()));
+        let dedup_path =
+            std::env::temp_dir().join(format!("orp-test-dedup-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dedup_path).ok();
         let dedup = Arc::new(RocksDbDedupWindow::open(&dedup_path, 3600).unwrap());
-        let processor: Arc<dyn StreamProcessor> =
-            Arc::new(DefaultStreamProcessor::new(storage.clone(), dedup, None, 50));
+        let processor: Arc<dyn StreamProcessor> = Arc::new(DefaultStreamProcessor::new(
+            storage.clone(),
+            dedup,
+            None,
+            50,
+        ));
         let query_executor = Arc::new(QueryExecutor::new(storage.clone()));
         let monitor_engine = Arc::new(MonitorEngine::new());
         let auth_state = Arc::new(AuthState {
@@ -2024,7 +2008,10 @@ mod tests {
             .route("/api/v1/entities/:id", get(get_entity))
             .route("/api/v1/entities/:id", put(update_entity))
             .route("/api/v1/entities/:id", delete(delete_entity))
-            .route("/api/v1/entities/:id/relationships", get(get_entity_relationships))
+            .route(
+                "/api/v1/entities/:id/relationships",
+                get(get_entity_relationships),
+            )
             .route("/api/v1/entities/:id/events", get(get_entity_events))
             .route("/api/v1/relationships", post(create_relationship))
             .route("/api/v1/query", post(execute_query))
@@ -2093,7 +2080,9 @@ mod tests {
             .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "healthy");
         assert!(json["components"].is_object());
@@ -2345,7 +2334,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["pagination"]["total_count"].as_u64().unwrap() >= 5);
     }
@@ -2371,7 +2362,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["pagination"]["has_next"].as_bool().unwrap_or(false));
     }
@@ -2384,7 +2377,11 @@ mod tests {
         let entity = orp_proto::Entity {
             entity_id: "ship-near-1".to_string(),
             entity_type: "ship".to_string(),
-            geometry: Some(GeoPoint { lat: 51.92, lon: 4.47, alt: None }),
+            geometry: Some(GeoPoint {
+                lat: 51.92,
+                lon: 4.47,
+                alt: None,
+            }),
             ..orp_proto::Entity::default()
         };
         state.storage.insert_entity(&entity).await.unwrap();
@@ -2721,11 +2718,7 @@ mod tests {
     async fn test_list_alerts_200() {
         let (app, _) = make_test_app().await;
         let resp = app
-            .oneshot(
-                Request::get("/api/v1/alerts")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/api/v1/alerts").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2800,11 +2793,7 @@ mod tests {
     async fn test_list_events_global_200() {
         let (app, _) = make_test_app().await;
         let resp = app
-            .oneshot(
-                Request::get("/api/v1/events")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/api/v1/events").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2830,15 +2819,13 @@ mod tests {
     async fn test_metrics_200() {
         let (app, _) = make_test_app().await;
         let resp = app
-            .oneshot(
-                Request::get("/api/v1/metrics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/api/v1/metrics").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("orp_entities_total"));
     }
@@ -2864,7 +2851,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["geometry"].is_object());
     }

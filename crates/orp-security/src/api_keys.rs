@@ -56,9 +56,7 @@ pub struct ApiKeyRecord {
 
 impl ApiKeyRecord {
     pub fn is_expired(&self) -> bool {
-        self.expires_at
-            .map(|exp| exp < Utc::now())
-            .unwrap_or(false)
+        self.expires_at.map(|exp| exp < Utc::now()).unwrap_or(false)
     }
 }
 
@@ -144,15 +142,16 @@ impl ApiKeyService {
     /// Generate a new API key from the given request.
     ///
     /// Returns both the record and the raw key (plaintext) — the raw key is shown once only.
-    pub fn create_key(&self, req: CreateApiKeyRequest) -> Result<CreateApiKeyResponse, ApiKeyError> {
+    pub fn create_key(
+        &self,
+        req: CreateApiKeyRequest,
+    ) -> Result<CreateApiKeyResponse, ApiKeyError> {
         let raw_key = generate_api_key();
         let key_hash = hash_key(&raw_key);
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
         let rate_limit = req.rate_limit.unwrap_or(1000);
-        let expires_at = req
-            .expires_in
-            .map(|secs| now + Duration::seconds(secs));
+        let expires_at = req.expires_in.map(|secs| now + Duration::seconds(secs));
 
         let record = ApiKeyRecord {
             id: id.clone(),
@@ -414,9 +413,6 @@ mod tests {
         svc.validate_key(&resp.api_key).await.unwrap();
         // Third should be rate limited
         let result = svc.validate_key(&resp.api_key).await;
-        assert!(matches!(
-            result,
-            Err(ApiKeyError::RateLimitExceeded { .. })
-        ));
+        assert!(matches!(result, Err(ApiKeyError::RateLimitExceeded { .. })));
     }
 }

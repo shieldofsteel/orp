@@ -135,20 +135,20 @@ jobs:
             echo "::warning::Binary size ${SIZE_MB}MB exceeds target of ${WARN_MB}MB"
           fi
 
-      - name: Annotate binary size
-        uses: actions/github-script@v7
-        if: github.event_name == 'pull_request'
-        with:
-          script: |
-            const sizeMb = '${{ steps.size.outputs.size_mb }}';
-            const os = '${{ matrix.os }}';
-            const target = '${{ matrix.target }}';
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `📦 **Binary size** (${target}): **${sizeMb} MB**`
-            });
+      - name: Annotate binary size in step summary
+        # Writes to $GITHUB_STEP_SUMMARY rather than posting a PR comment.
+        # The previous `github-script` createComment call hit 403 on
+        # cross-fork PRs (the GITHUB_TOKEN from the fork can't write to the
+        # upstream issue). Step summary works for every event including
+        # forks, requires no special permissions, and shows up in the
+        # workflow run UI.
+        shell: bash
+        run: |
+          {
+            echo "### 📦 Binary size — \`${{ matrix.target }}\`"
+            echo ""
+            echo "**${{ steps.size.outputs.size_mb }} MB** (${{ steps.size.outputs.size_bytes }} bytes)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Security audit ───────────────────────────────────────────────────────────
   security-audit:

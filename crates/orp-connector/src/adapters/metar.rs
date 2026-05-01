@@ -32,10 +32,10 @@ use std::sync::Arc;
 /// Cloud cover level.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CloudCover {
-    Few,       // 1–2 oktas
-    Scattered, // 3–4 oktas
-    Broken,    // 5–7 oktas
-    Overcast,  // 8 oktas
+    Few,                // 1–2 oktas
+    Scattered,          // 3–4 oktas
+    Broken,             // 5–7 oktas
+    Overcast,           // 8 oktas
     VerticalVisibility, // VV (sky obscured)
 }
 
@@ -66,7 +66,7 @@ impl CloudCover {
 #[derive(Clone, Debug)]
 pub struct CloudLayer {
     pub cover: CloudCover,
-    pub altitude_ft: u32, // in hundreds of feet AGL
+    pub altitude_ft: u32,           // in hundreds of feet AGL
     pub cloud_type: Option<String>, // CB, TCU, etc.
 }
 
@@ -91,14 +91,14 @@ pub struct MetarReport {
     pub hour: Option<u8>,
     pub minute: Option<u8>,
     pub wind: Option<Wind>,
-    pub visibility_sm: Option<f64>,   // statute miles
-    pub visibility_m: Option<u32>,    // meters
+    pub visibility_sm: Option<f64>, // statute miles
+    pub visibility_m: Option<u32>,  // meters
     pub clouds: Vec<CloudLayer>,
     pub temperature_c: Option<i16>,
     pub dewpoint_c: Option<i16>,
     pub altimeter_inhg: Option<f64>,
     pub altimeter_hpa: Option<f64>,
-    pub weather: Vec<String>,       // present weather codes (RA, SN, FG, etc.)
+    pub weather: Vec<String>, // present weather codes (RA, SN, FG, etc.)
     pub sky_clear: bool,
     pub cavok: bool,
     pub remarks: Option<String>,
@@ -195,9 +195,7 @@ pub fn parse_metar(raw: &str) -> Result<MetarReport, ConnectorError> {
         }
 
         // Wind
-        if (tok.ends_with("KT") || tok.ends_with("MPS") || tok.ends_with("KMH"))
-            && wind.is_none()
-        {
+        if (tok.ends_with("KT") || tok.ends_with("MPS") || tok.ends_with("KMH")) && wind.is_none() {
             wind = parse_wind(tok);
             idx += 1;
             // Check for variable wind direction (e.g., 180V240)
@@ -321,7 +319,10 @@ fn build_obs_time(day: Option<u8>, hour: Option<u8>, minute: Option<u8>) -> Opti
 
 /// Parse wind token (e.g., "22006KT", "VRB03KT", "18010G25KT").
 fn parse_wind(tok: &str) -> Option<Wind> {
-    let unit_pos = tok.find("KT").or_else(|| tok.find("MPS")).or_else(|| tok.find("KMH"))?;
+    let unit_pos = tok
+        .find("KT")
+        .or_else(|| tok.find("MPS"))
+        .or_else(|| tok.find("KMH"))?;
     let wind_part = &tok[..unit_pos];
 
     let (dir, rest) = if let Some(stripped) = wind_part.strip_prefix("VRB") {
@@ -426,11 +427,13 @@ fn is_weather_code(tok: &str) -> bool {
     // Present weather has intensity prefix (+/-/VC), descriptor, and phenomena
     let phenomena = [
         "DZ", "RA", "SN", "SG", "IC", "PL", "GR", "GS", "UP", // precipitation
-        "BR", "FG", "FU", "VA", "DU", "SA", "HZ", "PY",        // obscuration
-        "PO", "SQ", "FC", "SS", "DS",                           // other
-        "TS", "SH", "FZ", "MI", "PR", "BC", "BL", "DR",        // descriptors
+        "BR", "FG", "FU", "VA", "DU", "SA", "HZ", "PY", // obscuration
+        "PO", "SQ", "FC", "SS", "DS", // other
+        "TS", "SH", "FZ", "MI", "PR", "BC", "BL", "DR", // descriptors
     ];
-    let clean = tok.trim_start_matches(['+', '-'].as_ref()).trim_start_matches("VC");
+    let clean = tok
+        .trim_start_matches(['+', '-'].as_ref())
+        .trim_start_matches("VC");
     if clean.is_empty() {
         return false;
     }
@@ -453,7 +456,9 @@ pub fn parse_taf(raw: &str) -> Result<TafReport, ConnectorError> {
     let raw = raw.trim();
     let tokens: Vec<&str> = raw.split_whitespace().collect();
     if tokens.is_empty() || tokens[0] != "TAF" {
-        return Err(ConnectorError::ParseError("TAF: expected 'TAF' prefix".into()));
+        return Err(ConnectorError::ParseError(
+            "TAF: expected 'TAF' prefix".into(),
+        ));
     }
 
     let mut idx = 1;
@@ -496,10 +501,7 @@ pub fn parse_taf(raw: &str) -> Result<TafReport, ConnectorError> {
 // ---------------------------------------------------------------------------
 
 /// Convert a MetarReport to a SourceEvent.
-pub fn metar_to_source_event(
-    metar: &MetarReport,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn metar_to_source_event(metar: &MetarReport, connector_id: &str) -> SourceEvent {
     let entity_id = format!("metar:{}", metar.station);
 
     let mut properties = HashMap::new();
@@ -608,11 +610,8 @@ impl Connector for MetarConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let path = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
+        let path =
+            self.config.url.as_deref().ok_or_else(|| {
                 ConnectorError::ConfigError("METAR: url (file path) required".into())
             })?;
 
@@ -685,7 +684,8 @@ mod tests {
 
     #[test]
     fn test_parse_basic_metar() {
-        let metar = parse_metar("METAR KJFK 260830Z 22006KT 10SM FEW250 18/10 A3012 RMK AO2").unwrap();
+        let metar =
+            parse_metar("METAR KJFK 260830Z 22006KT 10SM FEW250 18/10 A3012 RMK AO2").unwrap();
         assert_eq!(metar.station, "KJFK");
         assert_eq!(metar.report_type, "METAR");
         assert_eq!(metar.day, Some(26));
@@ -733,7 +733,8 @@ mod tests {
 
     #[test]
     fn test_parse_cloud_layers() {
-        let metar = parse_metar("METAR KJFK 260830Z 22006KT 10SM FEW020 SCT080 BKN120 18/10 A3012").unwrap();
+        let metar = parse_metar("METAR KJFK 260830Z 22006KT 10SM FEW020 SCT080 BKN120 18/10 A3012")
+            .unwrap();
         assert_eq!(metar.clouds.len(), 3);
         assert_eq!(metar.clouds[0].cover, CloudCover::Few);
         assert_eq!(metar.clouds[0].altitude_ft, 2000);
@@ -779,7 +780,8 @@ mod tests {
 
     #[test]
     fn test_parse_weather_codes() {
-        let metar = parse_metar("METAR KJFK 260830Z 22006KT 3SM -RA BR OVC010 12/10 A2990").unwrap();
+        let metar =
+            parse_metar("METAR KJFK 260830Z 22006KT 3SM -RA BR OVC010 12/10 A2990").unwrap();
         assert!(metar.weather.contains(&"-RA".to_string()));
         assert!(metar.weather.contains(&"BR".to_string()));
     }
@@ -799,7 +801,9 @@ mod tests {
 
     #[test]
     fn test_parse_remarks() {
-        let metar = parse_metar("METAR KJFK 260830Z 22006KT 10SM FEW250 18/10 A3012 RMK AO2 SLP198").unwrap();
+        let metar =
+            parse_metar("METAR KJFK 260830Z 22006KT 10SM FEW250 18/10 A3012 RMK AO2 SLP198")
+                .unwrap();
         assert!(metar.remarks.is_some());
         assert!(metar.remarks.unwrap().contains("AO2"));
     }
@@ -824,7 +828,9 @@ mod tests {
 
     #[test]
     fn test_speci_report() {
-        let metar = parse_metar("SPECI KORD 260945Z 18015G30KT 2SM +TSRA BKN015CB OVC030 20/18 A2975").unwrap();
+        let metar =
+            parse_metar("SPECI KORD 260945Z 18015G30KT 2SM +TSRA BKN015CB OVC030 20/18 A2975")
+                .unwrap();
         assert_eq!(metar.report_type, "SPECI");
         assert_eq!(metar.station, "KORD");
         assert!(metar.weather.contains(&"+TSRA".to_string()));

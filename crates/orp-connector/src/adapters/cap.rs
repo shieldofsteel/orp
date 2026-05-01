@@ -427,8 +427,7 @@ pub fn parse_cap_xml(xml: &str) -> Result<CapAlert, ConnectorError> {
                         "valueName" => geocode_name = text,
                         "value" => {
                             if !geocode_name.is_empty() {
-                                area_geocodes
-                                    .push((geocode_name.clone(), text));
+                                area_geocodes.push((geocode_name.clone(), text));
                                 geocode_name.clear();
                             }
                         }
@@ -562,9 +561,7 @@ pub fn parse_cap_polygon_centroid(polygon: &str) -> Option<(f64, f64)> {
     for pt in &points {
         let coords: Vec<&str> = pt.split(',').collect();
         if coords.len() == 2 {
-            if let (Ok(lat), Ok(lon)) =
-                (coords[0].parse::<f64>(), coords[1].parse::<f64>())
-            {
+            if let (Ok(lat), Ok(lon)) = (coords[0].parse::<f64>(), coords[1].parse::<f64>()) {
                 sum_lat += lat;
                 sum_lon += lon;
                 count += 1;
@@ -596,27 +593,14 @@ impl CapAlert {
             .collect()
     }
 
-    fn to_single_event(
-        &self,
-        connector_id: &str,
-        info: Option<(usize, &CapInfo)>,
-    ) -> SourceEvent {
+    fn to_single_event(&self, connector_id: &str, info: Option<(usize, &CapInfo)>) -> SourceEvent {
         let mut properties: HashMap<String, serde_json::Value> = HashMap::new();
         properties.insert("cap_id".into(), serde_json::json!(self.identifier));
         properties.insert("sender".into(), serde_json::json!(self.sender));
         properties.insert("sent".into(), serde_json::json!(self.sent));
-        properties.insert(
-            "status".into(),
-            serde_json::json!(self.status.as_str()),
-        );
-        properties.insert(
-            "msg_type".into(),
-            serde_json::json!(self.msg_type.as_str()),
-        );
-        properties.insert(
-            "scope".into(),
-            serde_json::json!(self.scope.as_str()),
-        );
+        properties.insert("status".into(), serde_json::json!(self.status.as_str()));
+        properties.insert("msg_type".into(), serde_json::json!(self.msg_type.as_str()));
+        properties.insert("scope".into(), serde_json::json!(self.scope.as_str()));
         if let Some(ref src) = self.source {
             properties.insert("source".into(), serde_json::json!(src));
         }
@@ -633,19 +617,10 @@ impl CapAlert {
             entity_type = cap_category_to_entity(&inf.category).to_string();
             entity_suffix = format!(":{}", _idx);
 
-            properties.insert(
-                "category".into(),
-                serde_json::json!(inf.category.as_str()),
-            );
+            properties.insert("category".into(), serde_json::json!(inf.category.as_str()));
             properties.insert("event".into(), serde_json::json!(inf.event));
-            properties.insert(
-                "urgency".into(),
-                serde_json::json!(inf.urgency.as_str()),
-            );
-            properties.insert(
-                "severity".into(),
-                serde_json::json!(inf.severity.as_str()),
-            );
+            properties.insert("urgency".into(), serde_json::json!(inf.urgency.as_str()));
+            properties.insert("severity".into(), serde_json::json!(inf.severity.as_str()));
             properties.insert(
                 "certainty".into(),
                 serde_json::json!(inf.certainty.as_str()),
@@ -657,8 +632,7 @@ impl CapAlert {
                 properties.insert("description".into(), serde_json::json!(d));
             }
             if let Some(ref inst) = inf.instruction {
-                properties
-                    .insert("instruction".into(), serde_json::json!(inst));
+                properties.insert("instruction".into(), serde_json::json!(inst));
             }
             if let Some(ref exp) = inf.expires {
                 properties.insert("expires".into(), serde_json::json!(exp));
@@ -670,10 +644,7 @@ impl CapAlert {
                     if let Some((clat, clon, radius)) = parse_cap_circle(circle) {
                         lat = Some(clat);
                         lon = Some(clon);
-                        properties.insert(
-                            "radius_km".into(),
-                            serde_json::json!(radius),
-                        );
+                        properties.insert("radius_km".into(), serde_json::json!(radius));
                     }
                 } else if let Some(poly) = area.polygons.first() {
                     if let Some((plat, plon)) = parse_cap_polygon_centroid(poly) {
@@ -681,10 +652,7 @@ impl CapAlert {
                         lon = Some(plon);
                     }
                 }
-                properties.insert(
-                    "area_desc".into(),
-                    serde_json::json!(area.area_desc),
-                );
+                properties.insert("area_desc".into(), serde_json::json!(area.area_desc));
             }
         } else {
             entity_type = "emergency_alert".to_string();
@@ -761,9 +729,8 @@ impl Connector for CapConnector {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(60);
 
-                let mut interval = tokio::time::interval(
-                    tokio::time::Duration::from_secs(poll_secs),
-                );
+                let mut interval =
+                    tokio::time::interval(tokio::time::Duration::from_secs(poll_secs));
 
                 while running.load(Ordering::SeqCst) {
                     interval.tick().await;
@@ -771,26 +738,21 @@ impl Connector for CapConnector {
                         Ok(resp) => match resp.text().await {
                             Ok(body) => match parse_cap_xml(&body) {
                                 Ok(alert) => {
-                                    for event in
-                                        alert.to_source_events(&connector_id)
-                                    {
+                                    for event in alert.to_source_events(&connector_id) {
                                         if tx.send(event).await.is_err() {
                                             return;
                                         }
-                                        events_count
-                                            .fetch_add(1, Ordering::Relaxed);
+                                        events_count.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                                 Err(e) => {
                                     tracing::warn!("CAP parse error: {}", e);
-                                    errors_count
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    errors_count.fetch_add(1, Ordering::Relaxed);
                                 }
                             },
                             Err(e) => {
                                 tracing::warn!("CAP response error: {}", e);
-                                errors_count
-                                    .fetch_add(1, Ordering::Relaxed);
+                                errors_count.fetch_add(1, Ordering::Relaxed);
                             }
                         },
                         Err(e) => {
@@ -883,10 +845,7 @@ mod tests {
     #[test]
     fn test_parse_cap_basic() {
         let alert = parse_cap_xml(sample_cap_xml()).unwrap();
-        assert_eq!(
-            alert.identifier,
-            "NWS-IDP-TORNADO-WARNING-2026"
-        );
+        assert_eq!(alert.identifier, "NWS-IDP-TORNADO-WARNING-2026");
         assert_eq!(alert.sender, "w-nws.webmaster@noaa.gov");
         assert_eq!(alert.status, CapStatus::Actual);
         assert_eq!(alert.msg_type, CapMsgType::Alert);
@@ -926,8 +885,7 @@ mod tests {
 
     #[test]
     fn test_parse_cap_circle() {
-        let (lat, lon, radius) =
-            parse_cap_circle("38.9822,-94.6708 15.0").unwrap();
+        let (lat, lon, radius) = parse_cap_circle("38.9822,-94.6708 15.0").unwrap();
         assert!((lat - 38.9822).abs() < 0.001);
         assert!((lon - (-94.6708)).abs() < 0.001);
         assert!((radius - 15.0).abs() < 0.1);
@@ -954,10 +912,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.entity_type, "weather_alert");
-        assert_eq!(
-            event.entity_id,
-            "cap:NWS-IDP-TORNADO-WARNING-2026:0"
-        );
+        assert_eq!(event.entity_id, "cap:NWS-IDP-TORNADO-WARNING-2026:0");
         assert!(event.latitude.is_some());
         assert!(event.longitude.is_some());
         assert_eq!(
@@ -968,18 +923,12 @@ mod tests {
 
     #[test]
     fn test_cap_category_to_entity() {
-        assert_eq!(
-            cap_category_to_entity(&CapCategory::Met),
-            "weather_alert"
-        );
+        assert_eq!(cap_category_to_entity(&CapCategory::Met), "weather_alert");
         assert_eq!(
             cap_category_to_entity(&CapCategory::Geo),
             "geological_alert"
         );
-        assert_eq!(
-            cap_category_to_entity(&CapCategory::Fire),
-            "fire_alert"
-        );
+        assert_eq!(cap_category_to_entity(&CapCategory::Fire), "fire_alert");
         assert_eq!(
             cap_category_to_entity(&CapCategory::Security),
             "security_alert"

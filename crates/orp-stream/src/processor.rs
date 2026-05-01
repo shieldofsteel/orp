@@ -116,7 +116,13 @@ impl DefaultStreamProcessor {
         dlq: Option<Arc<DeadLetterQueue>>,
         batch_size: usize,
     ) -> Self {
-        Self::with_signer(storage, dedup, dlq, batch_size, Arc::new(EventSigner::new()))
+        Self::with_signer(
+            storage,
+            dedup,
+            dlq,
+            batch_size,
+            Arc::new(EventSigner::new()),
+        )
     }
 
     /// Create a processor with a specific pre-loaded [`EventSigner`] (e.g. loaded from HSM / key file).
@@ -223,36 +229,47 @@ impl DefaultStreamProcessor {
                     entity.properties.insert("course".into(), json!(v));
                 }
             }
-            EventPayload::PropertyChange {
-                key,
-                new_value,
-                ..
-            } if key == "name" => {
+            EventPayload::PropertyChange { key, new_value, .. } if key == "name" => {
                 if let Some(name_str) = new_value.as_str() {
                     entity.name = Some(name_str.to_string());
                 }
                 entity.properties.insert(key.clone(), new_value.clone());
             }
-            EventPayload::PropertyChange {
-                key,
-                new_value,
-                ..
-            } => {
+            EventPayload::PropertyChange { key, new_value, .. } => {
                 entity.properties.insert(key.clone(), new_value.clone());
             }
             _ => {}
         }
 
         // Feed position updates into the analytics engine (non-blocking).
-        if let (Some(analytics), EventPayload::PositionUpdate { latitude, longitude, speed_knots, course_degrees, .. }) =
-            (&self.analytics, &event.payload)
+        if let (
+            Some(analytics),
+            EventPayload::PositionUpdate {
+                latitude,
+                longitude,
+                speed_knots,
+                course_degrees,
+                ..
+            },
+        ) = (&self.analytics, &event.payload)
         {
             let speed = speed_knots.unwrap_or(0.0);
             let course = course_degrees.unwrap_or(0.0);
-            let position = orp_proto::GeoPoint { lat: *latitude, lon: *longitude, alt: None };
+            let position = orp_proto::GeoPoint {
+                lat: *latitude,
+                lon: *longitude,
+                alt: None,
+            };
             // Fire and forget — analytics are best-effort and must not block the pipeline.
             let _ = analytics
-                .ingest(&event.entity_id, position, speed, course, event.timestamp, &[])
+                .ingest(
+                    &event.entity_id,
+                    position,
+                    speed,
+                    course,
+                    event.timestamp,
+                    &[],
+                )
                 .await;
         }
 
@@ -275,10 +292,16 @@ impl DefaultStreamProcessor {
                 if buf.len() == ML_HISTORY_LEN {
                     buf.pop_front();
                 }
-                buf.push_back((event.timestamp.timestamp() as f64, *latitude, *longitude, speed));
+                buf.push_back((
+                    event.timestamp.timestamp() as f64,
+                    *latitude,
+                    *longitude,
+                    speed,
+                ));
                 buf.iter().copied().collect()
             };
-            if let Some(features) = extract_kinematic_features(&event.entity_id, &history_snapshot) {
+            if let Some(features) = extract_kinematic_features(&event.entity_id, &history_snapshot)
+            {
                 // Skip the entire write path for the default `NullScorer` —
                 // otherwise every entity would carry `ml_anomaly_score: 0.0`
                 // and `ml_model_id: "null-v0"`, bloating storage and giving
@@ -292,10 +315,9 @@ impl DefaultStreamProcessor {
                         entity
                             .properties
                             .insert("ml_anomaly_score".into(), json!(ml_score));
-                        entity.properties.insert(
-                            "ml_model_id".into(),
-                            json!(self.anomaly_scorer.model_id()),
-                        );
+                        entity
+                            .properties
+                            .insert("ml_model_id".into(), json!(self.anomaly_scorer.model_id()));
                     } else {
                         // Promote dim mismatch to `warn!` so a misconfigured
                         // model surfaces in operator logs rather than silently
@@ -434,11 +456,7 @@ impl StreamProcessor for DefaultStreamProcessor {
                     );
                     if let Some(dlq) = &self.dlq {
                         let payload = serde_json::to_vec(event).unwrap_or_default();
-                        let _ = dlq.record_failure(
-                            &event.id.to_string(),
-                            &payload,
-                            &e.to_string(),
-                        );
+                        let _ = dlq.record_failure(&event.id.to_string(), &payload, &e.to_string());
                     }
                 }
             }
@@ -554,9 +572,7 @@ mod tests {
     #[tokio::test]
     async fn test_average_latency_populated() {
         let (p, _dd, _dq) = make_processor(1, 60);
-        p.process_event(make_ctx(pos_event("s1"), 1))
-            .await
-            .unwrap();
+        p.process_event(make_ctx(pos_event("s1"), 1)).await.unwrap();
         assert!(p.stats().average_latency_ms >= 0.0);
     }
 
@@ -599,7 +615,10 @@ mod tests {
         let signer = orp_audit::crypto::EventSigner::new();
         let data = b"test signing round-trip";
         let sig = signer.sign(data);
-        assert!(signer.verify(data, &sig), "signer should verify its own signature");
+        assert!(
+            signer.verify(data, &sig),
+            "signer should verify its own signature"
+        );
     }
 
     #[tokio::test]
@@ -608,20 +627,19 @@ mod tests {
         let storage = Arc::new(DuckDbStorage::new_in_memory().unwrap());
         let dedup = Arc::new(RocksDbDedupWindow::open(dedup_dir.path(), 60).unwrap());
         let signer = Arc::new(orp_audit::crypto::EventSigner::new());
-        let p = DefaultStreamProcessor::with_signer(
-            storage.clone(),
-            dedup,
-            None,
-            1,
-            signer.clone(),
-        );
+        let p =
+            DefaultStreamProcessor::with_signer(storage.clone(), dedup, None, 1, signer.clone());
 
         let ev = pos_event("ship-signed");
         p.process_event(make_ctx(ev.clone(), 1)).await.unwrap();
 
         // Verify the signature using the processor's public key
         let pubkey_bytes = p.public_key_bytes();
-        assert_eq!(pubkey_bytes.len(), 32, "Ed25519 public key should be 32 bytes");
+        assert_eq!(
+            pubkey_bytes.len(),
+            32,
+            "Ed25519 public key should be 32 bytes"
+        );
 
         // Sign the same input the processor would have used
         let payload_str = serde_json::to_string(&ev.payload).unwrap();

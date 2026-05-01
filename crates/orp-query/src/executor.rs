@@ -33,9 +33,7 @@ pub enum PlanStep {
         estimated_rows: u64,
     },
     /// Apply filter predicates
-    Filter {
-        conditions: Vec<Condition>,
-    },
+    Filter { conditions: Vec<Condition> },
     /// Apply geospatial filter (optimized path)
     GeoFilter {
         lat: f64,
@@ -44,22 +42,13 @@ pub enum PlanStep {
         entity_type: Option<String>,
     },
     /// Project specific columns
-    Project {
-        expressions: Vec<ReturnExpr>,
-    },
+    Project { expressions: Vec<ReturnExpr> },
     /// Aggregate functions
-    Aggregate {
-        functions: Vec<ReturnExpr>,
-    },
+    Aggregate { functions: Vec<ReturnExpr> },
     /// Sort results
-    Sort {
-        field: String,
-        ascending: bool,
-    },
+    Sort { field: String, ascending: bool },
     /// Limit results
-    Limit {
-        count: usize,
-    },
+    Limit { count: usize },
 }
 
 /// Simple query planner that generates an execution plan
@@ -167,8 +156,7 @@ impl QueryExecutor {
     pub async fn execute(&self, query_str: &str) -> Result<QueryResult, StorageError> {
         let start = std::time::Instant::now();
 
-        let query =
-            parse_orpql(query_str).map_err(|e| StorageError::QueryError(e.to_string()))?;
+        let query = parse_orpql(query_str).map_err(|e| StorageError::QueryError(e.to_string()))?;
 
         // Generate plan (for future optimization)
         let _plan = QueryPlanner::plan(&query);
@@ -251,7 +239,9 @@ impl QueryExecutor {
         // more rows than needed. Use a generous upper bound when WHERE
         // filters will reduce the result set in Rust.
         let has_where_filters = query.where_clause.as_ref().is_some_and(|wc| {
-            wc.conditions.iter().any(|c| !matches!(c, Condition::Near { .. }))
+            wc.conditions
+                .iter()
+                .any(|c| !matches!(c, Condition::Near { .. }))
         });
         let fetch_limit = if has_where_filters {
             // Need to over-fetch because Rust-side filters will reduce the set
@@ -267,7 +257,9 @@ impl QueryExecutor {
                 .get_entities_in_radius(lat, lon, radius, entity_type)
                 .await?
         } else if let Some(etype) = entity_type {
-            self.storage.get_entities_by_type(etype, fetch_limit, 0).await?
+            self.storage
+                .get_entities_by_type(etype, fetch_limit, 0)
+                .await?
         } else {
             // No type specified — scan all active entities via search
             self.storage.search_entities("", None, fetch_limit).await?
@@ -282,15 +274,11 @@ impl QueryExecutor {
                     for (key, expected) in &pattern.entity.properties {
                         let val = e.properties.get(key);
                         let matches = match (val, expected) {
-                            (Some(v), Literal::String(s)) => {
-                                v.as_str().is_some_and(|vs| vs == s)
-                            }
+                            (Some(v), Literal::String(s)) => v.as_str().is_some_and(|vs| vs == s),
                             (Some(v), Literal::Number(n)) => {
                                 v.as_f64().is_some_and(|vn| (vn - n).abs() < f64::EPSILON)
                             }
-                            (Some(v), Literal::Boolean(b)) => {
-                                v.as_bool() == Some(*b)
-                            }
+                            (Some(v), Literal::Boolean(b)) => v.as_bool() == Some(*b),
                             _ => false,
                         };
                         if !matches {
@@ -317,10 +305,9 @@ impl QueryExecutor {
         });
 
         if has_aggregate {
-            return Ok(vec![self.compute_aggregates(
-                &filtered,
-                &query.return_clause,
-            )]);
+            return Ok(vec![
+                self.compute_aggregates(&filtered, &query.return_clause)
+            ]);
         }
 
         // Build result rows from RETURN clause
@@ -337,15 +324,9 @@ impl QueryExecutor {
                         } => {
                             let key = alias.as_deref().unwrap_or(property);
                             let val = match property.as_str() {
-                                "id" | "entity_id" => {
-                                    JsonValue::String(e.entity_id.clone())
-                                }
-                                "name" => JsonValue::String(
-                                    e.name.clone().unwrap_or_default(),
-                                ),
-                                "type" | "entity_type" => {
-                                    JsonValue::String(e.entity_type.clone())
-                                }
+                                "id" | "entity_id" => JsonValue::String(e.entity_id.clone()),
+                                "name" => JsonValue::String(e.name.clone().unwrap_or_default()),
+                                "type" | "entity_type" => JsonValue::String(e.entity_type.clone()),
                                 "confidence" => serde_json::json!(e.confidence),
                                 "lat" | "latitude" => e
                                     .geometry
@@ -357,11 +338,9 @@ impl QueryExecutor {
                                     .as_ref()
                                     .map(|g| serde_json::json!(g.lon))
                                     .unwrap_or(JsonValue::Null),
-                                other => e
-                                    .properties
-                                    .get(other)
-                                    .cloned()
-                                    .unwrap_or(JsonValue::Null),
+                                other => {
+                                    e.properties.get(other).cloned().unwrap_or(JsonValue::Null)
+                                }
                             };
                             row.insert(key.to_string(), val);
                         }
@@ -372,17 +351,17 @@ impl QueryExecutor {
                                 serde_json::to_value(e).unwrap_or(JsonValue::Null),
                             );
                         }
-                        ReturnExpr::Function { name, args: _, alias } => {
-                            let key =
-                                alias.as_deref().unwrap_or(name.as_str());
+                        ReturnExpr::Function {
+                            name,
+                            args: _,
+                            alias,
+                        } => {
+                            let key = alias.as_deref().unwrap_or(name.as_str());
                             // DISTANCE function
                             if name == "DISTANCE" {
                                 if e.geometry.is_some() {
                                     // Placeholder: return 0 for now
-                                    row.insert(
-                                        key.to_string(),
-                                        serde_json::json!(0.0),
-                                    );
+                                    row.insert(key.to_string(), serde_json::json!(0.0));
                                 } else {
                                     row.insert(key.to_string(), JsonValue::Null);
                                 }
@@ -422,9 +401,7 @@ impl QueryExecutor {
                             let sum: f64 = entities
                                 .iter()
                                 .filter_map(|e| {
-                                    e.properties
-                                        .get(prop_name)
-                                        .and_then(|v| v.as_f64())
+                                    e.properties.get(prop_name).and_then(|v| v.as_f64())
                                 })
                                 .sum();
                             agg_row.insert(key.to_string(), serde_json::json!(sum));
@@ -436,15 +413,12 @@ impl QueryExecutor {
                             let values: Vec<f64> = entities
                                 .iter()
                                 .filter_map(|e| {
-                                    e.properties
-                                        .get(prop_name)
-                                        .and_then(|v| v.as_f64())
+                                    e.properties.get(prop_name).and_then(|v| v.as_f64())
                                 })
                                 .collect();
                             let count = values.len().max(1) as f64;
                             let sum: f64 = values.iter().sum();
-                            agg_row
-                                .insert(key.to_string(), serde_json::json!(sum / count));
+                            agg_row.insert(key.to_string(), serde_json::json!(sum / count));
                         }
                     }
                     "MIN" => {
@@ -453,14 +427,11 @@ impl QueryExecutor {
                             let min = entities
                                 .iter()
                                 .filter_map(|e| {
-                                    e.properties
-                                        .get(prop_name)
-                                        .and_then(|v| v.as_f64())
+                                    e.properties.get(prop_name).and_then(|v| v.as_f64())
                                 })
                                 .fold(f64::INFINITY, f64::min);
                             if min.is_finite() {
-                                agg_row
-                                    .insert(key.to_string(), serde_json::json!(min));
+                                agg_row.insert(key.to_string(), serde_json::json!(min));
                             } else {
                                 agg_row.insert(key.to_string(), JsonValue::Null);
                             }
@@ -472,14 +443,11 @@ impl QueryExecutor {
                             let max = entities
                                 .iter()
                                 .filter_map(|e| {
-                                    e.properties
-                                        .get(prop_name)
-                                        .and_then(|v| v.as_f64())
+                                    e.properties.get(prop_name).and_then(|v| v.as_f64())
                                 })
                                 .fold(f64::NEG_INFINITY, f64::max);
                             if max.is_finite() {
-                                agg_row
-                                    .insert(key.to_string(), serde_json::json!(max));
+                                agg_row.insert(key.to_string(), serde_json::json!(max));
                             } else {
                                 agg_row.insert(key.to_string(), JsonValue::Null);
                             }
@@ -498,9 +466,7 @@ impl QueryExecutor {
 fn eval_condition(cond: &Condition, e: &orp_proto::Entity, variable: &str) -> bool {
     match cond {
         Condition::Comparison { left, op, right } => {
-            let prop_name = left
-                .strip_prefix(&format!("{}.", variable))
-                .unwrap_or(left);
+            let prop_name = left.strip_prefix(&format!("{}.", variable)).unwrap_or(left);
 
             let val = e.properties.get(prop_name);
 
@@ -576,12 +542,8 @@ fn eval_condition(cond: &Condition, e: &orp_proto::Entity, variable: &str) -> bo
                 false
             }
         }
-        Condition::And(a, b) => {
-            eval_condition(a, e, variable) && eval_condition(b, e, variable)
-        }
-        Condition::Or(a, b) => {
-            eval_condition(a, e, variable) || eval_condition(b, e, variable)
-        }
+        Condition::And(a, b) => eval_condition(a, e, variable) && eval_condition(b, e, variable),
+        Condition::Or(a, b) => eval_condition(a, e, variable) || eval_condition(b, e, variable),
     }
 }
 
@@ -620,9 +582,7 @@ fn extract_column_names(ret: &ReturnClause) -> Vec<String> {
             ReturnExpr::Function { name, alias, .. } => {
                 alias.clone().unwrap_or_else(|| name.clone())
             }
-            ReturnExpr::Variable { name, alias } => {
-                alias.clone().unwrap_or_else(|| name.clone())
-            }
+            ReturnExpr::Variable { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
         })
         .collect()
 }
@@ -638,10 +598,7 @@ mod tests {
 
         for i in 0..10 {
             let mut props = HashMap::new();
-            props.insert(
-                "speed".to_string(),
-                serde_json::json!(5.0 + i as f64 * 3.0),
-            );
+            props.insert("speed".to_string(), serde_json::json!(5.0 + i as f64 * 3.0));
             props.insert(
                 "mmsi".to_string(),
                 serde_json::json!(format!("{:09}", 200000000 + i)),
@@ -705,11 +662,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.row_count, 1);
-        let avg = result.rows[0]
-            .get("avg_speed")
-            .unwrap()
-            .as_f64()
-            .unwrap();
+        let avg = result.rows[0].get("avg_speed").unwrap().as_f64().unwrap();
         assert!(avg > 0.0);
     }
 
@@ -723,11 +676,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.row_count, 1);
-        let sum = result.rows[0]
-            .get("total_speed")
-            .unwrap()
-            .as_f64()
-            .unwrap();
+        let sum = result.rows[0].get("total_speed").unwrap().as_f64().unwrap();
         assert!(sum > 0.0);
     }
 
@@ -740,22 +689,14 @@ mod tests {
             .execute("MATCH (s:Ship) RETURN MIN(s.speed) as min_speed")
             .await
             .unwrap();
-        let min = result.rows[0]
-            .get("min_speed")
-            .unwrap()
-            .as_f64()
-            .unwrap();
+        let min = result.rows[0].get("min_speed").unwrap().as_f64().unwrap();
         assert!((min - 5.0).abs() < 0.01);
 
         let result = executor
             .execute("MATCH (s:Ship) RETURN MAX(s.speed) as max_speed")
             .await
             .unwrap();
-        let max = result.rows[0]
-            .get("max_speed")
-            .unwrap()
-            .as_f64()
-            .unwrap();
+        let max = result.rows[0].get("max_speed").unwrap().as_f64().unwrap();
         assert!((max - 32.0).abs() < 0.01);
     }
 
@@ -778,9 +719,7 @@ mod tests {
         let storage = setup_test_storage().await;
         let executor = QueryExecutor::new(storage);
         let result = executor
-            .execute(
-                "MATCH (s:Ship) RETURN s.id, s.speed ORDER BY s.speed DESC LIMIT 3",
-            )
+            .execute("MATCH (s:Ship) RETURN s.id, s.speed ORDER BY s.speed DESC LIMIT 3")
             .await
             .unwrap();
 
@@ -804,18 +743,13 @@ mod tests {
         let storage = setup_test_storage().await;
         let executor = QueryExecutor::new(storage);
         let result = executor
-            .execute(
-                r#"MATCH (s:Ship) WHERE s.ship_type = "container" RETURN s.id, s.ship_type"#,
-            )
+            .execute(r#"MATCH (s:Ship) WHERE s.ship_type = "container" RETURN s.id, s.ship_type"#)
             .await
             .unwrap();
 
         assert!(result.row_count > 0);
         for row in &result.rows {
-            let st = row
-                .get("ship_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let st = row.get("ship_type").and_then(|v| v.as_str()).unwrap_or("");
             assert_eq!(st, "container");
         }
     }
@@ -942,7 +876,9 @@ mod tests {
         let storage = setup_test_storage().await;
         let executor = QueryExecutor::new(storage);
         let result = executor
-            .execute(r#"MATCH (s:Ship) WHERE s.speed > 10 AND s.ship_type = "container" RETURN s.id"#)
+            .execute(
+                r#"MATCH (s:Ship) WHERE s.speed > 10 AND s.ship_type = "container" RETURN s.id"#,
+            )
             .await
             .unwrap();
         // Some ships should match
@@ -953,20 +889,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_planner_no_geo_filter() {
-        let query = parse_orpql(
-            "MATCH (s:Ship) WHERE s.speed > 20 RETURN s.id LIMIT 10",
-        )
-        .unwrap();
+        let query = parse_orpql("MATCH (s:Ship) WHERE s.speed > 20 RETURN s.id LIMIT 10").unwrap();
         let plan = QueryPlanner::plan(&query);
         assert!(matches!(plan[0], PlanStep::EntityScan { .. }));
     }
 
     #[tokio::test]
     async fn test_planner_aggregate() {
-        let query = parse_orpql(
-            "MATCH (s:Ship) RETURN COUNT(s) as total",
-        )
-        .unwrap();
+        let query = parse_orpql("MATCH (s:Ship) RETURN COUNT(s) as total").unwrap();
         let plan = QueryPlanner::plan(&query);
         assert!(plan.iter().any(|s| matches!(s, PlanStep::Aggregate { .. })));
     }

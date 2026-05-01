@@ -130,9 +130,8 @@ fn schedule_relationship_str(code: u64) -> &'static str {
 
 /// Parse a GTFS-RT JSON feed (as commonly served by transit agencies).
 pub fn parse_gtfs_json(data: &str) -> Result<GtfsFeed, ConnectorError> {
-    let value: JsonValue = serde_json::from_str(data).map_err(|e| {
-        ConnectorError::ParseError(format!("GTFS-RT: invalid JSON: {}", e))
-    })?;
+    let value: JsonValue = serde_json::from_str(data)
+        .map_err(|e| ConnectorError::ParseError(format!("GTFS-RT: invalid JSON: {}", e)))?;
 
     parse_gtfs_json_value(&value)
 }
@@ -196,7 +195,10 @@ fn parse_vehicle_position_json(vp: &JsonValue) -> Option<GtfsVehiclePosition> {
     let pos = vp.get("position")?;
     let lat = pos.get("latitude").and_then(|v| v.as_f64())?;
     let lon = pos.get("longitude").and_then(|v| v.as_f64())?;
-    let bearing = pos.get("bearing").and_then(|v| v.as_f64()).map(|v| v as f32);
+    let bearing = pos
+        .get("bearing")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32);
     let speed = pos.get("speed").and_then(|v| v.as_f64()).map(|v| v as f32);
 
     let trip = vp.get("trip");
@@ -283,39 +285,35 @@ fn parse_trip_update_json(tu: &JsonValue) -> Option<GtfsTripUpdate> {
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .map(|stu| {
-                    GtfsStopTimeUpdate {
-                        stop_sequence: stu
-                            .get("stopSequence")
-                            .or_else(|| stu.get("stop_sequence"))
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as u32),
-                        stop_id: stu
-                            .get("stopId")
-                            .or_else(|| stu.get("stop_id"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        arrival_delay: stu
-                            .get("arrival")
-                            .and_then(|a| a.get("delay"))
-                            .and_then(|v| v.as_i64())
-                            .map(|v| v as i32),
-                        departure_delay: stu
-                            .get("departure")
-                            .and_then(|d| d.get("delay"))
-                            .and_then(|v| v.as_i64())
-                            .map(|v| v as i32),
-                        schedule_relationship: stu
-                            .get("scheduleRelationship")
-                            .or_else(|| stu.get("schedule_relationship"))
-                            .and_then(|v| {
-                                v.as_str()
-                                    .map(|s| s.to_string())
-                                    .or_else(|| {
-                                        v.as_u64().map(|c| schedule_relationship_str(c).to_string())
-                                    })
-                            }),
-                    }
+                .map(|stu| GtfsStopTimeUpdate {
+                    stop_sequence: stu
+                        .get("stopSequence")
+                        .or_else(|| stu.get("stop_sequence"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32),
+                    stop_id: stu
+                        .get("stopId")
+                        .or_else(|| stu.get("stop_id"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    arrival_delay: stu
+                        .get("arrival")
+                        .and_then(|a| a.get("delay"))
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v as i32),
+                    departure_delay: stu
+                        .get("departure")
+                        .and_then(|d| d.get("delay"))
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v as i32),
+                    schedule_relationship: stu
+                        .get("scheduleRelationship")
+                        .or_else(|| stu.get("schedule_relationship"))
+                        .and_then(|v| {
+                            v.as_str().map(|s| s.to_string()).or_else(|| {
+                                v.as_u64().map(|c| schedule_relationship_str(c).to_string())
+                            })
+                        }),
                 })
                 .collect()
         })
@@ -385,8 +383,14 @@ fn parse_alert_json(al: &JsonValue, entity_id: Option<&JsonValue>) -> Option<Gtf
 
     Some(GtfsAlert {
         alert_id: entity_id.and_then(|v| v.as_str()).map(|s| s.to_string()),
-        cause: al.get("cause").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        effect: al.get("effect").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        cause: al
+            .get("cause")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        effect: al
+            .get("effect")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         header_text,
         description_text,
         route_ids,
@@ -466,10 +470,7 @@ pub fn vehicle_position_to_source_event(
 }
 
 /// Convert a trip update to a SourceEvent.
-pub fn trip_update_to_source_event(
-    tu: &GtfsTripUpdate,
-    connector_id: &str,
-) -> SourceEvent {
+pub fn trip_update_to_source_event(tu: &GtfsTripUpdate, connector_id: &str) -> SourceEvent {
     let entity_id = format!("gtfs:trip:{}", tu.trip_id);
 
     let ts = tu
@@ -544,21 +545,21 @@ impl Connector for GtfsConnector {
         &self,
         tx: tokio::sync::mpsc::Sender<SourceEvent>,
     ) -> Result<(), ConnectorError> {
-        let url = self
-            .config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                ConnectorError::ConfigError("GTFS-RT: url (endpoint or file path) required".into())
-            })?;
+        let url = self.config.url.as_deref().ok_or_else(|| {
+            ConnectorError::ConfigError("GTFS-RT: url (endpoint or file path) required".into())
+        })?;
 
         let content = if url.starts_with("http://") || url.starts_with("https://") {
             reqwest::get(url)
                 .await
-                .map_err(|e| ConnectorError::ConnectionError(format!("GTFS-RT: HTTP error: {}", e)))?
+                .map_err(|e| {
+                    ConnectorError::ConnectionError(format!("GTFS-RT: HTTP error: {}", e))
+                })?
                 .text()
                 .await
-                .map_err(|e| ConnectorError::ConnectionError(format!("GTFS-RT: read error: {}", e)))?
+                .map_err(|e| {
+                    ConnectorError::ConnectionError(format!("GTFS-RT: read error: {}", e))
+                })?
         } else {
             tokio::fs::read_to_string(url)
                 .await

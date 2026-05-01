@@ -30,7 +30,8 @@ async fn main() -> Result<()> {
             no_auth,
             in_memory,
         } => {
-            cli::commands::run_start(config, template, port, dev, headless, no_auth, in_memory).await?;
+            cli::commands::run_start(config, template, port, dev, headless, no_auth, in_memory)
+                .await?;
         }
 
         cli::args::Commands::Query {
@@ -48,8 +49,9 @@ async fn main() -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("Failed to read stdin: {}", e))?;
                     buf
                 } else {
-                    std::fs::read_to_string(path)
-                        .map_err(|e| anyhow::anyhow!("Failed to read query file '{}': {}", path, e))?
+                    std::fs::read_to_string(path).map_err(|e| {
+                        anyhow::anyhow!("Failed to read query file '{}': {}", path, e)
+                    })?
                 }
             } else if let Some(q) = query {
                 q
@@ -92,8 +94,14 @@ async fn main() -> Result<()> {
                 entity_type,
                 trust_score,
             } => {
-                cli::commands::run_connectors_add(host, &name, connector_type, &entity_type, trust_score)
-                    .await?;
+                cli::commands::run_connectors_add(
+                    host,
+                    &name,
+                    connector_type,
+                    &entity_type,
+                    trust_score,
+                )
+                .await?;
             }
             cli::args::ConnectorAction::Remove { id, yes } => {
                 cli::commands::run_connectors_remove(host, &id, yes).await?;
@@ -167,8 +175,14 @@ async fn main() -> Result<()> {
             entity_type,
             trust_score,
         } => {
-            cli::commands::run_connect(host, &url, name.as_deref(), entity_type.as_deref(), trust_score)
-                .await?;
+            cli::commands::run_connect(
+                host,
+                &url,
+                name.as_deref(),
+                entity_type.as_deref(),
+                trust_score,
+            )
+            .await?;
         }
 
         cli::args::Commands::Ingest {
@@ -182,7 +196,11 @@ async fn main() -> Result<()> {
         }
 
         cli::args::Commands::Peer { action } => match action {
-            cli::args::PeerAction::Add { address, name, trust_score } => {
+            cli::args::PeerAction::Add {
+                address,
+                name,
+                trust_score,
+            } => {
                 cli::commands::run_peer_add(host, &address, name.as_deref(), trust_score).await?;
             }
             cli::args::PeerAction::List { output } => {

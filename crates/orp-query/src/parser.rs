@@ -178,7 +178,11 @@ fn parse_where_clause(input: &str) -> IResult<&str, WhereClause> {
 }
 
 fn parse_condition(input: &str) -> IResult<&str, Condition> {
-    alt((parse_near_condition, parse_within_condition, parse_comparison))(input)
+    alt((
+        parse_near_condition,
+        parse_within_condition,
+        parse_comparison,
+    ))(input)
 }
 
 fn parse_near_condition(input: &str) -> IResult<&str, Condition> {
@@ -388,7 +392,11 @@ fn parse_limit(input: &str) -> IResult<&str, usize> {
 }
 
 fn parse_literal(input: &str) -> IResult<&str, Literal> {
-    alt((parse_string_literal, parse_number_literal, parse_bool_literal))(input)
+    alt((
+        parse_string_literal,
+        parse_number_literal,
+        parse_bool_literal,
+    ))(input)
 }
 
 fn parse_string_literal(input: &str) -> IResult<&str, Literal> {
@@ -440,7 +448,8 @@ mod tests {
 
     #[test]
     fn test_graph_traversal() {
-        let query = r#"MATCH (s:Ship)-[:HEADING_TO]->(p:Port {name: "Rotterdam"}) RETURN s.id, s.name"#;
+        let query =
+            r#"MATCH (s:Ship)-[:HEADING_TO]->(p:Port {name: "Rotterdam"}) RETURN s.id, s.name"#;
         let result = parse_orpql(query);
         assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
         let q = result.unwrap();
@@ -462,7 +471,13 @@ mod tests {
         let q = result.unwrap();
         let cond = &q.where_clause.unwrap().conditions[0];
         match cond {
-            Condition::Within { min_lat, min_lon, max_lat, max_lon, .. } => {
+            Condition::Within {
+                min_lat,
+                min_lon,
+                max_lat,
+                max_lon,
+                ..
+            } => {
                 assert!((*min_lat - 48.0).abs() < 0.01);
                 assert!((*min_lon - -5.0).abs() < 0.01);
                 assert!((*max_lat - 55.0).abs() < 0.01);
@@ -511,13 +526,21 @@ mod tests {
         ] {
             let query = format!(r#"MATCH (s:Ship) WHERE s.speed {} 10 RETURN s.id"#, op);
             let result = parse_orpql(&query);
-            assert!(result.is_ok(), "Failed to parse '{}': {:?}", op, result.err());
+            assert!(
+                result.is_ok(),
+                "Failed to parse '{}': {:?}",
+                op,
+                result.err()
+            );
             let q = result.unwrap();
             let cond = &q.where_clause.unwrap().conditions[0];
             if let Condition::Comparison { op: parsed_op, .. } = cond {
                 assert!(
                     std::mem::discriminant(parsed_op) == std::mem::discriminant(expected),
-                    "Operator mismatch for '{}': {:?} vs {:?}", op, parsed_op, expected
+                    "Operator mismatch for '{}': {:?} vs {:?}",
+                    op,
+                    parsed_op,
+                    expected
                 );
             }
         }
@@ -575,7 +598,12 @@ mod tests {
         for func in &["MIN", "MAX"] {
             let query = format!("MATCH (s:Ship) RETURN {}(s.speed)", func);
             let result = parse_orpql(&query);
-            assert!(result.is_ok(), "Failed to parse {}: {:?}", func, result.err());
+            assert!(
+                result.is_ok(),
+                "Failed to parse {}: {:?}",
+                func,
+                result.err()
+            );
         }
     }
 
@@ -628,7 +656,11 @@ mod tests {
     fn test_case_insensitive_keywords() {
         let query = r#"match (s:Ship) where s.speed > 10 return s.id order by s.speed limit 5"#;
         let result = parse_orpql(query);
-        assert!(result.is_ok(), "Failed to parse case-insensitive: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to parse case-insensitive: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -645,7 +677,8 @@ mod tests {
 
     #[test]
     fn test_near_with_decimal_values() {
-        let query = "MATCH (s:Ship) WHERE NEAR(s, lat=51.922500, lon=4.270600, radius_km=0.5) RETURN s.id";
+        let query =
+            "MATCH (s:Ship) WHERE NEAR(s, lat=51.922500, lon=4.270600, radius_km=0.5) RETURN s.id";
         let result = parse_orpql(query);
         assert!(result.is_ok());
         let q = result.unwrap();

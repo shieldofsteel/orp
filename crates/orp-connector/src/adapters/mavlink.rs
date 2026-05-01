@@ -302,7 +302,11 @@ fn parse_endpoint(url: Option<&str>) -> Result<Endpoint, ConnectorError> {
         ConnectorError::ConfigError(format!("invalid mavlink address {with_port}: {e}"))
     })?;
 
-    Ok(if is_tcp { Endpoint::Tcp(addr) } else { Endpoint::Udp(addr) })
+    Ok(if is_tcp {
+        Endpoint::Tcp(addr)
+    } else {
+        Endpoint::Udp(addr)
+    })
 }
 
 #[async_trait]
@@ -513,12 +517,9 @@ async fn drive_tcp_stream(
             }
             match MavlinkConnector::decode_v2_datagram(&buf[stx..stx + frame_len]) {
                 Some((header, msg)) => {
-                    if let Some(event) = MavlinkConnector::frame_to_event(
-                        connector_id,
-                        header,
-                        &msg,
-                        Utc::now(),
-                    ) {
+                    if let Some(event) =
+                        MavlinkConnector::frame_to_event(connector_id, header, &msg, Utc::now())
+                    {
                         if tx.send(event).await.is_err() {
                             running.store(false, Ordering::SeqCst);
                             return Ok(());
@@ -541,8 +542,8 @@ async fn drive_tcp_stream(
 mod tests {
     use super::*;
     use mavlink::common::{
-        ATTITUDE_DATA, GLOBAL_POSITION_INT_DATA, GPS_RAW_INT_DATA, GpsFixType, HEARTBEAT_DATA,
-        MavAutopilot, MavModeFlag, MavState, MavType, SYS_STATUS_DATA, VFR_HUD_DATA,
+        GpsFixType, MavAutopilot, MavModeFlag, MavState, MavType, ATTITUDE_DATA,
+        GLOBAL_POSITION_INT_DATA, GPS_RAW_INT_DATA, HEARTBEAT_DATA, SYS_STATUS_DATA, VFR_HUD_DATA,
     };
     use mavlink::write_v2_msg;
 
@@ -559,7 +560,11 @@ mod tests {
     }
 
     fn header(system_id: u8) -> MavHeader {
-        MavHeader { system_id, component_id: 1, sequence: 0 }
+        MavHeader {
+            system_id,
+            component_id: 1,
+            sequence: 0,
+        }
     }
 
     fn encode_v2(hdr: MavHeader, msg: &MavMessage) -> Vec<u8> {
@@ -570,10 +575,13 @@ mod tests {
 
     fn heartbeat_msg() -> MavMessage {
         MavMessage::HEARTBEAT(HEARTBEAT_DATA {
-            custom_mode: 4, mavtype: MavType::MAV_TYPE_QUADROTOR,
+            custom_mode: 4,
+            mavtype: MavType::MAV_TYPE_QUADROTOR,
             autopilot: MavAutopilot::MAV_AUTOPILOT_PX4,
-            base_mode: MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED | MavModeFlag::MAV_MODE_FLAG_AUTO_ENABLED,
-            system_status: MavState::MAV_STATE_ACTIVE, mavlink_version: 3,
+            base_mode: MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED
+                | MavModeFlag::MAV_MODE_FLAG_AUTO_ENABLED,
+            system_status: MavState::MAV_STATE_ACTIVE,
+            mavlink_version: 3,
         })
     }
 
@@ -638,8 +646,14 @@ mod tests {
         assert_eq!(event.entity_type, "drone");
         assert_eq!(event.properties["message"], json!("HEARTBEAT"));
         assert_eq!(event.properties["system_id"], json!(7));
-        assert!(event.properties["autopilot"].as_str().unwrap().contains("PX4"));
-        assert!(event.properties["vehicle_type"].as_str().unwrap().contains("QUADROTOR"));
+        assert!(event.properties["autopilot"]
+            .as_str()
+            .unwrap()
+            .contains("PX4"));
+        assert!(event.properties["vehicle_type"]
+            .as_str()
+            .unwrap()
+            .contains("QUADROTOR"));
         assert_eq!(event.properties["custom_mode"], json!(4));
     }
 
@@ -647,9 +661,15 @@ mod tests {
     fn global_position_int_lat_lon_scale() {
         // 47.3977419°, 8.5455934°, alt 488.123m, hdg 92.5°
         let data = GLOBAL_POSITION_INT_DATA {
-            time_boot_ms: 123_456, lat: 473_977_419, lon: 85_455_934,
-            alt: 488_123, relative_alt: 12_345,
-            vx: 250, vy: -100, vz: 50, hdg: 9250,
+            time_boot_ms: 123_456,
+            lat: 473_977_419,
+            lon: 85_455_934,
+            alt: 488_123,
+            relative_alt: 12_345,
+            vx: 250,
+            vy: -100,
+            vz: 50,
+            hdg: 9250,
         };
         let bytes = encode_v2(header(1), &MavMessage::GLOBAL_POSITION_INT(data));
         let (h, m) = MavlinkConnector::decode_v2_datagram(&bytes).unwrap();
@@ -667,7 +687,14 @@ mod tests {
 
     #[test]
     fn vfr_hud_maps_speed_and_heading() {
-        let data = VFR_HUD_DATA { airspeed: 12.5, groundspeed: 11.0, alt: 100.0, climb: 0.5, heading: 273, throttle: 65 };
+        let data = VFR_HUD_DATA {
+            airspeed: 12.5,
+            groundspeed: 11.0,
+            alt: 100.0,
+            climb: 0.5,
+            heading: 273,
+            throttle: 65,
+        };
         let bytes = encode_v2(header(2), &MavMessage::VFR_HUD(data));
         let (h, m) = MavlinkConnector::decode_v2_datagram(&bytes).unwrap();
         let event = MavlinkConnector::frame_to_event("mav", h, &m, Utc::now()).unwrap();
@@ -682,8 +709,15 @@ mod tests {
     fn dedup_two_global_position_packets_share_entity_id() {
         let mk = |lat: i32, lon: i32, ms: u32| {
             MavMessage::GLOBAL_POSITION_INT(GLOBAL_POSITION_INT_DATA {
-                time_boot_ms: ms, lat, lon,
-                alt: 0, relative_alt: 0, vx: 0, vy: 0, vz: 0, hdg: 0,
+                time_boot_ms: ms,
+                lat,
+                lon,
+                alt: 0,
+                relative_alt: 0,
+                vx: 0,
+                vy: 0,
+                vz: 0,
+                hdg: 0,
             })
         };
         let b1 = encode_v2(header(1), &mk(473_977_419, 85_455_934, 1));
@@ -712,7 +746,15 @@ mod tests {
 
     #[test]
     fn attitude_message_decodes_into_event() {
-        let data = ATTITUDE_DATA { time_boot_ms: 5, roll: 0.1, pitch: -0.05, yaw: 1.57, rollspeed: 0.01, pitchspeed: -0.02, yawspeed: 0.03 };
+        let data = ATTITUDE_DATA {
+            time_boot_ms: 5,
+            roll: 0.1,
+            pitch: -0.05,
+            yaw: 1.57,
+            rollspeed: 0.01,
+            pitchspeed: -0.02,
+            yawspeed: 0.03,
+        };
         let bytes = encode_v2(header(1), &MavMessage::ATTITUDE(data));
         let (h, m) = MavlinkConnector::decode_v2_datagram(&bytes).unwrap();
         let event = MavlinkConnector::frame_to_event("mav", h, &m, Utc::now()).unwrap();
@@ -724,15 +766,25 @@ mod tests {
     #[test]
     fn gps_raw_int_extracts_fix_and_satellites() {
         let data = GPS_RAW_INT_DATA {
-            time_usec: 0, lat: 473_977_419, lon: 85_455_934, alt: 488_123,
-            eph: 80, epv: 120, vel: 250, cog: 9250,
-            fix_type: GpsFixType::GPS_FIX_TYPE_3D_FIX, satellites_visible: 14,
+            time_usec: 0,
+            lat: 473_977_419,
+            lon: 85_455_934,
+            alt: 488_123,
+            eph: 80,
+            epv: 120,
+            vel: 250,
+            cog: 9250,
+            fix_type: GpsFixType::GPS_FIX_TYPE_3D_FIX,
+            satellites_visible: 14,
         };
         let bytes = encode_v2(header(3), &MavMessage::GPS_RAW_INT(data));
         let (h, m) = MavlinkConnector::decode_v2_datagram(&bytes).unwrap();
         let event = MavlinkConnector::frame_to_event("mav", h, &m, Utc::now()).unwrap();
         assert_eq!(event.properties["satellites_visible"], json!(14));
-        assert!(event.properties["fix_type"].as_str().unwrap().contains("3D_FIX"));
+        assert!(event.properties["fix_type"]
+            .as_str()
+            .unwrap()
+            .contains("3D_FIX"));
         assert!((event.properties["hdop"].as_f64().unwrap() - 0.80).abs() < 1e-6);
         assert!((event.properties["vdop"].as_f64().unwrap() - 1.20).abs() < 1e-6);
     }
@@ -743,9 +795,15 @@ mod tests {
             onboard_control_sensors_present: Default::default(),
             onboard_control_sensors_enabled: Default::default(),
             onboard_control_sensors_health: Default::default(),
-            load: 250, voltage_battery: 12_450, current_battery: 1_500,
-            drop_rate_comm: 5, errors_comm: 7,
-            errors_count1: 0, errors_count2: 1, errors_count3: 2, errors_count4: 3,
+            load: 250,
+            voltage_battery: 12_450,
+            current_battery: 1_500,
+            drop_rate_comm: 5,
+            errors_comm: 7,
+            errors_count1: 0,
+            errors_count2: 1,
+            errors_count3: 2,
+            errors_count4: 3,
             battery_remaining: 73,
         };
         let bytes = encode_v2(header(1), &MavMessage::SYS_STATUS(data));
@@ -768,8 +826,7 @@ mod tests {
         drop(probe);
 
         let url = format!("mavlink://{bind_addr}");
-        let connector =
-            MavlinkConnector::from_connector_config(build_config(Some(&url))).unwrap();
+        let connector = MavlinkConnector::from_connector_config(build_config(Some(&url))).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SourceEvent>(16);
         connector.start(tx).await.expect("start");
 
@@ -780,11 +837,10 @@ mod tests {
         let bytes = encode_v2(header(9), &heartbeat_msg());
         client.send_to(&bytes, bind_addr).await.unwrap();
 
-        let event =
-            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-                .await
-                .expect("did not receive event in time")
-                .expect("channel closed");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("did not receive event in time")
+            .expect("channel closed");
         assert_eq!(event.entity_id, "mav-9-1");
         assert!(connector.stats().events_processed >= 1);
 

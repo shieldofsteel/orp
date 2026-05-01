@@ -121,21 +121,21 @@ pub struct CotEvent {
     pub time: String,
     pub start: String,
     pub stale: String,
-    /// latitude from <point>
+    /// latitude from `<point>`
     pub lat: f64,
-    /// longitude from <point>
+    /// longitude from `<point>`
     pub lon: f64,
-    /// height above ellipsoid from <point>
+    /// height above ellipsoid from `<point>`
     pub hae: f64,
-    /// circular error from <point>
+    /// circular error from `<point>`
     pub ce: f64,
-    /// linear error from <point>
+    /// linear error from `<point>`
     pub le: f64,
-    /// callsign from <contact> in <detail>
+    /// callsign from `<contact>` in `<detail>`
     pub callsign: Option<String>,
     /// remarks text
     pub remarks: Option<String>,
-    /// extra key‑value pairs found in <detail>
+    /// extra key‑value pairs found in `<detail>`
     pub detail_fields: HashMap<String, String>,
 }
 
@@ -219,10 +219,8 @@ pub fn parse_cot_xml(xml: &str) -> Result<CotEvent, ConnectorError> {
                 match tag.as_str() {
                     "event" => {
                         for attr in e.attributes().flatten() {
-                            let key =
-                                String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let val =
-                                String::from_utf8_lossy(&attr.value).to_string();
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let val = String::from_utf8_lossy(&attr.value).to_string();
                             match key.as_str() {
                                 "uid" => uid = val,
                                 "type" => event_type = val,
@@ -236,10 +234,8 @@ pub fn parse_cot_xml(xml: &str) -> Result<CotEvent, ConnectorError> {
                     }
                     "point" => {
                         for attr in e.attributes().flatten() {
-                            let key =
-                                String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let val =
-                                String::from_utf8_lossy(&attr.value).to_string();
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let val = String::from_utf8_lossy(&attr.value).to_string();
                             match key.as_str() {
                                 "lat" => lat = val.parse().unwrap_or(0.0),
                                 "lon" => lon = val.parse().unwrap_or(0.0),
@@ -255,15 +251,12 @@ pub fn parse_cot_xml(xml: &str) -> Result<CotEvent, ConnectorError> {
                     }
                     "contact" if in_detail => {
                         for attr in e.attributes().flatten() {
-                            let key =
-                                String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let val =
-                                String::from_utf8_lossy(&attr.value).to_string();
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let val = String::from_utf8_lossy(&attr.value).to_string();
                             if key == "callsign" {
                                 callsign = Some(val);
                             } else {
-                                detail_fields
-                                    .insert(format!("contact_{}", key), val);
+                                detail_fields.insert(format!("contact_{}", key), val);
                             }
                         }
                     }
@@ -273,12 +266,9 @@ pub fn parse_cot_xml(xml: &str) -> Result<CotEvent, ConnectorError> {
                     _ if in_detail => {
                         // Capture arbitrary detail child elements as key‑values
                         for attr in e.attributes().flatten() {
-                            let key =
-                                String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let val =
-                                String::from_utf8_lossy(&attr.value).to_string();
-                            detail_fields
-                                .insert(format!("{}_{}", tag, key), val);
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            detail_fields.insert(format!("{}_{}", tag, key), val);
                         }
                     }
                     _ => {}
@@ -358,9 +348,8 @@ pub fn emit_cot_xml(event: &CotEvent) -> String {
     ));
 
     // Detail section
-    let has_detail = event.callsign.is_some()
-        || event.remarks.is_some()
-        || !event.detail_fields.is_empty();
+    let has_detail =
+        event.callsign.is_some() || event.remarks.is_some() || !event.detail_fields.is_empty();
     if has_detail {
         xml.push_str("  <detail>\n");
         if let Some(ref cs) = event.callsign {
@@ -370,10 +359,7 @@ pub fn emit_cot_xml(event: &CotEvent) -> String {
             ));
         }
         if let Some(ref rmk) = event.remarks {
-            xml.push_str(&format!(
-                "    <remarks>{}</remarks>\n",
-                xml_escape(rmk)
-            ));
+            xml.push_str(&format!("    <remarks>{}</remarks>\n", xml_escape(rmk)));
         }
         xml.push_str("  </detail>\n");
     }
@@ -437,9 +423,9 @@ pub fn cot_producer_url_to_config(url: &str) -> Result<CotProducerConfig, Connec
     let (host, port_str) = rest.rsplit_once(':').ok_or_else(|| {
         ConnectorError::ConfigError(format!("CoT producer URL missing port: {url}"))
     })?;
-    let port: u16 = port_str.parse().map_err(|_| {
-        ConnectorError::ConfigError(format!("CoT producer invalid port in {url}"))
-    })?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| ConnectorError::ConfigError(format!("CoT producer invalid port in {url}")))?;
     cfg.bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
 
     match scheme {
@@ -471,8 +457,7 @@ fn is_multicast(ip: &IpAddr) -> bool {
 /// Build a `CotEvent` from a `SourceEvent` using the producer config.
 /// Honours `properties.cot_type`; otherwise specialises by entity_type.
 pub fn source_event_to_cot(ev: &SourceEvent, cfg: &CotProducerConfig) -> CotEvent {
-    let stale = (Utc::now() + chrono::Duration::seconds(cfg.stale_seconds as i64))
-        .to_rfc3339();
+    let stale = (Utc::now() + chrono::Duration::seconds(cfg.stale_seconds as i64)).to_rfc3339();
     let event_type = ev
         .properties
         .get("cot_type")
@@ -556,7 +541,10 @@ pub fn spawn_cot_producer(
         let _ = socket.set_multicast_loop_v4(true);
         let peers = read_unicast_peers();
         let mut fails: u64 = 0;
-        let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(config.bind_addr.port());
+        let local_port = socket
+            .local_addr()
+            .map(|a| a.port())
+            .unwrap_or(config.bind_addr.port());
         tracing::info!(bind = %config.bind_addr, multicast = ?config.multicast_group,
             peers = ?peers, "CoT producer started");
         while let Some(ev) = rx.recv().await {
@@ -641,50 +629,36 @@ impl Connector for CotConnector {
                                         if let Ok(xml) = std::str::from_utf8(&buf[..n]) {
                                             match parse_cot_xml(xml) {
                                                 Ok(cot) => {
-                                                    let event = cot.to_source_event(
-                                                        &connector_id,
-                                                    );
+                                                    let event = cot.to_source_event(&connector_id);
                                                     if tx.send(event).await.is_err() {
                                                         return;
                                                     }
-                                                    events_count.fetch_add(
-                                                        1,
-                                                        Ordering::Relaxed,
-                                                    );
+                                                    events_count.fetch_add(1, Ordering::Relaxed);
                                                 }
                                                 Err(e) => {
                                                     tracing::warn!("CoT parse error: {}", e);
-                                                    errors_count.fetch_add(
-                                                        1,
-                                                        Ordering::Relaxed,
-                                                    );
+                                                    errors_count.fetch_add(1, Ordering::Relaxed);
                                                 }
                                             }
                                         }
                                     }
                                     Err(e) => {
                                         tracing::warn!("CoT UDP recv error: {}", e);
-                                        errors_count
-                                            .fetch_add(1, Ordering::Relaxed);
+                                        errors_count.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                             }
                             return;
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "Cannot bind CoT UDP {}: {}, using demo data",
-                                addr,
-                                e
-                            );
+                            tracing::warn!("Cannot bind CoT UDP {}: {}, using demo data", addr, e);
                         }
                     }
                 }
             }
 
             // Demo mode: emit synthetic CoT events
-            let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_secs(3));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
             let demo_events = vec![
                 ("ALPHA-1", "a-f-G-U-C", 38.8977, -77.0365, "Alpha Squad"),
                 ("BRAVO-2", "a-f-G-E-V", 34.0522, -118.2437, "Bravo Team"),
@@ -806,10 +780,7 @@ mod tests {
     #[test]
     fn test_parse_cot_remarks() {
         let cot = parse_cot_xml(sample_cot_xml()).unwrap();
-        assert_eq!(
-            cot.remarks,
-            Some("On patrol near objective".to_string())
-        );
+        assert_eq!(cot.remarks, Some("On patrol near objective".to_string()));
     }
 
     #[test]
@@ -976,7 +947,10 @@ mod tests {
 
     #[test]
     fn test_xml_escape() {
-        assert_eq!(xml_escape("a<b>c&d\"e'f"), "a&lt;b&gt;c&amp;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape("a<b>c&d\"e'f"),
+            "a&lt;b&gt;c&amp;d&quot;e&apos;f"
+        );
     }
 
     #[test]
@@ -1022,7 +996,10 @@ mod tests {
         let cfg = CotProducerConfig::default();
         assert_eq!(cfg.bind_addr.port(), 6969);
         assert_eq!(cfg.bind_addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        assert_eq!(cfg.multicast_group, Some(IpAddr::V4(Ipv4Addr::new(239, 2, 3, 1))));
+        assert_eq!(
+            cfg.multicast_group,
+            Some(IpAddr::V4(Ipv4Addr::new(239, 2, 3, 1)))
+        );
         assert_eq!(cfg.stale_seconds, 60);
         assert_eq!(cfg.cot_type, "a-f-G");
     }
@@ -1031,7 +1008,10 @@ mod tests {
     fn test_cot_producer_url_parsing() {
         let mc = cot_producer_url_to_config("cot-out://239.2.3.1:6969").unwrap();
         assert_eq!(mc.bind_addr.port(), 6969);
-        assert_eq!(mc.multicast_group, Some(IpAddr::V4(Ipv4Addr::new(239, 2, 3, 1))));
+        assert_eq!(
+            mc.multicast_group,
+            Some(IpAddr::V4(Ipv4Addr::new(239, 2, 3, 1)))
+        );
 
         let alt = cot_producer_url_to_config("cot-out://224.0.0.1:18999").unwrap();
         assert_eq!(alt.bind_addr.port(), 18999);
@@ -1089,7 +1069,9 @@ mod tests {
         let recv_addr = recv.local_addr().unwrap();
         // SAFETY: env mutation is global; this test runs with default
         // cargo test threading and clears the var on exit.
-        unsafe { std::env::set_var("ORP_COT_PEERS", recv_addr.to_string()); }
+        unsafe {
+            std::env::set_var("ORP_COT_PEERS", recv_addr.to_string());
+        }
 
         let cfg = CotProducerConfig {
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -1101,7 +1083,9 @@ mod tests {
         let handle = spawn_cot_producer(cfg, rx);
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        tx.send(make_event("sar_aircraft", 45.0, -90.0)).await.unwrap();
+        tx.send(make_event("sar_aircraft", 45.0, -90.0))
+            .await
+            .unwrap();
 
         let mut buf = vec![0u8; 4096];
         let (n, _src) = tokio::time::timeout(
@@ -1119,7 +1103,9 @@ mod tests {
 
         drop(tx);
         let _ = handle.await;
-        unsafe { std::env::remove_var("ORP_COT_PEERS"); }
+        unsafe {
+            std::env::remove_var("ORP_COT_PEERS");
+        }
     }
 
     /// Regression: `read_unicast_peers` must warn on malformed entries
@@ -1130,15 +1116,18 @@ mod tests {
         // SAFETY: env mutation is global; same pattern as
         // `test_spawn_cot_producer_unicast_round_trip`.
         unsafe {
-            std::env::set_var(
-                "ORP_COT_PEERS",
-                "10.0.0.1:9999, ,not-a-socket,,[::1]:7777",
-            );
+            std::env::set_var("ORP_COT_PEERS", "10.0.0.1:9999, ,not-a-socket,,[::1]:7777");
         }
         let peers = read_unicast_peers();
-        unsafe { std::env::remove_var("ORP_COT_PEERS"); }
-        assert_eq!(peers.len(), 2,
-            "expected exactly two well-formed entries, got {:?}", peers);
+        unsafe {
+            std::env::remove_var("ORP_COT_PEERS");
+        }
+        assert_eq!(
+            peers.len(),
+            2,
+            "expected exactly two well-formed entries, got {:?}",
+            peers
+        );
         assert!(peers.contains(&"10.0.0.1:9999".parse().unwrap()));
         assert!(peers.contains(&"[::1]:7777".parse().unwrap()));
     }

@@ -14,7 +14,9 @@
 //! | Admin      | Manage users, connectors, monitors — full CRUD               |
 //! | SuperAdmin | Everything including system config and user admin            |
 
-use crate::abac::{AbacEngine, AbacPolicy, EvaluationContext, PolicyEffect, PrincipalSpec, ResourceSpec};
+use crate::abac::{
+    AbacEngine, AbacPolicy, EvaluationContext, PolicyEffect, PrincipalSpec, ResourceSpec,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -198,9 +200,7 @@ impl RolePermissions {
     /// permissions plus their own.
     pub fn for_role(role: Role) -> Vec<Action> {
         match role {
-            Role::Guest => vec![
-                Action::HealthCheck,
-            ],
+            Role::Guest => vec![Action::HealthCheck],
 
             Role::Viewer => vec![
                 // All Guest permissions
@@ -509,39 +509,60 @@ mod tests {
 
     #[test]
     fn analyst_cannot_write_entities() {
-        assert!(!check_role_permission(Role::Analyst, &Action::EntitiesWrite));
+        assert!(!check_role_permission(
+            Role::Analyst,
+            &Action::EntitiesWrite
+        ));
     }
 
     #[test]
     fn analyst_cannot_acknowledge_alerts() {
-        assert!(!check_role_permission(Role::Analyst, &Action::AlertsAcknowledge));
+        assert!(!check_role_permission(
+            Role::Analyst,
+            &Action::AlertsAcknowledge
+        ));
     }
 
     #[test]
     fn analyst_cannot_manage_connectors() {
-        assert!(!check_role_permission(Role::Analyst, &Action::ConnectorsManage));
+        assert!(!check_role_permission(
+            Role::Analyst,
+            &Action::ConnectorsManage
+        ));
     }
 
     // ── Operator ──────────────────────────────────────────────────────────────
 
     #[test]
     fn operator_can_write_entities() {
-        assert!(check_role_permission(Role::Operator, &Action::EntitiesWrite));
+        assert!(check_role_permission(
+            Role::Operator,
+            &Action::EntitiesWrite
+        ));
     }
 
     #[test]
     fn operator_can_create_monitors() {
-        assert!(check_role_permission(Role::Operator, &Action::MonitorsWrite));
+        assert!(check_role_permission(
+            Role::Operator,
+            &Action::MonitorsWrite
+        ));
     }
 
     #[test]
     fn operator_can_acknowledge_alerts() {
-        assert!(check_role_permission(Role::Operator, &Action::AlertsAcknowledge));
+        assert!(check_role_permission(
+            Role::Operator,
+            &Action::AlertsAcknowledge
+        ));
     }
 
     #[test]
     fn operator_cannot_delete_entities() {
-        assert!(!check_role_permission(Role::Operator, &Action::EntitiesDelete));
+        assert!(!check_role_permission(
+            Role::Operator,
+            &Action::EntitiesDelete
+        ));
     }
 
     #[test]
@@ -551,7 +572,10 @@ mod tests {
 
     #[test]
     fn operator_cannot_manage_connectors() {
-        assert!(!check_role_permission(Role::Operator, &Action::ConnectorsManage));
+        assert!(!check_role_permission(
+            Role::Operator,
+            &Action::ConnectorsManage
+        ));
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
@@ -565,7 +589,10 @@ mod tests {
 
     #[test]
     fn admin_can_manage_connectors() {
-        assert!(check_role_permission(Role::Admin, &Action::ConnectorsManage));
+        assert!(check_role_permission(
+            Role::Admin,
+            &Action::ConnectorsManage
+        ));
     }
 
     #[test]
@@ -668,7 +695,10 @@ mod tests {
 
     #[test]
     fn check_role_permission_str_works() {
-        assert!(check_role_permission_str(Role::Operator, "alerts:acknowledge"));
+        assert!(check_role_permission_str(
+            Role::Operator,
+            "alerts:acknowledge"
+        ));
         assert!(!check_role_permission_str(Role::Viewer, "query:execute"));
         assert!(!check_role_permission_str(Role::Admin, "unknown:action"));
     }
@@ -677,15 +707,13 @@ mod tests {
 
     #[test]
     fn abac_context_includes_role_attribute() {
-        let ctx = build_rbac_abac_context(
-            "user-1",
-            Role::Analyst,
-            "query:execute",
-            "entity",
-            "ent-1",
-        );
+        let ctx =
+            build_rbac_abac_context("user-1", Role::Analyst, "query:execute", "entity", "ent-1");
         assert_eq!(ctx.subject.role.as_deref(), Some("analyst"));
-        assert!(ctx.subject.permissions.contains(&"query:execute".to_string()));
+        assert!(ctx
+            .subject
+            .permissions
+            .contains(&"query:execute".to_string()));
     }
 
     #[test]
@@ -704,13 +732,8 @@ mod tests {
         assert!(engine.is_allowed(&ctx));
 
         // Viewer cannot execute queries via ABAC engine
-        let ctx_deny = build_rbac_abac_context(
-            "view-1",
-            Role::Viewer,
-            "query:execute",
-            "entity",
-            "ent-1",
-        );
+        let ctx_deny =
+            build_rbac_abac_context("view-1", Role::Viewer, "query:execute", "entity", "ent-1");
         assert!(!engine.is_allowed(&ctx_deny));
     }
 
@@ -719,13 +742,8 @@ mod tests {
         let engine = crate::abac::AbacEngine::new();
         register_rbac_policies(&engine);
 
-        let ctx = build_rbac_abac_context(
-            "sa-1",
-            Role::SuperAdmin,
-            "system:config",
-            "system",
-            "sys-1",
-        );
+        let ctx =
+            build_rbac_abac_context("sa-1", Role::SuperAdmin, "system:config", "system", "sys-1");
         assert!(engine.is_allowed(&ctx));
     }
 }

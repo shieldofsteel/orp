@@ -54,9 +54,7 @@ fn is_url_safe(url: &str, allow_private: bool) -> Result<(), String> {
     for addr in addrs {
         let ip = addr.ip();
         if is_internal_ip(&ip) {
-            return Err(format!(
-                "host '{host}' resolves to internal address {ip}"
-            ));
+            return Err(format!("host '{host}' resolves to internal address {ip}"));
         }
     }
     Ok(())
@@ -152,9 +150,7 @@ pub(crate) fn safe_resolve_with(
         for sa in &addrs {
             let ip = sa.ip();
             if is_internal_ip(&ip) {
-                return Err(format!(
-                    "host '{host}' resolves to internal address {ip}"
-                ));
+                return Err(format!("host '{host}' resolves to internal address {ip}"));
             }
         }
     }
@@ -241,8 +237,7 @@ impl reqwest::dns::Resolve for SsrfDnsResolver {
             })
             .await
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
-            let addrs =
-                res.map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+            let addrs = res.map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
             let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
             Ok(iter)
         })
@@ -251,9 +246,7 @@ impl reqwest::dns::Resolve for SsrfDnsResolver {
 
 #[cfg(test)]
 mod ssrf_tests {
-    use super::{
-        build_safe_client, is_url_safe, safe_resolve, safe_resolve_with, HostResolver,
-    };
+    use super::{build_safe_client, is_url_safe, safe_resolve, safe_resolve_with, HostResolver};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[test]
@@ -376,9 +369,7 @@ mod ssrf_tests {
                 ])
             }
         }
-        assert!(
-            safe_resolve_with("http://mixed.example/", false, &MixedResolver).is_err()
-        );
+        assert!(safe_resolve_with("http://mixed.example/", false, &MixedResolver).is_err());
     }
 
     #[test]
@@ -428,9 +419,9 @@ mod ssrf_tests {
                 "expected DNS resolution failure, got: {}",
                 msg
             ),
-            Ok(()) => eprintln!(
-                "skipping dns_failure test: local resolver returned a hit for .invalid"
-            ),
+            Ok(()) => {
+                eprintln!("skipping dns_failure test: local resolver returned a hit for .invalid")
+            }
         }
     }
 
@@ -485,18 +476,18 @@ impl HttpPollerConnector {
             .filter_map(|item| {
                 let entity_id = item
                     .get(id_field)
-                    .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_i64().map(|n| n.to_string())))
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(String::from)
+                            .or_else(|| v.as_i64().map(|n| n.to_string()))
+                    })
                     .unwrap_or_default();
                 if entity_id.is_empty() {
                     return None;
                 }
 
-                let latitude = item
-                    .get(lat_field)
-                    .and_then(|v| v.as_f64());
-                let longitude = item
-                    .get(lon_field)
-                    .and_then(|v| v.as_f64());
+                let latitude = item.get(lat_field).and_then(|v| v.as_f64());
+                let longitude = item.get(lon_field).and_then(|v| v.as_f64());
 
                 let mut properties = HashMap::new();
                 if let Some(obj) = item.as_object() {
@@ -639,18 +630,9 @@ impl Connector for HttpPollerConnector {
 
                     for (id, lat, lon, sys_type, severity) in &demo_weather {
                         let mut properties = HashMap::new();
-                        properties.insert(
-                            "system_type".to_string(),
-                            serde_json::json!(sys_type),
-                        );
-                        properties.insert(
-                            "severity".to_string(),
-                            serde_json::json!(severity),
-                        );
-                        properties.insert(
-                            "radius_km".to_string(),
-                            serde_json::json!(200.0),
-                        );
+                        properties.insert("system_type".to_string(), serde_json::json!(sys_type));
+                        properties.insert("severity".to_string(), serde_json::json!(severity));
+                        properties.insert("radius_km".to_string(), serde_json::json!(200.0));
 
                         let event = SourceEvent {
                             connector_id: connector_id.clone(),
@@ -721,7 +703,12 @@ mod tests {
         ]);
 
         let events = HttpPollerConnector::extract_entities(
-            &json, "ship", "http-1", "id", "latitude", "longitude",
+            &json,
+            "ship",
+            "http-1",
+            "id",
+            "latitude",
+            "longitude",
         );
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].entity_id, "ship:vessel-1");
@@ -737,7 +724,12 @@ mod tests {
         });
 
         let events = HttpPollerConnector::extract_entities(
-            &json, "port", "http-1", "id", "latitude", "longitude",
+            &json,
+            "port",
+            "http-1",
+            "id",
+            "latitude",
+            "longitude",
         );
         assert_eq!(events.len(), 1);
     }
@@ -745,9 +737,8 @@ mod tests {
     #[test]
     fn test_extract_entities_empty() {
         let json = serde_json::json!([]);
-        let events = HttpPollerConnector::extract_entities(
-            &json, "ship", "http-1", "id", "lat", "lon",
-        );
+        let events =
+            HttpPollerConnector::extract_entities(&json, "ship", "http-1", "id", "lat", "lon");
         assert!(events.is_empty());
     }
 }

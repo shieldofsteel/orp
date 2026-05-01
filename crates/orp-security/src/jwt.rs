@@ -89,8 +89,7 @@ impl Claims {
 
     /// Returns true if the claims contain the given permission string.
     pub fn has_permission(&self, perm: &str) -> bool {
-        self.permissions.iter().any(|p| p == perm)
-            || self.permissions.iter().any(|p| p == "admin")
+        self.permissions.iter().any(|p| p == perm) || self.permissions.iter().any(|p| p == "admin")
     }
 
     /// Returns the list of scopes parsed from the scope string.
@@ -164,9 +163,7 @@ impl JwtService {
                 }
             }
             JwtAlgorithm::RS256 => {
-                if config.rs256_private_key_pem.is_none()
-                    && config.rs256_public_key_pem.is_none()
-                {
+                if config.rs256_private_key_pem.is_none() && config.rs256_public_key_pem.is_none() {
                     return Err(JwtError::Config(
                         "RS256 requires at least one of private or public key".into(),
                     ));
@@ -327,7 +324,9 @@ impl JwtService {
                     DecodingKey::from_rsa_pem(priv_pem.as_bytes())
                         .map_err(|e| JwtError::Config(format!("Invalid RSA key: {e}")))
                 } else {
-                    Err(JwtError::Config("No RS256 key available for decoding".into()))
+                    Err(JwtError::Config(
+                        "No RS256 key available for decoding".into(),
+                    ))
                 }
             }
         }
@@ -374,13 +373,7 @@ mod tests {
     fn test_has_permission() {
         let svc = default_service();
         let token = svc
-            .issue_token(
-                "user-123",
-                None,
-                None,
-                None,
-                vec!["entities:read".into()],
-            )
+            .issue_token("user-123", None, None, None, vec!["entities:read".into()])
             .unwrap();
         let claims = svc.validate_token(&token).unwrap();
         assert!(claims.has_permission("entities:read"));

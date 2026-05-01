@@ -55,7 +55,11 @@ impl AsterixFieldValue {
             AsterixFieldValue::F64(v) => serde_json::json!(*v),
             AsterixFieldValue::Text(v) => serde_json::json!(v),
             AsterixFieldValue::Bytes(v) => {
-                serde_json::json!(v.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(""))
+                serde_json::json!(v
+                    .iter()
+                    .map(|b| format!("{:02X}", b))
+                    .collect::<Vec<_>>()
+                    .join(""))
             }
         }
     }
@@ -125,9 +129,7 @@ pub fn fspec_has_field(fspec: &[u8], field_index: usize) -> bool {
 //   FRN 12: I048/042 Calculated Position in Cartesian (4 bytes)
 //   FRN 13: I048/200 Calculated Track Velocity (4 bytes)
 
-pub fn parse_cat048_record(
-    data: &[u8],
-) -> Result<(AsterixRecord, usize), ConnectorError> {
+pub fn parse_cat048_record(data: &[u8]) -> Result<(AsterixRecord, usize), ConnectorError> {
     let (fspec, mut offset) = parse_fspec(data)?;
     let mut fields = HashMap::new();
 
@@ -179,7 +181,7 @@ pub fn parse_cat048_record(
                 ));
             }
             offset += 1; // skip extension byte
-            // More extensions possible
+                         // More extensions possible
             while offset > 0 && data[offset - 1] & 0x01 != 0 {
                 if offset >= data.len() {
                     break;
@@ -197,8 +199,7 @@ pub fn parse_cat048_record(
             ));
         }
         let rho_raw = ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
-        let theta_raw =
-            ((data[offset + 2] as u16) << 8) | (data[offset + 3] as u16);
+        let theta_raw = ((data[offset + 2] as u16) << 8) | (data[offset + 3] as u16);
         let rho_nm = rho_raw as f64 / 256.0; // NM
         let theta_deg = theta_raw as f64 * 360.0 / 65536.0; // degrees
         fields.insert("rho_nm".into(), AsterixFieldValue::F64(rho_nm));
@@ -213,8 +214,7 @@ pub fn parse_cat048_record(
                 "ASTERIX Cat048: truncated I048/070".to_string(),
             ));
         }
-        let code_raw =
-            ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
+        let code_raw = ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
         let squawk = code_raw & 0x0FFF;
         fields.insert("mode3a".into(), AsterixFieldValue::U16(squawk));
         offset += 2;
@@ -229,10 +229,7 @@ pub fn parse_cat048_record(
         }
         let fl_raw = ((data[offset] as i16) << 8) | (data[offset + 1] as i16);
         let flight_level = (fl_raw & 0x3FFF) as f64 / 4.0;
-        fields.insert(
-            "flight_level".into(),
-            AsterixFieldValue::F64(flight_level),
-        );
+        fields.insert("flight_level".into(), AsterixFieldValue::F64(flight_level));
         offset += 2;
     }
 
@@ -285,10 +282,7 @@ pub fn parse_cat048_record(
             ));
         }
         let callsign = decode_icao_6bit(&data[offset..offset + 6]);
-        fields.insert(
-            "callsign".into(),
-            AsterixFieldValue::Text(callsign),
-        );
+        fields.insert("callsign".into(), AsterixFieldValue::Text(callsign));
         offset += 6;
     }
 
@@ -317,9 +311,11 @@ pub fn parse_cat048_record(
                 "ASTERIX Cat048: truncated I048/161".to_string(),
             ));
         }
-        let track =
-            ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
-        fields.insert("track_number".into(), AsterixFieldValue::U16(track & 0x0FFF));
+        let track = ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
+        fields.insert(
+            "track_number".into(),
+            AsterixFieldValue::U16(track & 0x0FFF),
+        );
         offset += 2;
     }
 
@@ -331,8 +327,7 @@ pub fn parse_cat048_record(
             ));
         }
         let x_raw = ((data[offset] as i16) << 8) | (data[offset + 1] as i16);
-        let y_raw =
-            ((data[offset + 2] as i16) << 8) | (data[offset + 3] as i16);
+        let y_raw = ((data[offset + 2] as i16) << 8) | (data[offset + 3] as i16);
         let x_nm = x_raw as f64 / 128.0;
         let y_nm = y_raw as f64 / 128.0;
         fields.insert("x_nm".into(), AsterixFieldValue::F64(x_nm));
@@ -347,20 +342,15 @@ pub fn parse_cat048_record(
                 "ASTERIX Cat048: truncated I048/200".to_string(),
             ));
         }
-        let gs_raw =
-            ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
-        let hdg_raw =
-            ((data[offset + 2] as u16) << 8) | (data[offset + 3] as u16);
+        let gs_raw = ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
+        let hdg_raw = ((data[offset + 2] as u16) << 8) | (data[offset + 3] as u16);
         let ground_speed_kt = gs_raw as f64 * 3600.0 / 16384.0; // NM/s → knots
         let heading_deg = hdg_raw as f64 * 360.0 / 65536.0;
         fields.insert(
             "ground_speed_kt".into(),
             AsterixFieldValue::F64(ground_speed_kt),
         );
-        fields.insert(
-            "heading_deg".into(),
-            AsterixFieldValue::F64(heading_deg),
-        );
+        fields.insert("heading_deg".into(), AsterixFieldValue::F64(heading_deg));
         offset += 4;
     }
 
@@ -385,9 +375,7 @@ pub fn parse_cat048_record(
 //   FRN 6: I062/185 Calculated Track Velocity (Cartesian) (4 bytes)
 //   FRN 7: I062/210 Calculated Acceleration (Cartesian) (2 bytes)
 
-pub fn parse_cat062_record(
-    data: &[u8],
-) -> Result<(AsterixRecord, usize), ConnectorError> {
+pub fn parse_cat062_record(data: &[u8]) -> Result<(AsterixRecord, usize), ConnectorError> {
     let (fspec, mut offset) = parse_fspec(data)?;
     let mut fields = HashMap::new();
 
@@ -470,7 +458,11 @@ pub fn parse_cat062_record(
             data[offset + 2],
         ]);
         let y_raw = i32::from_be_bytes([
-            if data[offset + 3] & 0x80 != 0 { 0xFF } else { 0x00 },
+            if data[offset + 3] & 0x80 != 0 {
+                0xFF
+            } else {
+                0x00
+            },
             data[offset + 3],
             data[offset + 4],
             data[offset + 5],
@@ -489,10 +481,8 @@ pub fn parse_cat062_record(
                 "ASTERIX Cat062: truncated I062/185".to_string(),
             ));
         }
-        let vx_raw =
-            i16::from_be_bytes([data[offset], data[offset + 1]]);
-        let vy_raw =
-            i16::from_be_bytes([data[offset + 2], data[offset + 3]]);
+        let vx_raw = i16::from_be_bytes([data[offset], data[offset + 1]]);
+        let vy_raw = i16::from_be_bytes([data[offset + 2], data[offset + 3]]);
         let vx_ms = vx_raw as f64 * 0.25; // 0.25 m/s resolution
         let vy_ms = vy_raw as f64 * 0.25;
         fields.insert("vx_ms".into(), AsterixFieldValue::F64(vx_ms));
@@ -509,14 +499,8 @@ pub fn parse_cat062_record(
         }
         let ax = data[offset] as i8;
         let ay = data[offset + 1] as i8;
-        fields.insert(
-            "ax_ms2".into(),
-            AsterixFieldValue::F64(ax as f64 * 0.25),
-        );
-        fields.insert(
-            "ay_ms2".into(),
-            AsterixFieldValue::F64(ay as f64 * 0.25),
-        );
+        fields.insert("ax_ms2".into(), AsterixFieldValue::F64(ax as f64 * 0.25));
+        fields.insert("ay_ms2".into(), AsterixFieldValue::F64(ay as f64 * 0.25));
         offset += 2;
     }
 
@@ -534,9 +518,7 @@ pub fn parse_cat062_record(
 // ---------------------------------------------------------------------------
 
 /// Parse an ASTERIX data block (CAT + LEN + records).
-pub fn parse_asterix_data_block(
-    data: &[u8],
-) -> Result<AsterixDataBlock, ConnectorError> {
+pub fn parse_asterix_data_block(data: &[u8]) -> Result<AsterixDataBlock, ConnectorError> {
     if data.len() < 3 {
         return Err(ConnectorError::ParseError(
             "ASTERIX: data block too short (< 3 bytes)".to_string(),
@@ -570,13 +552,7 @@ pub fn parse_asterix_data_block(
                     "raw_data".into(),
                     AsterixFieldValue::Bytes(remaining.clone()),
                 );
-                (
-                    AsterixRecord {
-                        category,
-                        fields,
-                    },
-                    remaining.len(),
-                )
+                (AsterixRecord { category, fields }, remaining.len())
             }
         };
         records.push(record);
@@ -630,29 +606,20 @@ impl AsterixRecord {
             properties.insert(k.clone(), v.to_json());
         }
 
-        properties.insert(
-            "asterix_category".into(),
-            serde_json::json!(self.category),
-        );
+        properties.insert("asterix_category".into(), serde_json::json!(self.category));
 
         // Determine entity_id from available identifiers
-        let entity_id = if let Some(AsterixFieldValue::Text(icao)) =
-            self.fields.get("icao_address")
+        let entity_id = if let Some(AsterixFieldValue::Text(icao)) = self.fields.get("icao_address")
         {
             format!("icao:{}", icao)
-        } else if let Some(AsterixFieldValue::U16(track)) =
-            self.fields.get("track_number")
-        {
+        } else if let Some(AsterixFieldValue::U16(track)) = self.fields.get("track_number") {
             format!("asterix_track:{}", track)
         } else {
             format!("asterix:{}:{}", self.category, uuid::Uuid::new_v4())
         };
 
         // Extract position (lat/lon from Cat 062, or polar from Cat 048)
-        let (lat, lon) = match (
-            self.fields.get("latitude"),
-            self.fields.get("longitude"),
-        ) {
+        let (lat, lon) = match (self.fields.get("latitude"), self.fields.get("longitude")) {
             (Some(AsterixFieldValue::F64(la)), Some(AsterixFieldValue::F64(lo))) => {
                 (Some(*la), Some(*lo))
             }
@@ -735,47 +702,31 @@ impl Connector for AsterixConnector {
                             let mut buf = vec![0u8; 65535];
                             while running.load(Ordering::SeqCst) {
                                 match socket.recv_from(&mut buf).await {
-                                    Ok((n, _)) => {
-                                        match parse_asterix_data_block(&buf[..n]) {
-                                            Ok(block) => {
-                                                for rec in &block.records {
-                                                    let event = rec.to_source_event(
-                                                        &connector_id,
-                                                    );
-                                                    if tx.send(event).await.is_err() {
-                                                        return;
-                                                    }
-                                                    events_count.fetch_add(
-                                                        1,
-                                                        Ordering::Relaxed,
-                                                    );
+                                    Ok((n, _)) => match parse_asterix_data_block(&buf[..n]) {
+                                        Ok(block) => {
+                                            for rec in &block.records {
+                                                let event = rec.to_source_event(&connector_id);
+                                                if tx.send(event).await.is_err() {
+                                                    return;
                                                 }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "ASTERIX parse error: {}",
-                                                    e
-                                                );
-                                                errors_count
-                                                    .fetch_add(1, Ordering::Relaxed);
+                                                events_count.fetch_add(1, Ordering::Relaxed);
                                             }
                                         }
-                                    }
+                                        Err(e) => {
+                                            tracing::warn!("ASTERIX parse error: {}", e);
+                                            errors_count.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    },
                                     Err(e) => {
                                         tracing::warn!("ASTERIX UDP error: {}", e);
-                                        errors_count
-                                            .fetch_add(1, Ordering::Relaxed);
+                                        errors_count.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                             }
                             return;
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "Cannot bind ASTERIX UDP {}: {}",
-                                addr,
-                                e
-                            );
+                            tracing::warn!("Cannot bind ASTERIX UDP {}: {}", addr, e);
                         }
                     }
                 }
@@ -1151,10 +1102,7 @@ mod tests {
 
         // FRN 9: Aircraft ID (6 bytes) — encode "TEST    "
         // T=20, E=5, S=19, T=20, spaces
-        let encoded: u64 = (20u64 << 42)
-            | (5u64 << 36)
-            | (19u64 << 30)
-            | (20u64 << 24);
+        let encoded: u64 = (20u64 << 42) | (5u64 << 36) | (19u64 << 30) | (20u64 << 24);
         let bytes = encoded.to_be_bytes();
         record_data.extend_from_slice(&bytes[2..8]);
 

@@ -227,7 +227,9 @@ impl AbacEngine {
                     r#type: "*".to_string(),
                     attribute_match: HashMap::new(),
                 },
-                description: Some("Development permissive policy — disable in production".to_string()),
+                description: Some(
+                    "Development permissive policy — disable in production".to_string(),
+                ),
                 priority: -100,
             })
             .unwrap_or_else(|e| {
@@ -299,12 +301,9 @@ impl AbacEngine {
                 action: vec!["*".to_string()],
                 resource: ResourceSpec {
                     r#type: "entity".to_string(),
-                    attribute_match: [(
-                        "sensitivity".to_string(),
-                        serde_json::json!("secret"),
-                    )]
-                    .into_iter()
-                    .collect(),
+                    attribute_match: [("sensitivity".to_string(), serde_json::json!("secret"))]
+                        .into_iter()
+                        .collect(),
                 },
                 description: None,
                 priority: 50, // Evaluated before allow rules
@@ -381,10 +380,7 @@ impl AbacEngine {
             return PolicyDecision {
                 result: EvaluationResult::Deny,
                 matched_policy: None,
-                reason: format!(
-                    "Missing permission '{}' in token claims",
-                    ctx.action
-                ),
+                reason: format!("Missing permission '{}' in token claims", ctx.action),
             };
         }
 
@@ -544,10 +540,7 @@ fn value_matches(actual: &serde_json::Value, expected: &serde_json::Value) -> bo
 }
 
 /// Interpolate `${subject.sub}` etc. in a policy attribute value.
-fn interpolate_value(
-    value: &serde_json::Value,
-    ctx: &EvaluationContext,
-) -> serde_json::Value {
+fn interpolate_value(value: &serde_json::Value, ctx: &EvaluationContext) -> serde_json::Value {
     if let Some(s) = value.as_str() {
         if s.starts_with("${") && s.ends_with('}') {
             let var = &s[2..s.len() - 1];
@@ -668,12 +661,9 @@ mod tests {
                 action: vec!["*".into()],
                 resource: ResourceSpec {
                     r#type: "entity".into(),
-                    attribute_match: [(
-                        "sensitivity".to_string(),
-                        serde_json::json!("secret"),
-                    )]
-                    .into_iter()
-                    .collect(),
+                    attribute_match: [("sensitivity".to_string(), serde_json::json!("secret"))]
+                        .into_iter()
+                        .collect(),
                 },
                 description: None,
                 priority: 10,

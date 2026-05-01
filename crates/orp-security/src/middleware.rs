@@ -41,8 +41,7 @@ pub struct AuthContext {
 impl AuthContext {
     /// Returns true if the context holds the requested permission.
     pub fn has_permission(&self, perm: &str) -> bool {
-        self.permissions.iter().any(|p| p == perm)
-            || self.permissions.iter().any(|p| p == "admin")
+        self.permissions.iter().any(|p| p == perm) || self.permissions.iter().any(|p| p == "admin")
     }
 
     /// Returns true if the context holds the requested scope.
@@ -127,8 +126,7 @@ pub enum AuthMethod {
 }
 
 /// Authentication state shared across Axum handlers.
-#[derive(Clone, Debug)]
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AuthState {
     /// JWT service — `None` means auth is disabled (dev mode)
     pub jwt_service: Option<Arc<JwtService>>,
@@ -285,10 +283,7 @@ where
     }
 }
 
-async fn extract_auth(
-    parts: &mut Parts,
-    auth_state: &AuthState,
-) -> Result<AuthContext, AuthError> {
+async fn extract_auth(parts: &mut Parts, auth_state: &AuthState) -> Result<AuthContext, AuthError> {
     // Try to extract Bearer token
     let bearer_token = parts
         .headers
@@ -513,7 +508,10 @@ mod tests {
         }
     }
 
-    fn dev_env_test(orp_dev_mode: Option<&str>, orp_env: Option<&str>) -> Result<AuthState, AuthStateError> {
+    fn dev_env_test(
+        orp_dev_mode: Option<&str>,
+        orp_env: Option<&str>,
+    ) -> Result<AuthState, AuthStateError> {
         // Always start from a clean slate so the previous test's settings
         // can't leak in.
         std::env::remove_var("ORP_DEV_MODE");
@@ -564,10 +562,13 @@ mod tests {
     fn test_dev_state_refuses_production_env() {
         let _guard = EnvGuard;
         let result = dev_env_test(Some("true"), Some("production"));
-        assert!(matches!(
-            result,
-            Err(AuthStateError::DevModeRefusedInProd { ref env }) if env == "production"
-        ), "expected DevModeRefusedInProd, got {result:?}");
+        assert!(
+            matches!(
+                result,
+                Err(AuthStateError::DevModeRefusedInProd { ref env }) if env == "production"
+            ),
+            "expected DevModeRefusedInProd, got {result:?}"
+        );
     }
 
     #[test]
@@ -577,10 +578,13 @@ mod tests {
         // ORP_ENV unset (absent) — the closed-by-default policy means this
         // is no longer treated as dev-OK. Refused.
         let result = dev_env_test(Some("true"), None);
-        assert!(matches!(
-            result,
-            Err(AuthStateError::DevModeRefusedInProd { ref env }) if env.is_empty()
-        ), "unset ORP_ENV with dev-mode-on must refuse, got {result:?}");
+        assert!(
+            matches!(
+                result,
+                Err(AuthStateError::DevModeRefusedInProd { ref env }) if env.is_empty()
+            ),
+            "unset ORP_ENV with dev-mode-on must refuse, got {result:?}"
+        );
     }
 
     #[test]

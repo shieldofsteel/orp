@@ -96,9 +96,7 @@ impl DatabaseConfig {
         let query = props
             .get("query")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ConnectorError::ConfigError("Missing 'query' property".to_string())
-            })?
+            .ok_or_else(|| ConnectorError::ConfigError("Missing 'query' property".to_string()))?
             .to_string();
 
         let poll_interval_secs = props
@@ -483,7 +481,8 @@ impl Connector for DatabaseConnector {
 
                         // Update watermark
                         if let Some(ref wf) = config_clone.watermark_field {
-                            let mut lock = watermark_clone.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut lock =
+                                watermark_clone.lock().unwrap_or_else(|e| e.into_inner());
                             for row in &rows {
                                 if let Some(v) = row.get(wf) {
                                     let s = if let Some(str_val) = v.as_str() {
@@ -772,8 +771,7 @@ mod tests {
         let config = make_config("postgres://localhost/db");
         let mut db_config = DatabaseConfig::from_properties(&config.properties).unwrap();
         db_config.watermark_field = Some("updated_at".to_string());
-        let connector =
-            DatabaseConnector::new(config, db_config.clone(), Arc::new(NoopExecutor));
+        let connector = DatabaseConnector::new(config, db_config.clone(), Arc::new(NoopExecutor));
 
         let mut row = HashMap::new();
         row.insert("updated_at".to_string(), json!("2024-06-01T00:00:00Z"));
