@@ -300,7 +300,13 @@ impl MediaStreamStats {
 pub struct MediaStreamHandle {
     pub stream: MediaStream,
     pub cancel: CancellationToken,
-    pub stats: MediaStreamStats,
+    /// Arc-wrapped so a spawned relay task (RTSP, future RTMP/SRT/WebRTC)
+    /// can hold an independent strong reference and keep bumping atomic
+    /// counters even after the registry has dropped its handle on DELETE.
+    /// All MediaStreamStats fields are atomic / RwLock so concurrent
+    /// readers (the /api/v1/media/stats endpoint) and writers (the relay
+    /// task) compose without coarse locking.
+    pub stats: Arc<MediaStreamStats>,
 }
 
 /// Snapshot pairing an emitted stream descriptor with its current stats —
@@ -358,7 +364,7 @@ impl MediaRegistry {
         let handle = Arc::new(MediaStreamHandle {
             stream: stream.clone(),
             cancel: CancellationToken::new(),
-            stats: MediaStreamStats::default(),
+            stats: Arc::new(MediaStreamStats::default()),
         });
         guard.insert(stream.id.clone(), handle);
         Ok(stream)
@@ -526,9 +532,17 @@ fn capabilities_for(protocol: MediaProtocol, klv_metadata: bool) -> MediaCapabil
 }
 
 fn supports_in_binary_relay(protocol: MediaProtocol) -> bool {
+    // HTTP-family is relayed by re-streaming the upstream body. RTSP is
+    // relayed by a dedicated client (retina) that depacketizes RTP into
+    // Annex-B H.264. Both paths feed the same MediaStreamStats and are
+    // governed by the same cancellation + semaphore invariants.
     matches!(
         protocol,
-        MediaProtocol::Hls | MediaProtocol::HttpFlv | MediaProtocol::Mjpeg | MediaProtocol::Jpeg
+        MediaProtocol::Hls
+            | MediaProtocol::HttpFlv
+            | MediaProtocol::Mjpeg
+            | MediaProtocol::Jpeg
+            | MediaProtocol::Rtsp
     )
 }
 

@@ -43,6 +43,17 @@ rdkafka = { version = "0.36", optional = true, features = ["cmake-build"] }
 # CCSDS / TLE / SGP4 — passive satellite tracking adapter. Default-on.
 sgp4 = "2.0"
 base64 = "0.22"
+# Standalone Bytes type — used by the KLV-in-MPEG-TS adapter's public
+# channel surface. Cheap (zero deps beyond core) and a workspace-wide
+# convention for refcounted byte slices.
+bytes = "1"
+# MPEG-TS PID demux — extracts the KLV metadata PID (stream_type 0x15
+# per MISB ST 1402, or 0x06 / 0xC4 with descriptor format_id "KLVA")
+# from a STANAG 4609 ISR feed. The recovered KLV bytes are handed to
+# the existing parse_misb_st_0601 in `klv.rs`. Pure-Rust, push-based.
+# Behind the `klv-ts` feature so default builds don't pull the
+# four-cc / smptera deps; enable when ingesting drone feeds.
+mpeg2ts-reader = { version = "0.18", optional = true }
 # NATS / JetStream — durable subject-based pub/sub. Behind the `nats`
 # cargo feature. Pinned to ≥0.47 so the transitive `rustls-webpki` is
 # ≥0.103.13 — closes RUSTSEC-2026-{0049,0098,0099,0104}.
@@ -55,8 +66,10 @@ default = ["nats"]
 kafka = ["dep:rdkafka"]
 # NATS adapter — pulls async-nats client.
 nats = ["dep:async-nats"]
+# KLV-in-MPEG-TS demux for STANAG 4609 ISR feeds.
+klv-ts = ["dep:mpeg2ts-reader"]
 # Enable all optional adapters.
-all-adapters = ["kafka", "nats"]
+all-adapters = ["kafka", "nats", "klv-ts"]
 
 [dev-dependencies]
 criterion = { workspace = true }

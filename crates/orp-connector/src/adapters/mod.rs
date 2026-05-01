@@ -21,6 +21,7 @@ pub mod http_poller;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod klv;
+pub mod klv_ts;
 pub mod lorawan;
 pub mod mavlink;
 pub mod metar;

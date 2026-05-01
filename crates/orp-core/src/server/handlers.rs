@@ -1788,6 +1788,100 @@ async fn fetch_media_stream_response(
     })
 }
 
+/// Relay an RTSP source as a raw H.264 Annex-B byte stream.
+///
+/// Unlike the HTTP/MJPEG/HLS path that re-relays bytes the upstream sends
+/// over a long-lived HTTP body, RTSP requires a real client (DESCRIBE,
+/// SETUP, PLAY, RTP depacketization, NAL reassembly). The
+/// [`crate::server::rtsp::rtsp_to_h264_annexb`] helper does that under
+/// the same `CancellationToken` + `MediaStreamStats` discipline as the
+/// HTTP path, then pushes complete access units onto an mpsc channel.
+/// Here we wrap that channel into an axum body so a downstream
+/// `ffplay -f h264 -i pipe:0` can consume it.
+///
+/// Defends against the same DoS surface as `fetch_media_stream_response`:
+/// the per-stream cancel token tears the rtsp task down on DELETE; the
+/// global semaphore caps concurrency; the parent task's
+/// `RELAY_IDLE_TIMEOUT` watchdog fires if no chunk arrives in 60s.
+async fn relay_rtsp_h264_response(
+    handle: Arc<MediaStreamHandle>,
+    relay_semaphore: tokio::sync::OwnedSemaphorePermit,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let stream = &handle.stream;
+    // The (channel, channel) pair: producer side runs rtsp_to_h264_annexb
+    // and pushes Bytes; consumer side (axum body) drains and emits to
+    // the HTTP client. Capacity 8 = small buffer to absorb decoder
+    // jitter without buffering many MB of B-frames in RAM.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+    let cancel = handle.cancel.clone();
+    let stats = std::sync::Arc::clone(&handle.stats);
+    let url = stream.source_url().to_string();
+    let stream_id = stream.id.clone();
+
+    handle
+        .stats
+        .active_sessions
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    handle
+        .stats
+        .total_sessions
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let stats_close = std::sync::Arc::clone(&stats);
+    let handle_for_log = std::sync::Arc::clone(&handle);
+    tokio::spawn(async move {
+        let _permit = relay_semaphore;
+        match crate::server::rtsp::rtsp_to_h264_annexb(&url, cancel, tx, stats).await {
+            Ok(()) => {
+                tracing::info!(
+                    stream_id = %stream_id,
+                    "rtsp relay closed cleanly"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    stream_id = %stream_id,
+                    error = %e,
+                    "rtsp relay terminated"
+                );
+                stats_close
+                    .errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        handle_for_log
+            .stats
+            .active_sessions
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    // Wrap the receiver into an axum body. Send each Bytes as one frame
+    // chunk. Errors come from std::io::Error::other on the producer side
+    // (the producer never sends those — it just closes tx on error and
+    // the body sees graceful EOF).
+    let body_stream =
+        tokio_stream::wrappers::ReceiverStream::new(rx).map(|b| Ok::<Bytes, std::io::Error>(b));
+    let body = Body::from_stream(body_stream);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        // RFC 6184 — the H.264 byte stream MIME. Browsers won't render
+        // this directly; downstream is expected to be a transmux/decoder
+        // (ffmpeg/vlc/ffplay). A WHEP/HLS adapter for browsers lands in
+        // a follow-up. Cache-Control: no-store because each session is
+        // stateful and reusing a cached body breaks RTP timing.
+        .header(header::CONTENT_TYPE, "video/h264")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(body)
+        .map_err(|e| {
+            error_response(
+                "MEDIA_RELAY_ERROR",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to build rtsp relay response: {e}"),
+            )
+        })
+}
+
 /// Fetch a bounded text body (HLS playlist). Caps total bytes at
 /// [`HLS_PLAYLIST_MAX_BYTES`] before we stringify — refuses 5GB MPEGURL
 /// payloads from a hostile origin.
@@ -1903,6 +1997,18 @@ pub async fn relay_media_stream(
         )
         .into_response();
     };
+
+    // RTSP cameras can't be re-relayed as raw HTTP bodies — we have to
+    // run a real RTSP client (DESCRIBE / SETUP / PLAY / RTP depacketize).
+    // The handler returns Annex-B H.264 chunks the same way the HTTP
+    // path returns whatever the upstream sent. Browser playback requires
+    // a downstream transmux (HLS / WHEP) which is the next-tier work.
+    if handle.stream.protocol == MediaProtocol::Rtsp {
+        return match relay_rtsp_h264_response(handle, permit).await {
+            Ok(resp) => resp.into_response(),
+            Err(resp) => resp.into_response(),
+        };
+    }
 
     let target = handle.stream.source_url().to_string();
     match fetch_media_stream_response(handle, &target, permit).await {
