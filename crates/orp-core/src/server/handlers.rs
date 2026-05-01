@@ -1929,6 +1929,7 @@ mod tests {
         let auth_state = Arc::new(AuthState {
             jwt_service: None,
             api_key_service: None,
+            oidc_validator: None,
             permissive_mode: true,
         });
         let abac_engine = Arc::new(AbacEngine::default_permissive());
