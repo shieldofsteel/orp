@@ -6,6 +6,10 @@ edition.workspace = true
 [dependencies]
 orp-proto = { path = "../orp-proto" }
 orp-storage = { path = "../orp-storage" }
+# Bonus from P-audit Wave 2: route record_match through the hash-chained
+# AuditLogger trait instead of bypassing it via Storage::log_audit (which
+# would silently drop entity-match feedback from the Ed25519-signed chain).
+orp-audit = { path = "../orp-audit" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

@@ -1415,9 +1415,8 @@ mod tests {
         let csv_path = tmp.path().join("sdn.csv");
         std::fs::write(&csv_path, fixture_csv()).unwrap();
         // Note: no .sig file.
-        match SanctionsDatabase::load_signed(&csv_path, &public_key).await {
-            Ok(_) => panic!("missing sig file must fail-closed"),
-            Err(_) => (),
+        if let Ok(_db) = SanctionsDatabase::load_signed(&csv_path, &public_key).await {
+            panic!("missing sig file must fail-closed");
         }
     }
 

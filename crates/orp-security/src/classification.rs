@@ -196,6 +196,7 @@ impl Classification {
     /// 1. Subject's level ≥ resource's level AND
     /// 2. Subject holds every SCI compartment the resource carries AND
     /// 3. Subject holds the ATOMAL qualifier if the resource carries it.
+    ///
     /// Dissemination controls are advisory and not enforced by this
     /// predicate — they require their own per-control logic (NOFORN
     /// requires citizenship metadata; ORCON requires originator opt-in).
@@ -234,7 +235,7 @@ mod tests {
         assert!(Level::CTS > Level::TS);
         // NATO equivalents slot between US tiers.
         assert!(Level::NS < Level::TS);
-        assert!(Level::NS > Level::S || Level::NS == Level::S || Level::NS > Level::C);
+        assert!(Level::NS >= Level::S);
     }
 
     #[test]

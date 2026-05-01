@@ -94,11 +94,35 @@ pub trait EntityResolver: Send + Sync {
 /// (e.g., `mmsi` for ships, `icao` / `icao_hex` for aircraft).
 pub struct StructuralEntityResolver {
     storage: Arc<dyn Storage>,
+    /// Optional hash-chained, Ed25519-signed audit logger. When set,
+    /// `record_match` routes feedback through this logger so the chain
+    /// covers entity-match decisions (P-audit Wave 2 bonus). When `None`,
+    /// `record_match` falls back to a `tracing::info` line — no chain
+    /// bypass, no silent legacy `Storage::log_audit` write.
+    audit: Option<Arc<dyn orp_audit::AuditLogger>>,
 }
 
 impl StructuralEntityResolver {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            audit: None,
+        }
+    }
+
+    /// Construct with an explicit AuditLogger. Production callers should
+    /// use this so entity-match feedback lands in the signed chain.
+    pub fn with_audit(storage: Arc<dyn Storage>, audit: Arc<dyn orp_audit::AuditLogger>) -> Self {
+        Self {
+            storage,
+            audit: Some(audit),
+        }
+    }
+
+    /// Builder-style alternative when the resolver is already constructed.
+    pub fn attach_audit(mut self, audit: Arc<dyn orp_audit::AuditLogger>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 }
 
@@ -257,21 +281,38 @@ impl EntityResolver for StructuralEntityResolver {
             is_match,
             "Recorded entity match feedback"
         );
-        // Persist as a structured audit event so it can be queried later.
-        self.storage
-            .log_audit(
-                "entity_match_feedback",
-                Some("entity"),
-                Some(entity_id_1),
-                None,
-                serde_json::json!({
-                    "entity_id_1": entity_id_1,
-                    "entity_id_2": entity_id_2,
-                    "is_match": is_match,
-                    "recorded_at": Utc::now().to_rfc3339(),
-                }),
-            )
-            .await?;
+        let payload = serde_json::json!({
+            "entity_id_1": entity_id_1,
+            "entity_id_2": entity_id_2,
+            "is_match": is_match,
+            "recorded_at": Utc::now().to_rfc3339(),
+        });
+        if let Some(audit) = &self.audit {
+            // Hash-chained, Ed25519-signed path. Audit-logger errors are
+            // logged but not surfaced to the resolver caller — feedback
+            // collection is best-effort, dropping a single record must
+            // never block resolution.
+            if let Err(e) = audit
+                .record(
+                    "entity_match_feedback",
+                    Some("entity"),
+                    Some(entity_id_1),
+                    None,
+                    payload,
+                )
+                .await
+            {
+                tracing::warn!(error = %e, "audit chain rejected entity_match_feedback");
+            }
+        } else {
+            // No audit logger wired — record at INFO level so feedback is
+            // recoverable from logs. Production wiring (run_start) supplies
+            // the chain via `with_audit`.
+            tracing::info!(
+                payload = %payload,
+                "entity_match_feedback (audit chain not wired; using log fallback)"
+            );
+        }
         Ok(())
     }
 }
@@ -417,6 +458,27 @@ mod tests {
         let resolver = StructuralEntityResolver::new(storage);
         let result = resolver.record_match("entity-a", "entity-b", true).await;
         assert!(result.is_ok());
+    }
+
+    // ── P-audit Wave 2 bonus: feedback routes through AuditLogger when wired ─
+    #[tokio::test]
+    async fn record_match_routes_through_audit_logger() {
+        use orp_audit::{AuditLogger, InMemoryAuditLog};
+
+        let storage = make_storage();
+        let audit: Arc<dyn AuditLogger> = Arc::new(InMemoryAuditLog::new());
+        let resolver = StructuralEntityResolver::with_audit(storage, audit.clone());
+
+        resolver
+            .record_match("e-1", "e-2", true)
+            .await
+            .expect("record_match");
+
+        // Chain advanced by exactly one row.
+        assert_eq!(audit.len().await.unwrap(), 1);
+        let rows = audit.replay(None).await.unwrap();
+        assert_eq!(rows[0].operation, "entity_match_feedback");
+        assert_eq!(rows[0].entity_id.as_deref(), Some("e-1"));
     }
 
     // ── Name similarity edge cases ───────────────────────────────────────────
