@@ -6,6 +6,41 @@ This project follows [Semantic Versioning](https://semver.org/) and [Conventiona
 
 ---
 
+## [Unreleased] — 2026-05-01 v0.3.1 hardening + capability wave
+
+### Security — media relay (closes audit C1/C2/C3 + H1-H4)
+
+- **`MediaRegistry` now holds a `CancellationToken` per registered stream.** `DELETE /api/v1/media/streams/{id}` fires the token so any in-flight relay task tears down its upstream socket. Closes audit C1 (DELETE leaked relays).
+- **Concurrent-relay cap + idle timeout + per-session byte cap.** Each relay acquires an `OwnedSemaphorePermit` from a process-wide pool (default 256). Spawned relay task uses `tokio::select!` between cancel, 60s idle timeout, and a 4 GiB session ceiling. Slow-loris and runaway-bandwidth holes closed. Closes audit C2.
+- **IPv4-mapped IPv6 SSRF bypass.** Both `is_internal_ip` and `is_private_or_local_ip` now recurse through `Ipv6Addr::to_ipv4_mapped()` so `[::ffff:127.0.0.1]` is correctly rejected. Closes audit C3.
+- **Hardened HLS rewriter (closes H1).** Generic `URI="..."` rewrite covers every spec'd attribute-bearing tag: `EXT-X-KEY`, `EXT-X-MAP`, `EXT-X-SESSION-KEY`, `EXT-X-MEDIA`, `EXT-X-PRELOAD-HINT`, `EXT-X-PART`, `EXT-X-RENDITION-REPORT`.
+- **Same-origin segment URLs reject userinfo and 2 KiB+ references (H2).** Tampered upstream playlists can no longer smuggle credentials through ORP.
+- **Per-id media handlers run `validate_id()` (H3).** `..%2f`-decoded segments + non-`[A-Za-z0-9_-]` IDs are rejected with 400 before storage lookup.
+- **HLS playlist body capped at 1 MiB (H4).** Prevents 5 GB MPEGURL OOM.
+- **Reqwest errors no longer interpolated into client responses.** Their `Display` includes credentials; relay now logs at `warn!` and returns generic 502.
+
+### Security — Wave 2 P-audit ship-blockers
+
+- **F2 — Persistent audit signing key.** `EventSigner::load_or_generate()` reads/creates `${XDG_DATA_HOME:-$HOME/.local/share}/orp/audit-key.ed25519` (mode 0600) plus a world-readable `audit-key.pub.ed25519` sidecar. `orp start` (persistent mode) now uses it; in-memory mode keeps an ephemeral key. Signatures emitted before a restart are now verifiable after one.
+- **F8 — Sanctions list signature verification.** `SanctionsDatabase::load_signed(path, public_key)` verifies a detached Ed25519 signature (`<path>.sig`, raw 64 bytes) before parsing. A disk-writeable attacker can no longer silently delete entries.
+- **F9 — TLS backend unification.** `orp-connector` flipped `reqwest` and `tokio-tungstenite` from `native-tls` to `rustls-tls`. Drops `openssl-sys` entirely. tokio-tungstenite bumped to 0.24 → rustls 0.23 / rustls-webpki 0.103, closing RUSTSEC-2026-{0049,0098,0099,0104}.
+
+### Per-stream media observability
+
+- **`/api/v1/media/stats`** — JSON snapshot of every registered stream with live counters: `active_sessions`, `total_sessions`, `bytes_relayed`, `errors`, `last_activity`. Atomic counters on the relay hot path.
+
+### Federal-procurement scaffolding
+
+- **`crates/orp-security/src/classification.rs`** — multi-domain classification labels (`Level::U/CUI/NR/C/NC/S/NS/TS/CTS`) with full ordering, SCI compartments, dissemination controls (`NOFORN`, `REL TO …`), and NATO `ATOMAL`. CAPCO-format `banner()` for `X-Classification` headers, WS subprotocols, CLI. `Classification::dominates()` for ABAC clearance checks.
+
+### Release supply-chain
+
+- **CycloneDX 1.5 SBOM in `release.yml`.** New `attest` job runs `cargo cyclonedx`, signs each artifact + SBOM with sigstore cosign keyless OIDC (Fulcio + Rekor), and uploads to the GitHub Release. Satisfies SLSA-3 provenance for federal RFPs.
+
+### Tests
+
+- **34 new tests** across 5 areas: IPv4-mapped IPv6 SSRF (2), media relay cancel + stats + URI rewriter + 2 KiB cap + cred smuggling rejection (6), persistent audit key load/regen + 0600 perms + truncation rejection (3), sanctions sig verify across 4 attack paths (4), classification ordering / banner / dominance / serde / char validation / banner cap (10), plus 9 surrounding regression locks.
+
 ## [Unreleased] — 2026-05-01 v0.3.0 devex wave 1
 
 ### New CLI subcommand

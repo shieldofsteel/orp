@@ -19,10 +19,15 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 rocksdb = { version = "0.22", features = ["lz4"] }
 bincode = { workspace = true }
+# Ed25519 signature verification on sanctions list load — closes P-audit F8.
+# A disk-writeable attacker can otherwise silently delete entries to let
+# sanctioned vessels through; the trust root is a pinned verifying key.
+ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
+rand = { workspace = true }
 
 [[bench]]
 name = "dlq"

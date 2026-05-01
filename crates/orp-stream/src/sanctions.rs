@@ -299,6 +299,52 @@ impl SanctionsDatabase {
         }
     }
 
+    /// Load a sanctions file *and* verify its detached Ed25519 signature
+    /// against `public_key` before parsing. Refuses any input that fails
+    /// signature verification, closing the disk-writeable-attacker hole the
+    /// P-audit flagged as F8.
+    ///
+    /// The signature file is `<path>.sig` (raw 64-byte Ed25519 signature
+    /// over the *exact bytes* of the data file). Generate with:
+    /// ```text
+    /// orp gen-cert --sign-blob sanctions.csv --out sanctions.csv.sig
+    /// ```
+    /// Format-agnostic: dispatches on the data file's extension.
+    pub async fn load_signed(
+        path: impl AsRef<Path>,
+        public_key: &ed25519_dalek::VerifyingKey,
+    ) -> anyhow::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let sig_path = sig_path_for(&path);
+        let mtime = file_mtime_async(&path).await;
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("sanctions: failed to read {}: {e}", path.display()))?;
+        verify_detached_signature(&bytes, &sig_path, public_key).await?;
+        let text = String::from_utf8(bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "sanctions: file {} is not valid UTF-8 (sanctions data must be text)",
+                path.display()
+            )
+        })?;
+        let is_csv = path.extension().and_then(|e| e.to_str()) == Some("csv");
+        let entries = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<SdnEntry>> {
+            if is_csv {
+                parse_csv_text(&text)
+            } else {
+                parse_json_text(&text)
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("sanctions: signed-load parse task panicked: {e}"))??;
+        let index = SanctionsIndex::build(entries, mtime);
+        Ok(Self {
+            inner: Arc::new(RwLock::new(index)),
+            source_path: Some(path),
+            name_match_threshold: 75,
+        })
+    }
+
     // ── Reload ────────────────────────────────────────────────────────────────
 
     /// Reload from source file if the file has changed since last load.
@@ -635,6 +681,46 @@ pub fn fuzzy_score(a: &str, b: &str) -> u8 {
 /// Async mtime probe used by the load/reload paths.
 async fn file_mtime_async(path: &Path) -> Option<SystemTime> {
     tokio::fs::metadata(path).await.ok()?.modified().ok()
+}
+
+/// Default detached-signature path for a data file: `<path>.sig`.
+fn sig_path_for(data_path: &Path) -> PathBuf {
+    let mut s = data_path.as_os_str().to_owned();
+    s.push(".sig");
+    PathBuf::from(s)
+}
+
+/// Verify that `<sig_path>` is a 64-byte raw Ed25519 signature of `data`
+/// under `public_key`. Errors out before parsing so a bad-signature file
+/// never reaches the parser.
+async fn verify_detached_signature(
+    data: &[u8],
+    sig_path: &Path,
+    public_key: &ed25519_dalek::VerifyingKey,
+) -> anyhow::Result<()> {
+    use ed25519_dalek::Verifier;
+    let sig_bytes = tokio::fs::read(sig_path).await.map_err(|e| {
+        anyhow::anyhow!(
+            "sanctions: failed to read signature file {}: {e}",
+            sig_path.display()
+        )
+    })?;
+    if sig_bytes.len() != 64 {
+        anyhow::bail!(
+            "sanctions: signature file {} has length {} (expected 64 bytes)",
+            sig_path.display(),
+            sig_bytes.len()
+        );
+    }
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&sig_bytes);
+    let signature = ed25519_dalek::Signature::from_bytes(&sig);
+    public_key.verify(data, &signature).map_err(|e| {
+        anyhow::anyhow!(
+            "sanctions: signature verification FAILED for {} (refusing to load): {e}",
+            sig_path.display()
+        )
+    })
 }
 
 // ── CSV parser ────────────────────────────────────────────────────────────────
@@ -1245,5 +1331,113 @@ mod tests {
             baseline,
             contended
         );
+    }
+
+    // ── F8: Ed25519 signature verification on sanctions list load ─────────
+
+    fn fixture_csv() -> &'static str {
+        // 9-column SDN CSV row (matching parse_csv_text's expectations).
+        "name,type,programs,aliases,addresses,imo,mmsi,other_ids,listing_date\n\
+         VESSEL ALPHA,Vessel,SDN,V1,Pier 1,1234567,367123456,id1,2024-01-01\n"
+    }
+
+    #[tokio::test]
+    async fn signed_load_accepts_correct_signature() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::{rngs::OsRng, RngCore};
+
+        let mut sk = [0u8; 32];
+        OsRng.fill_bytes(&mut sk);
+        let signing_key = SigningKey::from_bytes(&sk);
+        let public_key = signing_key.verifying_key();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let csv_path = tmp.path().join("sdn.csv");
+        let csv = fixture_csv();
+        std::fs::write(&csv_path, csv).unwrap();
+
+        let signature = signing_key.sign(csv.as_bytes());
+        let sig_path = sig_path_for(&csv_path);
+        std::fs::write(&sig_path, signature.to_bytes()).unwrap();
+
+        let db = SanctionsDatabase::load_signed(&csv_path, &public_key)
+            .await
+            .expect("signed load with correct signature must succeed");
+        assert!(db.entry_count().await >= 1);
+    }
+
+    #[tokio::test]
+    async fn signed_load_rejects_tampered_data() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::{rngs::OsRng, RngCore};
+
+        let mut sk = [0u8; 32];
+        OsRng.fill_bytes(&mut sk);
+        let signing_key = SigningKey::from_bytes(&sk);
+        let public_key = signing_key.verifying_key();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let csv_path = tmp.path().join("sdn.csv");
+        let original = fixture_csv();
+        let signature = signing_key.sign(original.as_bytes());
+
+        // Write the tampered version (entry deleted) but keep the original sig.
+        std::fs::write(&csv_path, "name,type\n").unwrap();
+        let sig_path = sig_path_for(&csv_path);
+        std::fs::write(&sig_path, signature.to_bytes()).unwrap();
+
+        // SanctionsDatabase doesn't impl Debug (would risk leaking entries
+        // into logs), so match on Ok/Err rather than unwrap_err().
+        match SanctionsDatabase::load_signed(&csv_path, &public_key).await {
+            Ok(_) => {
+                panic!("tampered sanctions file must be rejected — F8 disk-writeable attacker")
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("signature verification FAILED") || msg.contains("signature"),
+                    "expected signature failure, got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_load_rejects_missing_signature_file() {
+        use ed25519_dalek::SigningKey;
+        use rand::{rngs::OsRng, RngCore};
+
+        let mut sk = [0u8; 32];
+        OsRng.fill_bytes(&mut sk);
+        let public_key = SigningKey::from_bytes(&sk).verifying_key();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let csv_path = tmp.path().join("sdn.csv");
+        std::fs::write(&csv_path, fixture_csv()).unwrap();
+        // Note: no .sig file.
+        match SanctionsDatabase::load_signed(&csv_path, &public_key).await {
+            Ok(_) => panic!("missing sig file must fail-closed"),
+            Err(_) => (),
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_load_rejects_short_signature_file() {
+        use ed25519_dalek::SigningKey;
+        use rand::{rngs::OsRng, RngCore};
+
+        let mut sk = [0u8; 32];
+        OsRng.fill_bytes(&mut sk);
+        let public_key = SigningKey::from_bytes(&sk).verifying_key();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let csv_path = tmp.path().join("sdn.csv");
+        std::fs::write(&csv_path, fixture_csv()).unwrap();
+        std::fs::write(sig_path_for(&csv_path), b"too-short").unwrap();
+
+        match SanctionsDatabase::load_signed(&csv_path, &public_key).await {
+            Ok(_) => panic!("wrong-length sig must fail-closed"),
+            Err(e) => assert!(e.to_string().contains("64 bytes")),
+        }
     }
 }

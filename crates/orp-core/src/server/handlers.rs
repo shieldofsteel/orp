@@ -1,7 +1,8 @@
 use crate::server::http::AppState;
 use crate::server::media::{
     rewrite_hls_playlist, validate_relay_target, CreateMediaStreamInput, MediaProtocol,
-    MediaRegistryError, MediaStream,
+    MediaRegistryError, MediaStream, MediaStreamHandle, HLS_PLAYLIST_MAX_BYTES, RELAY_BYTE_CAP,
+    RELAY_IDLE_TIMEOUT,
 };
 use crate::server::websocket::BroadcastEvent;
 use axum::{
@@ -10,7 +11,8 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Json, Response},
 };
-use futures_util::TryStreamExt;
+use chrono::Utc;
+use futures_util::StreamExt;
 use orp_proto::{Entity, GeoPoint, Relationship};
 use orp_security::middleware::AuthContext;
 use orp_security::url_safety::build_safe_client;
@@ -21,6 +23,7 @@ use orp_stream::monitor::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio_util::bytes::Bytes;
 
 // ---- Error Response ----
 
@@ -1583,6 +1586,9 @@ pub async fn get_media_stream(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(resp) = validate_media_id(&id) {
+        return resp.into_response();
+    }
     if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "media", &id) {
         return resp.into_response();
     }
@@ -1596,22 +1602,82 @@ pub async fn get_media_stream(
     }
 }
 
+/// Stream-id validator on the read path — catches `..%2f`-decoded segments
+/// and any other character set we don't accept on create. Identical to the
+/// rule applied in `MediaRegistry::create`, lifted here so the read handlers
+/// reject the same shapes (closes audit finding H3).
+fn validate_media_id(id: &str) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if id.is_empty() || id.len() > 96 {
+        return Err(error_response(
+            "VALIDATION_ERROR",
+            StatusCode::BAD_REQUEST,
+            "media stream id must be 1-96 characters",
+        ));
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(error_response(
+            "VALIDATION_ERROR",
+            StatusCode::BAD_REQUEST,
+            "media stream id may contain only ASCII letters, digits, '-' and '_'",
+        ));
+    }
+    Ok(())
+}
+
+pub async fn list_media_stats(
+    auth: AuthContext,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "media", "*") {
+        return resp.into_response();
+    }
+    let rows = state.media_registry.list_with_stats().await;
+    Json(serde_json::json!({
+        "data": rows,
+        "count": rows.len(),
+    }))
+    .into_response()
+}
+
+/// Build a 502 with a generic error code — the underlying reqwest error is
+/// logged but never surfaced verbatim because reqwest's `Display` includes
+/// the full URL with credentials when DNS or connect fails.
+fn upstream_error(
+    stream_id: &str,
+    ctx: &str,
+    err: impl std::fmt::Display,
+) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::warn!(stream_id = %stream_id, error = %err, "media relay {ctx}");
+    error_response(
+        "MEDIA_RELAY_UPSTREAM",
+        StatusCode::BAD_GATEWAY,
+        &format!("media upstream {ctx}"),
+    )
+}
+
 async fn fetch_media_stream_response(
-    stream: &MediaStream,
+    handle: Arc<MediaStreamHandle>,
     target_url: &str,
+    relay_semaphore: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let stream = &handle.stream;
     validate_relay_target(stream, target_url).map_err(media_relay_error)?;
     let (client, _) = build_safe_client(target_url, stream.allow_private_network)
         .map_err(|e| error_response("MEDIA_RELAY_BLOCKED", StatusCode::BAD_REQUEST, &e))?;
-    let upstream = client.get(target_url).send().await.map_err(|e| {
-        error_response(
-            "MEDIA_RELAY_UPSTREAM",
-            StatusCode::BAD_GATEWAY,
-            &format!("media upstream request failed: {e}"),
-        )
-    })?;
+    let upstream = client
+        .get(target_url)
+        .send()
+        .await
+        .map_err(|e| upstream_error(&stream.id, "request failed", e))?;
     let status = upstream.status();
     if !status.is_success() {
+        handle
+            .stats
+            .errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Err(error_response(
             "MEDIA_RELAY_UPSTREAM",
             StatusCode::BAD_GATEWAY,
@@ -1621,12 +1687,91 @@ async fn fetch_media_stream_response(
 
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     let cache_control = upstream.headers().get(header::CACHE_CONTROL).cloned();
-    let body = Body::from_stream(
-        upstream
-            .bytes_stream()
-            .map_err(|e| std::io::Error::other(format!("media upstream stream failed: {e}"))),
-    );
 
+    // Channel of size 8: gives the slow-downstream-fast-upstream pair a
+    // tiny buffer for prefetch but lets backpressure propagate (when the
+    // channel is full the relay task awaits the downstream client before
+    // pulling the next chunk from the upstream socket).
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    let cancel = handle.cancel.clone();
+    let handle_for_task = Arc::clone(&handle);
+
+    handle
+        .stats
+        .active_sessions
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    handle
+        .stats
+        .total_sessions
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    tokio::spawn(async move {
+        // Permit is released when this task completes — i.e. when upstream
+        // EOFs, the client disconnects, the cancel token fires (DELETE), or
+        // any relay-side cap kicks in.
+        let _permit = relay_semaphore;
+        let stats = &handle_for_task.stats;
+        let mut total_bytes: u64 = 0;
+        let mut upstream_stream = upstream.bytes_stream();
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    // DELETE on the parent stream — drop everything.
+                    break;
+                }
+                next = tokio::time::timeout(RELAY_IDLE_TIMEOUT, upstream_stream.next()) => {
+                    match next {
+                        Err(_elapsed) => {
+                            stats.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = tx
+                                .send(Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "media relay idle timeout",
+                                )))
+                                .await;
+                            break;
+                        }
+                        Ok(None) => break, // upstream EOF — clean tear-down
+                        Ok(Some(Err(_e))) => {
+                            stats.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = tx
+                                .send(Err(std::io::Error::other("media upstream stream error")))
+                                .await;
+                            break;
+                        }
+                        Ok(Some(Ok(chunk))) => {
+                            let n = chunk.len() as u64;
+                            total_bytes = total_bytes.saturating_add(n);
+                            stats.bytes_relayed.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                            *stats.last_activity.write().await = Some(Utc::now());
+                            if total_bytes > RELAY_BYTE_CAP {
+                                stats.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let _ = tx
+                                    .send(Err(std::io::Error::other(
+                                        "media relay session byte cap exceeded",
+                                    )))
+                                    .await;
+                                break;
+                            }
+                            // tx.send fails iff downstream went away;
+                            // exit cleanly without bumping `errors`.
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stats
+            .active_sessions
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     let mut builder = Response::builder().status(status);
     if let Some(value) = content_type {
         builder = builder.header(header::CONTENT_TYPE, value);
@@ -1643,33 +1788,72 @@ async fn fetch_media_stream_response(
     })
 }
 
+/// Fetch a bounded text body (HLS playlist). Caps total bytes at
+/// [`HLS_PLAYLIST_MAX_BYTES`] before we stringify — refuses 5GB MPEGURL
+/// payloads from a hostile origin.
 async fn fetch_media_text(
-    stream: &MediaStream,
+    handle: &MediaStreamHandle,
     target_url: &str,
 ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let stream = &handle.stream;
     validate_relay_target(stream, target_url).map_err(media_relay_error)?;
     let (client, _) = build_safe_client(target_url, stream.allow_private_network)
         .map_err(|e| error_response("MEDIA_RELAY_BLOCKED", StatusCode::BAD_REQUEST, &e))?;
-    let upstream = client.get(target_url).send().await.map_err(|e| {
-        error_response(
-            "MEDIA_RELAY_UPSTREAM",
-            StatusCode::BAD_GATEWAY,
-            &format!("media upstream request failed: {e}"),
-        )
-    })?;
+    let upstream = client
+        .get(target_url)
+        .send()
+        .await
+        .map_err(|e| upstream_error(&stream.id, "request failed", e))?;
     let status = upstream.status();
     if !status.is_success() {
+        handle
+            .stats
+            .errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Err(error_response(
             "MEDIA_RELAY_UPSTREAM",
             StatusCode::BAD_GATEWAY,
             &format!("media upstream returned HTTP {}", status.as_u16()),
         ));
     }
-    upstream.text().await.map_err(|e| {
+
+    // Reject hostile Content-Length up front when present.
+    if let Some(len) = upstream.content_length() {
+        if len as usize > HLS_PLAYLIST_MAX_BYTES {
+            handle
+                .stats
+                .errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(error_response(
+                "MEDIA_RELAY_BLOCKED",
+                StatusCode::BAD_REQUEST,
+                "HLS playlist exceeds size ceiling",
+            ));
+        }
+    }
+
+    let mut accumulator = Vec::with_capacity(8 * 1024);
+    let mut stream_iter = upstream.bytes_stream();
+    while let Some(chunk) = stream_iter.next().await {
+        let chunk = chunk.map_err(|e| upstream_error(&stream.id, "stream error", e))?;
+        if accumulator.len().saturating_add(chunk.len()) > HLS_PLAYLIST_MAX_BYTES {
+            handle
+                .stats
+                .errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(error_response(
+                "MEDIA_RELAY_BLOCKED",
+                StatusCode::BAD_REQUEST,
+                "HLS playlist exceeds size ceiling",
+            ));
+        }
+        accumulator.extend_from_slice(&chunk);
+    }
+    String::from_utf8(accumulator).map_err(|_| {
         error_response(
             "MEDIA_RELAY_UPSTREAM",
             StatusCode::BAD_GATEWAY,
-            &format!("media upstream text decode failed: {e}"),
+            "HLS playlist body was not valid UTF-8",
         )
     })
 }
@@ -1691,29 +1875,45 @@ pub async fn relay_media_stream(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(resp) = validate_media_id(&id) {
+        return resp.into_response();
+    }
     if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "media", &id) {
         return resp.into_response();
     }
 
-    let Some(stream) = state.media_registry.get(&id).await else {
+    let Some(handle) = state.media_registry.get_handle(&id).await else {
         return media_registry_error(MediaRegistryError::NotFound(format!(
             "media stream '{id}' not found"
         )))
         .into_response();
     };
 
-    if stream.protocol == MediaProtocol::Hls {
-        return relay_hls_playlist_for_stream(&stream).await.into_response();
+    if handle.stream.protocol == MediaProtocol::Hls {
+        return relay_hls_playlist_for_stream(handle.as_ref())
+            .await
+            .into_response();
     }
 
-    match fetch_media_stream_response(&stream, stream.source_url()).await {
+    let Ok(permit) = state.media_registry.relay_semaphore().try_acquire_owned() else {
+        return error_response(
+            "MEDIA_RELAY_BUSY",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "media relay capacity exhausted; retry after active sessions release",
+        )
+        .into_response();
+    };
+
+    let target = handle.stream.source_url().to_string();
+    match fetch_media_stream_response(handle, &target, permit).await {
         Ok(resp) => resp.into_response(),
         Err(resp) => resp.into_response(),
     }
 }
 
-async fn relay_hls_playlist_for_stream(stream: &MediaStream) -> Response {
-    match fetch_media_text(stream, stream.source_url())
+async fn relay_hls_playlist_for_stream(handle: &MediaStreamHandle) -> Response {
+    let stream = &handle.stream;
+    match fetch_media_text(handle, stream.source_url())
         .await
         .and_then(|text| {
             rewrite_hls_playlist(&stream.id, stream.source_url(), &text).map_err(media_relay_error)
@@ -1733,18 +1933,21 @@ pub async fn relay_hls_playlist(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(resp) = validate_media_id(&id) {
+        return resp.into_response();
+    }
     if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "media", &id) {
         return resp.into_response();
     }
 
-    let Some(stream) = state.media_registry.get(&id).await else {
+    let Some(handle) = state.media_registry.get_handle(&id).await else {
         return media_registry_error(MediaRegistryError::NotFound(format!(
             "media stream '{id}' not found"
         )))
         .into_response();
     };
 
-    if stream.protocol != MediaProtocol::Hls {
+    if handle.stream.protocol != MediaProtocol::Hls {
         return error_response(
             "MEDIA_RELAY_UNSUPPORTED",
             StatusCode::BAD_REQUEST,
@@ -1753,7 +1956,9 @@ pub async fn relay_hls_playlist(
         .into_response();
     }
 
-    relay_hls_playlist_for_stream(&stream).await.into_response()
+    relay_hls_playlist_for_stream(handle.as_ref())
+        .await
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1767,18 +1972,41 @@ pub async fn relay_hls_asset(
     Path(id): Path<String>,
     Query(params): Query<HlsFetchParams>,
 ) -> impl IntoResponse {
+    if let Err(resp) = validate_media_id(&id) {
+        return resp.into_response();
+    }
     if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:read", "media", &id) {
         return resp.into_response();
     }
 
-    let Some(stream) = state.media_registry.get(&id).await else {
+    // Reject obviously hostile asset URLs before parsing so the parser
+    // doesn't waste cycles on a megabyte string.
+    if params.url.len() > 2048 {
+        return error_response(
+            "MEDIA_RELAY_BLOCKED",
+            StatusCode::BAD_REQUEST,
+            "asset url exceeds 2 KiB",
+        )
+        .into_response();
+    }
+
+    let Some(handle) = state.media_registry.get_handle(&id).await else {
         return media_registry_error(MediaRegistryError::NotFound(format!(
             "media stream '{id}' not found"
         )))
         .into_response();
     };
 
-    match fetch_media_stream_response(&stream, &params.url).await {
+    let Ok(permit) = state.media_registry.relay_semaphore().try_acquire_owned() else {
+        return error_response(
+            "MEDIA_RELAY_BUSY",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "media relay capacity exhausted; retry after active sessions release",
+        )
+        .into_response();
+    };
+
+    match fetch_media_stream_response(handle, &params.url, permit).await {
         Ok(resp) => resp.into_response(),
         Err(resp) => resp.into_response(),
     }
@@ -1789,6 +2017,9 @@ pub async fn delete_media_stream(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(resp) = validate_media_id(&id) {
+        return resp.into_response();
+    }
     if let Err(resp) = check_abac(&state.abac_engine, &auth, "entities:write", "media", &id) {
         return resp.into_response();
     }

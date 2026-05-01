@@ -43,6 +43,7 @@
 
 pub mod abac;
 pub mod api_keys;
+pub mod classification;
 pub mod jwt;
 pub mod keystore;
 pub mod middleware;
@@ -56,6 +57,8 @@ pub use abac::{
     AbacEngine, AbacError, AbacPolicy, EvaluationContext, EvaluationResult, Permission,
     PolicyDecision, PolicyEffect, PrincipalSpec, Resource, ResourceSpec, Subject,
 };
+
+pub use classification::{Classification, ClassificationError, Level as ClassificationLevel};
 
 pub use api_keys::{
     generate_bootstrap_key, ApiKeyError, ApiKeyRecord, ApiKeyService, ApiKeyValidationResult,

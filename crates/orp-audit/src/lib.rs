@@ -20,7 +20,7 @@ pub mod logger;
 pub mod persistent;
 pub mod traits;
 
-pub use crypto::{compute_hash, EventSigner};
+pub use crypto::{compute_hash, default_audit_key_path, EventSigner};
 pub use entry::{canonical_preimage, compute_content_hash, AuditEntry, GENESIS_PREV_HASH};
 pub use logger::{AuditLog, InMemoryAuditLog};
 pub use persistent::{export_jsonl, ExportLine, PersistentAuditLog};

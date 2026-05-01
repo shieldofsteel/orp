@@ -243,6 +243,79 @@ jobs:
 
           echo "OK"
 
+  # ── SBOM + cosign keyless signing ──────────────────────────────────────────
+  attest:
+    name: SBOM + sign artifacts
+    runs-on: ubuntu-latest
+    needs: [build, build-frontend]
+    permissions:
+      contents: read
+      id-token: write   # Sigstore keyless OIDC
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked --version ^0.5
+
+      - name: Generate CycloneDX 1.5 SBOM
+        run: |
+          cargo cyclonedx --format json --spec-version 1.5 --override-filename bom.cdx
+          # Move the generated SBOM next to release artifacts
+          find . -name 'bom.cdx.json' -not -path './target/*' | head -1 | xargs -I{} cp {} ./bom.cdx.json
+          ls -lh bom.cdx.json
+          # Sanity: file is valid JSON and has components
+          python3 -c "import json,sys; d=json.load(open('bom.cdx.json')); assert d.get('bomFormat')=='CycloneDX'; print(f'SBOM components: {len(d.get(\"components\",[]))}')"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Stage artifacts for signing
+        run: |
+          mkdir -p signed
+          find artifacts -name '*.tar.gz' -exec cp {} signed/ \;
+          cp bom.cdx.json signed/
+          cd signed
+          sha256sum *.tar.gz bom.cdx.json > checksums.sha256
+          ls -lh
+
+      - uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Cosign keyless-sign tarballs + SBOM
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cd signed
+          for f in *.tar.gz bom.cdx.json checksums.sha256; do
+            cosign sign-blob --yes \
+              --bundle "${f}.cosign.bundle" \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.pem" \
+              "$f"
+          done
+          ls -lh
+
+      - name: Upload SBOM + signatures
+        uses: actions/upload-artifact@v4
+        with:
+          name: attest-bundle
+          path: |
+            signed/bom.cdx.json
+            signed/checksums.sha256
+            signed/*.sig
+            signed/*.pem
+            signed/*.cosign.bundle
+          retention-days: 7
+
   # ── Build + push Docker image ───────────────────────────────────────────────
   docker:
     name: Docker build & push
@@ -291,7 +364,7 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build, smoke, build-frontend, docker]
+    needs: [build, smoke, build-frontend, docker, attest]
     steps:
       - uses: actions/checkout@v4
 
@@ -342,6 +415,10 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/checksums.sha256
+            artifacts/attest-bundle/bom.cdx.json
+            artifacts/attest-bundle/*.sig
+            artifacts/attest-bundle/*.pem
+            artifacts/attest-bundle/*.cosign.bundle
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

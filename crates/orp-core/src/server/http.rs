@@ -460,6 +460,10 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         // Media streams
         .route("/api/v1/media/streams", get(handlers::list_media_streams))
         .route("/api/v1/media/streams", post(handlers::create_media_stream))
+        // Per-stream observability — sessions, bytes relayed, errors, last
+        // upstream activity. Surfaces the C2 (slow-loris) caps + the C1
+        // cancel-on-DELETE path.
+        .route("/api/v1/media/stats", get(handlers::list_media_stats))
         .route(
             "/api/v1/media/streams/{id}",
             get(handlers::get_media_stream),

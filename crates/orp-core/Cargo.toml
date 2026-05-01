@@ -36,6 +36,12 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "blocking", "rustls-tls", "stream"], default-features = false }
 futures-util = "0.3"
+# CancellationToken (relay teardown on DELETE) and StreamReader / ReaderStream
+# (wrap upstream byte streams under cancel + idle-timeout) for the media relay.
+tokio-util = { version = "0.7", default-features = false, features = ["io", "rt"] }
+# ReceiverStream — wraps the relay-task mpsc::Receiver into a Stream so
+# axum::Body::from_stream can drive it under cancel + idle-timeout + byte cap.
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 base64 = "0.22"
 ed25519-dalek = { workspace = true }
 duckdb = { version = "1.2", features = ["bundled"] }

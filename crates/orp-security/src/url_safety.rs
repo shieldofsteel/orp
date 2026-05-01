@@ -89,6 +89,12 @@ pub fn is_internal_ip(ip: &IpAddr) -> bool {
                 || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
         }
         IpAddr::V6(v6) => {
+            // IPv4-mapped IPv6 (::ffff:a.b.c.d) — recurse on the v4 form.
+            // Without this, http://[::ffff:7f00:1]/ resolves locally and
+            // bypasses every v4-only filter above.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_internal_ip(&IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_unique_local()
@@ -393,6 +399,23 @@ mod tests {
     #[test]
     fn blocks_ipv6_unspecified() {
         assert!(is_url_safe("http://[::]/", false).is_err());
+    }
+
+    // ── Regression: IPv4-mapped IPv6 must not bypass v4 filters ──────────
+    #[test]
+    fn blocks_ipv4_mapped_ipv6_loopback() {
+        // ::ffff:127.0.0.1 == ::ffff:7f00:1 — without to_ipv4_mapped() recursion
+        // this slipped through is_loopback() (which is v6-only) and SSRF guards.
+        assert!(is_url_safe("http://[::ffff:7f00:1]/", false).is_err());
+        assert!(is_url_safe("http://[::ffff:127.0.0.1]/", false).is_err());
+    }
+
+    #[test]
+    fn blocks_ipv4_mapped_ipv6_rfc1918() {
+        // ::ffff:10.0.0.5 must inherit the v4 RFC1918 block.
+        assert!(is_url_safe("http://[::ffff:10.0.0.5]/", false).is_err());
+        assert!(is_url_safe("http://[::ffff:192.168.1.1]/", false).is_err());
+        assert!(is_url_safe("http://[::ffff:169.254.169.254]/", false).is_err());
     }
 
     // ── DNS failure must fail-closed (Err), never panic ───────────────────

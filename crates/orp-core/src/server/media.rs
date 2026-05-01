@@ -3,7 +3,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::{RwLock, Semaphore};
+use tokio_util::sync::CancellationToken;
+
+/// Default ceiling on simultaneously-active media relay sessions across the
+/// whole process. Tunable via [`MediaRegistry::with_max_concurrent_relays`].
+/// Each active session holds one upstream TCP connection and one downstream
+/// hyper Body; 256 leaves headroom on a 1024-fd default ulimit.
+pub const DEFAULT_MAX_CONCURRENT_RELAYS: usize = 256;
+
+/// Per-session hard byte ceiling. A legitimate camera tops out at a few
+/// hundred kbps; 4 GiB is well past any sane single-viewer session.
+pub const RELAY_BYTE_CAP: u64 = 4 * 1024 * 1024 * 1024;
+
+/// If no upstream chunk arrives within this window the relay is torn down
+/// and the downstream client gets a `TimedOut` error frame. This is what
+/// closes the slow-loris hole the audit flagged as C2.
+pub const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// HLS playlist text bodies are bounded — 1 MiB is far above any real master
+/// or media playlist and stops a hostile origin from OOMing the process via
+/// `application/vnd.apple.mpegurl` content-type bait.
+pub const HLS_PLAYLIST_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -234,14 +257,90 @@ impl std::fmt::Display for MediaRegistryError {
 
 impl std::error::Error for MediaRegistryError {}
 
-#[derive(Default)]
+/// Per-stream observability counters. All Atomic so the relay hot path
+/// never grabs a lock; reads via `snapshot()` for the `/api/v1/media/stats`
+/// endpoint. `last_activity` lives behind an `RwLock<Option<…>>` because
+/// `DateTime<Utc>` isn't `Atomic`-friendly and we read it once per scrape.
+#[derive(Default, Debug)]
+pub struct MediaStreamStats {
+    pub active_sessions: AtomicU64,
+    pub total_sessions: AtomicU64,
+    pub bytes_relayed: AtomicU64,
+    pub errors: AtomicU64,
+    pub last_activity: RwLock<Option<DateTime<Utc>>>,
+}
+
+/// Read-only snapshot of [`MediaStreamStats`] suitable for JSON emission.
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaStreamStatsSnapshot {
+    pub active_sessions: u64,
+    pub total_sessions: u64,
+    pub bytes_relayed: u64,
+    pub errors: u64,
+    pub last_activity: Option<DateTime<Utc>>,
+}
+
+impl MediaStreamStats {
+    pub async fn snapshot(&self) -> MediaStreamStatsSnapshot {
+        MediaStreamStatsSnapshot {
+            active_sessions: self.active_sessions.load(Ordering::Relaxed),
+            total_sessions: self.total_sessions.load(Ordering::Relaxed),
+            bytes_relayed: self.bytes_relayed.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            last_activity: *self.last_activity.read().await,
+        }
+    }
+}
+
+/// Owning handle for an in-flight media stream — couples the descriptor, a
+/// process-lifetime cancellation token, and the live counter set. Relay
+/// tasks hold an `Arc<MediaStreamHandle>` so DELETE can cancel them by
+/// firing the token; the registry drops its reference, the relay task drops
+/// its reference, and Rust naturally collects the handle.
+pub struct MediaStreamHandle {
+    pub stream: MediaStream,
+    pub cancel: CancellationToken,
+    pub stats: MediaStreamStats,
+}
+
+/// Snapshot pairing an emitted stream descriptor with its current stats —
+/// the exact JSON shape returned by `/api/v1/media/stats`.
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaStreamWithStats {
+    pub stream: MediaStream,
+    pub stats: MediaStreamStatsSnapshot,
+}
+
 pub struct MediaRegistry {
-    streams: RwLock<HashMap<String, MediaStream>>,
+    streams: RwLock<HashMap<String, Arc<MediaStreamHandle>>>,
+    relay_semaphore: Arc<Semaphore>,
+}
+
+impl Default for MediaRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MediaRegistry {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_concurrent_relays(DEFAULT_MAX_CONCURRENT_RELAYS)
+    }
+
+    pub fn with_max_concurrent_relays(max: usize) -> Self {
+        Self {
+            streams: RwLock::new(HashMap::new()),
+            // Semaphore::new clamps to MAX permits internally; passing 0
+            // would lock the relay path entirely, so guard against it.
+            relay_semaphore: Arc::new(Semaphore::new(max.max(1))),
+        }
+    }
+
+    /// Shared semaphore for outbound relay sessions. The handler acquires a
+    /// permit before connecting upstream and holds it for the relay task's
+    /// lifetime; an exhausted pool returns 503 instead of stacking sockets.
+    pub fn relay_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.relay_semaphore)
     }
 
     pub async fn create(
@@ -256,26 +355,68 @@ impl MediaRegistry {
                 stream.id
             )));
         }
-        guard.insert(stream.id.clone(), stream.clone());
+        let handle = Arc::new(MediaStreamHandle {
+            stream: stream.clone(),
+            cancel: CancellationToken::new(),
+            stats: MediaStreamStats::default(),
+        });
+        guard.insert(stream.id.clone(), handle);
         Ok(stream)
     }
 
     pub async fn list(&self) -> Vec<MediaStream> {
-        let mut streams: Vec<_> = self.streams.read().await.values().cloned().collect();
+        let mut streams: Vec<_> = self
+            .streams
+            .read()
+            .await
+            .values()
+            .map(|handle| handle.stream.clone())
+            .collect();
         streams.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         streams
     }
 
+    pub async fn list_with_stats(&self) -> Vec<MediaStreamWithStats> {
+        let handles: Vec<Arc<MediaStreamHandle>> =
+            self.streams.read().await.values().cloned().collect();
+        let mut rows: Vec<MediaStreamWithStats> = Vec::with_capacity(handles.len());
+        for handle in handles {
+            rows.push(MediaStreamWithStats {
+                stream: handle.stream.clone(),
+                stats: handle.stats.snapshot().await,
+            });
+        }
+        rows.sort_by(|a, b| {
+            a.stream
+                .name
+                .cmp(&b.stream.name)
+                .then(a.stream.id.cmp(&b.stream.id))
+        });
+        rows
+    }
+
     pub async fn get(&self, id: &str) -> Option<MediaStream> {
+        self.streams
+            .read()
+            .await
+            .get(id)
+            .map(|handle| handle.stream.clone())
+    }
+
+    pub async fn get_handle(&self, id: &str) -> Option<Arc<MediaStreamHandle>> {
         self.streams.read().await.get(id).cloned()
     }
 
     pub async fn delete(&self, id: &str) -> Result<MediaStream, MediaRegistryError> {
-        self.streams
-            .write()
-            .await
-            .remove(id)
-            .ok_or_else(|| MediaRegistryError::NotFound(format!("media stream '{id}' not found")))
+        let removed = self.streams.write().await.remove(id).ok_or_else(|| {
+            MediaRegistryError::NotFound(format!("media stream '{id}' not found"))
+        })?;
+        // Fire the cancel token so any in-flight relay task tears down its
+        // upstream socket and stops pushing chunks into its mpsc channel.
+        // Without this, DELETE leaks the relay until the upstream EOFs or
+        // the downstream client disconnects (the C1 finding from audit).
+        removed.cancel.cancel();
+        Ok(removed.stream.clone())
     }
 }
 
@@ -443,6 +584,11 @@ fn is_private_or_local_ip(ip: IpAddr) -> bool {
                 || v4.is_unspecified()
         }
         IpAddr::V6(v6) => {
+            // IPv4-mapped IPv6 (::ffff:a.b.c.d) recurses on the v4 form so
+            // a literal `[::ffff:127.0.0.1]` source URL is gated correctly.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_or_local_ip(IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_multicast()
                 || v6.is_unspecified()
@@ -470,6 +616,14 @@ pub fn resolve_same_origin_media_url(
     base_url: &str,
     reference: &str,
 ) -> Result<String, MediaRegistryError> {
+    // Reject reference inputs that are pathologically large before they
+    // reach the URL parser — covers the "megabyte ?url= query" class.
+    if reference.len() > 2048 {
+        return Err(MediaRegistryError::Validation(
+            "media playlist reference exceeds 2 KiB".to_string(),
+        ));
+    }
+
     let base = reqwest::Url::parse(base_url).map_err(|e| {
         MediaRegistryError::Validation(format!("media source_url is not a valid URL: {e}"))
     })?;
@@ -480,6 +634,17 @@ pub fn resolve_same_origin_media_url(
     if !matches!(resolved.scheme(), "http" | "https") {
         return Err(MediaRegistryError::Validation(
             "media relay only supports http/https HLS segment URLs".to_string(),
+        ));
+    }
+
+    // The base URL legitimately holds camera credentials (e.g. an HLS
+    // origin behind basic auth). The *reference* is attacker-controllable
+    // playlist content — a tampered upstream playlist could smuggle
+    // userinfo to coerce ORP into mailing the credentials downstream.
+    // Reject any userinfo on the resolved reference outright.
+    if !resolved.username().is_empty() || resolved.password().is_some() {
+        return Err(MediaRegistryError::Validation(
+            "media playlist reference may not contain credentials".to_string(),
         ));
     }
 
@@ -500,6 +665,11 @@ pub fn rewrite_hls_playlist(
     source_url: &str,
     playlist: &str,
 ) -> Result<String, MediaRegistryError> {
+    if playlist.len() > HLS_PLAYLIST_MAX_BYTES {
+        return Err(MediaRegistryError::Validation(format!(
+            "HLS playlist exceeds {HLS_PLAYLIST_MAX_BYTES} byte ceiling"
+        )));
+    }
     let mut out = String::with_capacity(playlist.len() + 256);
     for line in playlist.lines() {
         let trimmed = line.trim();
@@ -508,14 +678,14 @@ pub fn rewrite_hls_playlist(
             continue;
         }
 
-        if trimmed.starts_with("#EXT-X-KEY") || trimmed.starts_with("#EXT-X-MAP") {
-            out.push_str(&rewrite_hls_uri_attribute(stream_id, source_url, line)?);
-            out.push('\n');
-            continue;
-        }
-
         if trimmed.starts_with('#') {
-            out.push_str(line);
+            // Any HLS tag may carry one or more `URI="..."` attributes —
+            // EXT-X-KEY, EXT-X-MAP, EXT-X-MEDIA, EXT-X-I-FRAME-STREAM-INF,
+            // EXT-X-SESSION-KEY, EXT-X-PART, EXT-X-PRELOAD-HINT,
+            // EXT-X-RENDITION-REPORT, etc. (RFC 8216 §4.4 and HLS LL-HLS
+            // additions). Rewriting every URI= attribute generically means
+            // we don't have to chase the spec for new tag names.
+            out.push_str(&rewrite_hls_uri_attributes(stream_id, source_url, line)?);
             out.push('\n');
             continue;
         }
@@ -530,30 +700,37 @@ pub fn rewrite_hls_playlist(
     Ok(out)
 }
 
-fn rewrite_hls_uri_attribute(
+fn rewrite_hls_uri_attributes(
     stream_id: &str,
     source_url: &str,
     line: &str,
 ) -> Result<String, MediaRegistryError> {
-    let Some(uri_start) = line.find("URI=\"") else {
-        return Ok(line.to_string());
-    };
-    let value_start = uri_start + 5;
-    let Some(value_end_rel) = line[value_start..].find('"') else {
-        return Ok(line.to_string());
-    };
-    let value_end = value_start + value_end_rel;
-    let resolved = resolve_same_origin_media_url(source_url, &line[value_start..value_end])?;
-    let relay_uri = format!(
-        "/api/v1/media/streams/{stream_id}/hls/fetch?url={}",
-        percent_encode_component(&resolved)
-    );
-    Ok(format!(
-        "{}{}{}",
-        &line[..value_start],
-        relay_uri,
-        &line[value_end..]
-    ))
+    let mut out = String::with_capacity(line.len() + 64);
+    let mut cursor = 0;
+    // Iterate `URI="..."` occurrences left-to-right so we cover any tag
+    // that legally contains more than one (rare but spec-allowed). After
+    // each rewrite we advance past the closing quote — never re-scanning
+    // the rewritten relay URI itself, so we can't recurse into our own
+    // output.
+    while let Some(rel) = line[cursor..].find("URI=\"") {
+        let attr_start = cursor + rel;
+        let value_start = attr_start + 5;
+        let Some(rel_end) = line[value_start..].find('"') else {
+            // Malformed attribute — bail out and leave the line untouched.
+            return Ok(line.to_string());
+        };
+        let value_end = value_start + rel_end;
+        let resolved = resolve_same_origin_media_url(source_url, &line[value_start..value_end])?;
+        let relay_uri = format!(
+            "/api/v1/media/streams/{stream_id}/hls/fetch?url={}",
+            percent_encode_component(&resolved)
+        );
+        out.push_str(&line[cursor..value_start]);
+        out.push_str(&relay_uri);
+        cursor = value_end;
+    }
+    out.push_str(&line[cursor..]);
+    Ok(out)
 }
 
 pub fn validate_relay_target(
@@ -675,6 +852,139 @@ mod tests {
         assert!(err
             .to_string()
             .contains("outside the registered source origin"));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_loopback_requires_opt_in() {
+        // Regression: ::ffff:127.0.0.1 was previously accepted at register-time
+        // because the v6 branch of is_private_or_local_ip didn't recurse on
+        // to_ipv4_mapped(). Now the LAN gate fires.
+        let mut req = input("http://[::ffff:127.0.0.1]/snapshot.jpg");
+        req.allow_private_network = false;
+        let err = build_stream(req).unwrap_err();
+        assert!(err.to_string().contains("allow_private_network=true"));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_rfc1918_requires_opt_in() {
+        let mut req = input("http://[::ffff:10.0.0.5]/snapshot.jpg");
+        req.allow_private_network = false;
+        let err = build_stream(req).unwrap_err();
+        assert!(err.to_string().contains("allow_private_network=true"));
+    }
+
+    #[test]
+    fn hls_rewriter_handles_session_key_and_preload_hint() {
+        // Audit finding H1: the previous rewriter only handled EXT-X-KEY and
+        // EXT-X-MAP. EXT-X-SESSION-KEY (whole-presentation DRM key),
+        // EXT-X-PRELOAD-HINT (LL-HLS), and EXT-X-RENDITION-REPORT all carry
+        // URI=, and the generic rewriter must rewrite all of them.
+        let playlist = "\
+#EXTM3U
+#EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"sk.bin\"
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part-0.ts\"
+#EXT-X-RENDITION-REPORT:URI=\"rendition-1.m3u8\"
+#EXT-X-MEDIA:TYPE=AUDIO,URI=\"audio.m3u8\",GROUP-ID=\"a1\",NAME=\"en\"
+seg-0.ts
+";
+        let rewritten = rewrite_hls_playlist(
+            "cam-1",
+            "https://media.example.test/live/index.m3u8",
+            playlist,
+        )
+        .unwrap();
+        for ref_name in ["sk.bin", "part-0.ts", "rendition-1.m3u8", "audio.m3u8"] {
+            let pct =
+                percent_encode_component(&format!("https://media.example.test/live/{ref_name}"));
+            assert!(
+                rewritten.contains(&format!("?url={pct}")),
+                "missing rewrite for {ref_name} in:\n{rewritten}"
+            );
+        }
+        // The segment-line URL also gets rewritten through the same
+        // /hls/fetch route — the percent-encoded form contains the seg name
+        // exactly once (no recursion through the relay rewrite).
+        let seg_pct = percent_encode_component("https://media.example.test/live/seg-0.ts");
+        assert_eq!(
+            rewritten.matches(&seg_pct).count(),
+            1,
+            "expected exactly one rewritten segment URL"
+        );
+        assert!(rewritten.contains("/api/v1/media/streams/cam-1/hls/fetch?url="));
+    }
+
+    #[test]
+    fn hls_rewriter_rejects_credential_smuggling_on_segment() {
+        // H2: a hostile playlist could ship a same-host URL with userinfo
+        // to coerce ORP into mailing the creds downstream. The resolver
+        // refuses any reference that carries username/password.
+        let err = rewrite_hls_playlist(
+            "cam-1",
+            "https://media.example.test/live/index.m3u8",
+            "#EXTM3U\nhttps://attacker:pw@media.example.test/seg.ts\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("credentials"),
+            "expected credential rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn hls_rewriter_rejects_2kib_reference() {
+        let big = format!("seg-{}.ts", "x".repeat(3000));
+        let err = rewrite_hls_playlist(
+            "cam-1",
+            "https://media.example.test/live/index.m3u8",
+            &format!("#EXTM3U\n{big}\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("2 KiB"));
+    }
+
+    #[tokio::test]
+    async fn registry_default_uses_default_max_relays() {
+        let registry = MediaRegistry::new();
+        assert_eq!(
+            registry.relay_semaphore().available_permits(),
+            DEFAULT_MAX_CONCURRENT_RELAYS
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_fires_cancel_token_for_in_flight_relay() {
+        // Audit finding C1: DELETE used to leak in-flight relay tasks.
+        // Now the registry holds a CancellationToken on each handle, and
+        // delete() fires it. A relay-side task observing the token via
+        // `cancel.cancelled().await` will tear down its upstream socket.
+        let registry = MediaRegistry::new();
+        registry
+            .create(input("https://example.com/snapshot.jpg"))
+            .await
+            .unwrap();
+        let handle = registry.get_handle("cam-1").await.unwrap();
+        assert!(!handle.cancel.is_cancelled());
+        registry.delete("cam-1").await.unwrap();
+        // Token clone held by the relay task observes cancellation
+        // immediately — the registry only released its own copy.
+        assert!(handle.cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn list_with_stats_emits_zero_counters_on_fresh_registry() {
+        let registry = MediaRegistry::new();
+        registry
+            .create(input("https://example.com/snapshot.jpg"))
+            .await
+            .unwrap();
+        let rows = registry.list_with_stats().await;
+        assert_eq!(rows.len(), 1);
+        let stats = &rows[0].stats;
+        assert_eq!(stats.active_sessions, 0);
+        assert_eq!(stats.total_sessions, 0);
+        assert_eq!(stats.bytes_relayed, 0);
+        assert_eq!(stats.errors, 0);
+        assert!(stats.last_activity.is_none());
     }
 
     #[tokio::test]

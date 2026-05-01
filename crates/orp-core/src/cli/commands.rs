@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::Datelike;
 use colored::Colorize;
-use orp_audit::{crypto::EventSigner, AuditLogger, InMemoryAuditLog, PersistentAuditLog};
+use orp_audit::{
+    crypto::{default_audit_key_path, EventSigner},
+    AuditLogger, InMemoryAuditLog, PersistentAuditLog,
+};
 use orp_config::{get_maritime_template, Config};
 use orp_connector::adapters::ais::AisConnector;
 use orp_connector::traits::ConnectorConfig;
@@ -490,7 +493,31 @@ pub async fn run_start(args: StartArgs) -> Result<()> {
     // DuckDB connection. The `--in-memory` path uses [`InMemoryAuditLog`],
     // matching the rest of the volatile state — there is no point persisting
     // an audit chain pointing at entities that vanish on restart.
-    let audit_signer = Arc::new(EventSigner::new());
+    //
+    // Persistent mode loads (or generates on first run) the Ed25519 audit
+    // signing key from `${XDG_DATA_HOME:-$HOME/.local/share}/orp/audit-key.ed25519`
+    // so signatures emitted before a restart are verifiable after one
+    // (closes P-audit Wave 2 F2). In-memory mode keeps a fresh ephemeral
+    // keypair — there's nothing on disk to verify against anyway.
+    let audit_signer = if in_memory {
+        Arc::new(EventSigner::new())
+    } else {
+        let key_path = default_audit_key_path();
+        match EventSigner::load_or_generate(&key_path) {
+            Ok(signer) => {
+                tracing::info!(path = %key_path.display(), "audit signing key loaded");
+                Arc::new(signer)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %key_path.display(),
+                    error = %e,
+                    "could not load/persist audit signing key — falling back to ephemeral key for this run only"
+                );
+                Arc::new(EventSigner::new())
+            }
+        }
+    };
     let (storage, audit_log): (Arc<dyn Storage>, Arc<dyn AuditLogger>) = if in_memory {
         tracing::warn!("Initializing DuckDB storage (in-memory). All state is lost on shutdown.");
         let s = Arc::new(
