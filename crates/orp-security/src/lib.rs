@@ -47,6 +47,7 @@ pub mod jwt;
 pub mod middleware;
 pub mod oidc;
 pub mod rbac;
+pub mod url_safety;
 
 // ─── Convenience re-exports ───────────────────────────────────────────────────
 

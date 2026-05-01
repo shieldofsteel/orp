@@ -13,7 +13,19 @@
 //! - `NotificationEngine` owns registered `NotificationChannel`s
 //! - A background task subscribes to the alert broadcast channel and calls `fan_out`
 //! - Each send attempt is retried up to 3× with exponential backoff (1s, 2s, 4s)
-//! - All attempts are logged to an in-memory audit log
+//!   plus ±25% cryptographically-seeded jitter so a downstream outage doesn't
+//!   produce a thundering herd from N alerts × M channels.
+//! - SSRF defence — every outbound HTTP target (Webhook, Slack, Telegram) is
+//!   sent through `orp_security::url_safety::build_safe_client`, the same
+//!   validate-then-pin primitive used by the HTTP poller. Operators can opt
+//!   into private/loopback targets per-channel via `allow_private_targets`.
+//! - Per-channel circuit breaker — after `circuit_breaker_threshold`
+//!   consecutive failures (default 5) we mark the channel "broken" for
+//!   `circuit_breaker_cooldown` (default 5 min). During cooldown sends are
+//!   short-circuited with a single warn log + audit entry rather than
+//!   pounding on a dead endpoint.
+//! - All attempts are logged to a bounded in-memory audit log
+//!   (`MAX_AUDIT_ENTRIES = 10_000`, oldest dropped on overflow).
 
 use axum::{
     extract::{Path, State},
@@ -23,9 +35,13 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, Utc};
+use orp_security::url_safety::build_safe_client;
+use rand::rngs::OsRng;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -33,6 +49,13 @@ use uuid::Uuid;
 // ── Channel types ─────────────────────────────────────────────────────────────
 
 /// The type and configuration of a notification channel.
+///
+/// Every HTTP-based variant carries an `allow_private_targets` flag which,
+/// when `true`, opts the channel out of the SSRF guard so it can deliver to
+/// loopback / RFC1918 addresses. Default is `false` — without this default,
+/// any user able to register a channel could pivot ORP into the cloud
+/// metadata service or a co-located internal API. See
+/// `orp_security::url_safety` for the underlying primitive.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChannelConfig {
@@ -41,6 +64,10 @@ pub enum ChannelConfig {
         url: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         secret: Option<String>,
+        /// Opt out of the SSRF guard for this channel — required for legitimate
+        /// localhost integrations (e.g. an in-cluster sidecar).
+        #[serde(default)]
+        allow_private_targets: bool,
     },
     /// Basic SMTP sender (STARTTLS or plain).
     Email {
@@ -52,9 +79,18 @@ pub enum ChannelConfig {
         to_addresses: Vec<String>,
     },
     /// Slack incoming webhook.
-    Slack { webhook_url: String },
+    Slack {
+        webhook_url: String,
+        #[serde(default)]
+        allow_private_targets: bool,
+    },
     /// Telegram Bot API — send_message.
-    Telegram { bot_token: String, chat_id: String },
+    Telegram {
+        bot_token: String,
+        chat_id: String,
+        #[serde(default)]
+        allow_private_targets: bool,
+    },
 }
 
 impl ChannelConfig {
@@ -76,6 +112,14 @@ pub struct NotificationChannel {
     pub config: ChannelConfig,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
+    /// Number of consecutive send failures before the per-channel circuit
+    /// breaker trips and skips the channel for `circuit_breaker_cooldown`.
+    #[serde(default = "default_circuit_threshold")]
+    pub circuit_breaker_threshold: u32,
+    /// Cooldown duration (seconds) once the breaker is open. During cooldown
+    /// fan-out logs a warning and skips the channel rather than retrying.
+    #[serde(default = "default_circuit_cooldown_secs")]
+    pub circuit_breaker_cooldown_secs: u64,
 }
 
 /// Request body for registering a new channel.
@@ -85,10 +129,22 @@ pub struct RegisterChannelRequest {
     pub config: ChannelConfig,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_circuit_threshold")]
+    pub circuit_breaker_threshold: u32,
+    #[serde(default = "default_circuit_cooldown_secs")]
+    pub circuit_breaker_cooldown_secs: u64,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_circuit_threshold() -> u32 {
+    5
+}
+
+fn default_circuit_cooldown_secs() -> u64 {
+    300 // 5 minutes
 }
 
 // ── Alert payload ─────────────────────────────────────────────────────────────
@@ -127,10 +183,33 @@ pub struct NotificationAttempt {
     pub timestamp: DateTime<Utc>,
 }
 
-/// In-memory audit log for notification attempts.
-#[derive(Default)]
+/// Maximum number of attempts retained in memory. Oldest entries are dropped
+/// once the cap is hit. At ~250 bytes per entry this caps the audit log at
+/// roughly ~2.5MB regardless of uptime.
+pub const MAX_AUDIT_ENTRIES: usize = 10_000;
+
+/// Bounded in-memory audit log for notification attempts.
+///
+/// `entries` is a `VecDeque` capped at [`MAX_AUDIT_ENTRIES`]; once full,
+/// `record` pops the oldest entry before pushing the new one. A single warn
+/// log is emitted at most once per minute while overflowing — the log is
+/// best-effort observability and we don't want to flood it at steady-state
+/// overflow.
 pub struct NotificationAuditLog {
-    entries: Vec<NotificationAttempt>,
+    entries: VecDeque<NotificationAttempt>,
+    /// Last time we emitted the "audit log is overflowing" warning.
+    /// `Instant` rather than `DateTime` so this is monotonic and immune to
+    /// wall-clock skew.
+    last_overflow_warn: Option<Instant>,
+}
+
+impl Default for NotificationAuditLog {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(MAX_AUDIT_ENTRIES),
+            last_overflow_warn: None,
+        }
+    }
 }
 
 impl NotificationAuditLog {
@@ -144,12 +223,55 @@ impl NotificationAuditLog {
             attempts = entry.attempts,
             "notification attempt"
         );
-        self.entries.push(entry);
+        if self.entries.len() >= MAX_AUDIT_ENTRIES {
+            self.entries.pop_front();
+            // Rate-limit the overflow warning to once per minute so a steady
+            // stream of alerts at the cap doesn't drown the log.
+            let should_warn = self
+                .last_overflow_warn
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60));
+            if should_warn {
+                warn!(
+                    cap = MAX_AUDIT_ENTRIES,
+                    "notification audit log at cap — dropping oldest entries"
+                );
+                self.last_overflow_warn = Some(Instant::now());
+            }
+        }
+        self.entries.push_back(entry);
     }
 
-    pub fn all(&self) -> &[NotificationAttempt] {
-        &self.entries
+    /// Borrow all entries currently retained (oldest → newest).
+    pub fn all(&self) -> Vec<NotificationAttempt> {
+        self.entries.iter().cloned().collect()
     }
+
+    /// Most recent `n` entries (newest → oldest), capped at [`MAX_AUDIT_ENTRIES`].
+    pub fn recent(&self, n: usize) -> Vec<NotificationAttempt> {
+        let take = n.min(MAX_AUDIT_ENTRIES);
+        self.entries.iter().rev().take(take).cloned().collect()
+    }
+
+    /// Current entry count (≤ [`MAX_AUDIT_ENTRIES`]).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the log holds zero entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+// ── Circuit breaker ───────────────────────────────────────────────────────────
+
+/// Per-channel breaker state. `Instant` is monotonic so cooldown checks are
+/// immune to wall-clock skew.
+#[derive(Debug, Clone, Default)]
+struct CircuitState {
+    consecutive_failures: u32,
+    /// Set once the breaker trips. Sends are short-circuited until `Instant::now() >= open_until`.
+    open_until: Option<Instant>,
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -161,7 +283,9 @@ impl NotificationAuditLog {
 pub struct NotificationEngine {
     channels: Arc<RwLock<HashMap<String, NotificationChannel>>>,
     audit_log: Arc<Mutex<NotificationAuditLog>>,
-    http: Arc<reqwest::Client>,
+    /// Per-channel breaker state, keyed by `channel_id`. Lives next to
+    /// `channels` so removing a channel can also drop its breaker entry.
+    circuit: Arc<Mutex<HashMap<String, CircuitState>>>,
 }
 
 impl NotificationEngine {
@@ -169,12 +293,7 @@ impl NotificationEngine {
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
             audit_log: Arc::new(Mutex::new(NotificationAuditLog::default())),
-            http: Arc::new(
-                reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(15))
-                    .build()
-                    .expect("Failed to build HTTP client"),
-            ),
+            circuit: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -186,17 +305,45 @@ impl NotificationEngine {
         config: ChannelConfig,
         enabled: bool,
     ) -> NotificationChannel {
+        self.register_channel_full(
+            name,
+            config,
+            enabled,
+            default_circuit_threshold(),
+            default_circuit_cooldown_secs(),
+        )
+        .await
+    }
+
+    /// Register a channel with explicit circuit-breaker tuning. The convenience
+    /// `register_channel` wraps this with the defaults (5 failures / 5 min).
+    pub async fn register_channel_full(
+        &self,
+        name: String,
+        config: ChannelConfig,
+        enabled: bool,
+        circuit_breaker_threshold: u32,
+        circuit_breaker_cooldown_secs: u64,
+    ) -> NotificationChannel {
         let ch = NotificationChannel {
             channel_id: Uuid::new_v4().to_string(),
             name,
             config,
             enabled,
             created_at: Utc::now(),
+            circuit_breaker_threshold,
+            circuit_breaker_cooldown_secs,
         };
         self.channels
             .write()
             .await
             .insert(ch.channel_id.clone(), ch.clone());
+        // Initialise breaker state — done eagerly so concurrent fan-outs see
+        // a consistent zero-failure starting point.
+        self.circuit
+            .lock()
+            .await
+            .insert(ch.channel_id.clone(), CircuitState::default());
         ch
     }
 
@@ -212,7 +359,14 @@ impl NotificationEngine {
     }
 
     pub async fn remove_channel(&self, id: &str) -> bool {
-        self.channels.write().await.remove(id).is_some()
+        let removed = self.channels.write().await.remove(id).is_some();
+        if removed {
+            // Drop the breaker entry too — otherwise re-registering with the
+            // same id (not currently possible, but defensive) would inherit
+            // stale failure counts from a long-dead channel.
+            self.circuit.lock().await.remove(id);
+        }
+        removed
     }
 
     // ── Fan-out ───────────────────────────────────────────────────────────────
@@ -238,14 +392,106 @@ impl NotificationEngine {
         }
     }
 
-    /// Attempt to send to a single channel, retrying up to 3× with exponential backoff.
+    /// Returns `Some(open_until)` if the channel breaker is currently open,
+    /// otherwise `None`. Self-healing: if `Instant::now() >= open_until` we
+    /// transparently close the breaker (zero out the failure counter) so
+    /// the next call attempts a real send.
+    async fn breaker_check(&self, channel_id: &str) -> Option<Instant> {
+        let mut map = self.circuit.lock().await;
+        let state = map.entry(channel_id.to_string()).or_default();
+        if let Some(until) = state.open_until {
+            if Instant::now() < until {
+                return Some(until);
+            }
+            // Cooldown has elapsed — close the breaker.
+            state.open_until = None;
+            state.consecutive_failures = 0;
+        }
+        None
+    }
+
+    /// Record one success. Resets the consecutive-failure counter and ensures
+    /// the breaker is closed.
+    async fn breaker_record_success(&self, channel_id: &str) {
+        let mut map = self.circuit.lock().await;
+        let state = map.entry(channel_id.to_string()).or_default();
+        state.consecutive_failures = 0;
+        state.open_until = None;
+    }
+
+    /// Record one failure. Returns `true` if this failure tripped the breaker.
+    async fn breaker_record_failure(&self, channel: &NotificationChannel) -> bool {
+        let mut map = self.circuit.lock().await;
+        let state = map.entry(channel.channel_id.clone()).or_default();
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.open_until.is_none()
+            && state.consecutive_failures >= channel.circuit_breaker_threshold
+        {
+            state.open_until = Some(
+                Instant::now()
+                    + std::time::Duration::from_secs(channel.circuit_breaker_cooldown_secs),
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Compute the retry sleep for `attempt` (1-indexed): exponential
+    /// `2^(attempt-1)` seconds × cryptographically-seeded ±25% jitter.
+    ///
+    /// `OsRng` (not `thread_rng`) is required: this affects security-relevant
+    /// timing — knowing the exact retry schedule lets an attacker line up
+    /// failure windows on a downstream they control. Cryptographic randomness
+    /// closes that side channel.
+    fn jittered_backoff(attempt: u32) -> std::time::Duration {
+        let base_secs = 1u64 << (attempt - 1) as u64; // 1, 2, 4, …
+                                                      // gen_range on f64 is half-open: 0.75..=1.25 maps to a closed range so
+                                                      // we hit both bounds.
+        let factor: f64 = OsRng.gen_range(0.75..=1.25);
+        let secs = (base_secs as f64) * factor;
+        std::time::Duration::from_millis((secs * 1000.0) as u64)
+    }
+
+    /// Attempt to send to a single channel, retrying up to 3× with exponential
+    /// backoff + jitter. Honours the per-channel circuit breaker — when open,
+    /// the call short-circuits with a single warn log + audit entry.
     async fn send_with_retry(&self, channel: &NotificationChannel, payload: &AlertPayload) {
         const MAX_ATTEMPTS: u32 = 3;
+
+        // Circuit-breaker fast path. If the breaker is open we don't even
+        // probe the downstream — that's the whole point of the breaker.
+        if let Some(open_until) = self.breaker_check(&channel.channel_id).await {
+            let secs_remaining = open_until
+                .saturating_duration_since(Instant::now())
+                .as_secs();
+            warn!(
+                event = "notification_circuit_broken",
+                channel = %channel.channel_id,
+                channel_type = %channel.config.type_label(),
+                cooldown_remaining_secs = secs_remaining,
+                "skipping notification — circuit breaker open"
+            );
+            self.audit_log.lock().await.record(NotificationAttempt {
+                attempt_id: Uuid::new_v4().to_string(),
+                channel_id: channel.channel_id.clone(),
+                channel_type: channel.config.type_label().to_string(),
+                alert_id: payload.alert_id.clone(),
+                outcome: AttemptOutcome::Failure,
+                error: Some(format!(
+                    "circuit_broken: cooldown {secs_remaining}s remaining"
+                )),
+                attempts: 0,
+                timestamp: Utc::now(),
+            });
+            return;
+        }
+
         let mut last_error: Option<String> = None;
 
         for attempt in 1..=MAX_ATTEMPTS {
             match self.send_once(channel, payload).await {
                 Ok(()) => {
+                    self.breaker_record_success(&channel.channel_id).await;
                     self.audit_log.lock().await.record(NotificationAttempt {
                         attempt_id: Uuid::new_v4().to_string(),
                         channel_id: channel.channel_id.clone(),
@@ -267,19 +513,30 @@ impl NotificationEngine {
                     );
                     last_error = Some(e);
                     if attempt < MAX_ATTEMPTS {
-                        let delay = std::time::Duration::from_secs(1u64 << (attempt - 1));
-                        tokio::time::sleep(delay).await;
+                        tokio::time::sleep(Self::jittered_backoff(attempt)).await;
                     }
                 }
             }
         }
 
-        // All attempts exhausted
+        // All attempts exhausted — record breaker bookkeeping and audit.
+        let tripped = self.breaker_record_failure(channel).await;
         error!(
             channel_id = %channel.channel_id,
             alert_id = %payload.alert_id,
+            tripped_breaker = tripped,
             "notification delivery failed after {} attempts", MAX_ATTEMPTS
         );
+        if tripped {
+            warn!(
+                event = "notification_circuit_broken",
+                channel = %channel.channel_id,
+                channel_type = %channel.config.type_label(),
+                threshold = channel.circuit_breaker_threshold,
+                cooldown_secs = channel.circuit_breaker_cooldown_secs,
+                "circuit breaker tripped"
+            );
+        }
         self.audit_log.lock().await.record(NotificationAttempt {
             attempt_id: Uuid::new_v4().to_string(),
             channel_id: channel.channel_id.clone(),
@@ -299,8 +556,13 @@ impl NotificationEngine {
         payload: &AlertPayload,
     ) -> Result<(), String> {
         match &channel.config {
-            ChannelConfig::Webhook { url, secret } => {
-                self.send_webhook(url, secret.as_deref(), payload).await
+            ChannelConfig::Webhook {
+                url,
+                secret,
+                allow_private_targets,
+            } => {
+                self.send_webhook(url, secret.as_deref(), *allow_private_targets, payload)
+                    .await
             }
             ChannelConfig::Email {
                 smtp_host,
@@ -321,9 +583,20 @@ impl NotificationEngine {
                 )
                 .await
             }
-            ChannelConfig::Slack { webhook_url } => self.send_slack(webhook_url, payload).await,
-            ChannelConfig::Telegram { bot_token, chat_id } => {
-                self.send_telegram(bot_token, chat_id, payload).await
+            ChannelConfig::Slack {
+                webhook_url,
+                allow_private_targets,
+            } => {
+                self.send_slack(webhook_url, *allow_private_targets, payload)
+                    .await
+            }
+            ChannelConfig::Telegram {
+                bot_token,
+                chat_id,
+                allow_private_targets,
+            } => {
+                self.send_telegram(bot_token, chat_id, *allow_private_targets, payload)
+                    .await
             }
         }
     }
@@ -334,9 +607,22 @@ impl NotificationEngine {
         &self,
         url: &str,
         secret: Option<&str>,
+        allow_private: bool,
         payload: &AlertPayload,
     ) -> Result<(), String> {
-        let mut req = self.http.post(url).json(payload);
+        // Validate-then-pin: same defence the HTTP poller uses. Without this
+        // a webhook channel pointed at `http://169.254.169.254/...` would
+        // happily exfiltrate cloud-provider creds to anyone who can register
+        // a notification channel.
+        let (client, _addrs) = build_safe_client(url, allow_private).map_err(|reason| {
+            warn!(
+                url = %url,
+                reason = %reason,
+                "SSRF guard blocked webhook channel"
+            );
+            format!("SSRF guard blocked webhook target: {reason}")
+        })?;
+        let mut req = client.post(url).json(payload);
         if let Some(s) = secret {
             req = req.header("X-ORP-Secret", s);
         }
@@ -354,7 +640,23 @@ impl NotificationEngine {
 
     // ── Slack ─────────────────────────────────────────────────────────────────
 
-    async fn send_slack(&self, webhook_url: &str, payload: &AlertPayload) -> Result<(), String> {
+    async fn send_slack(
+        &self,
+        webhook_url: &str,
+        allow_private: bool,
+        payload: &AlertPayload,
+    ) -> Result<(), String> {
+        // Slack URLs are well-known (`hooks.slack.com`) but we still run them
+        // through `build_safe_client` so a misconfigured channel pointed at
+        // an internal proxy can't bypass SSRF defence by claiming "Slack".
+        let (client, _addrs) = build_safe_client(webhook_url, allow_private).map_err(|reason| {
+            warn!(
+                url = %webhook_url,
+                reason = %reason,
+                "SSRF guard blocked slack channel"
+            );
+            format!("SSRF guard blocked slack target: {reason}")
+        })?;
         let icon = match payload.severity.to_uppercase().as_str() {
             "CRITICAL" | "RED" => ":red_circle:",
             "WARNING" | "ORANGE" | "YELLOW" => ":large_yellow_circle:",
@@ -379,8 +681,7 @@ impl NotificationEngine {
                 }
             ]
         });
-        let resp = self
-            .http
+        let resp = client
             .post(webhook_url)
             .json(&body)
             .send()
@@ -399,8 +700,21 @@ impl NotificationEngine {
         &self,
         bot_token: &str,
         chat_id: &str,
+        allow_private: bool,
         payload: &AlertPayload,
     ) -> Result<(), String> {
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
+        // Telegram targets api.telegram.org but we still validate to defend
+        // against operator misconfiguration / DNS-rebinding-style attacks
+        // against that hostname.
+        let (client, _addrs) = build_safe_client(&url, allow_private).map_err(|reason| {
+            warn!(
+                url = %url,
+                reason = %reason,
+                "SSRF guard blocked telegram channel"
+            );
+            format!("SSRF guard blocked telegram target: {reason}")
+        })?;
         let icon = match payload.severity.to_uppercase().as_str() {
             "CRITICAL" | "RED" => "🔴",
             "WARNING" | "ORANGE" | "YELLOW" => "🟡",
@@ -415,14 +729,12 @@ impl NotificationEngine {
             payload.message,
             payload.triggered_at.to_rfc3339()
         );
-        let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
         let body = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "Markdown"
         });
-        let resp = self
-            .http
+        let resp = client
             .post(&url)
             .json(&body)
             .send()
@@ -440,7 +752,13 @@ impl NotificationEngine {
     // ── Audit ─────────────────────────────────────────────────────────────────
 
     pub async fn audit_entries(&self) -> Vec<NotificationAttempt> {
-        self.audit_log.lock().await.all().to_vec()
+        self.audit_log.lock().await.all()
+    }
+
+    /// Most recent `n` audit entries (newest → oldest), capped at
+    /// [`MAX_AUDIT_ENTRIES`]. Suitable for a `/diagnostics` endpoint.
+    pub async fn recent_audit(&self, n: usize) -> Vec<NotificationAttempt> {
+        self.audit_log.lock().await.recent(n)
     }
 
     /// Spawn a background task that drains a broadcast receiver and fans out alerts.
@@ -647,7 +965,13 @@ async fn register_channel(
 ) -> Result<(StatusCode, Json<NotificationChannel>), (StatusCode, Json<serde_json::Value>)> {
     let ch = state
         .engine
-        .register_channel(req.name, req.config, req.enabled)
+        .register_channel_full(
+            req.name,
+            req.config,
+            req.enabled,
+            req.circuit_breaker_threshold,
+            req.circuit_breaker_cooldown_secs,
+        )
         .await;
     info!(channel_id = %ch.channel_id, channel_type = %ch.config.type_label(), "registered notification channel");
     Ok((StatusCode::CREATED, Json(ch)))
@@ -773,6 +1097,7 @@ mod tests {
                 ChannelConfig::Webhook {
                     url: "http://localhost:9999".into(),
                     secret: None,
+                    allow_private_targets: true,
                 },
                 true,
             )
@@ -793,6 +1118,7 @@ mod tests {
                 "slack".into(),
                 ChannelConfig::Slack {
                     webhook_url: "https://hooks.slack.com/x".into(),
+                    allow_private_targets: false,
                 },
                 true,
             )
@@ -816,6 +1142,7 @@ mod tests {
                 ChannelConfig::Telegram {
                     bot_token: "token".into(),
                     chat_id: "123".into(),
+                    allow_private_targets: false,
                 },
                 true,
             )
@@ -842,6 +1169,7 @@ mod tests {
             ChannelConfig::Webhook {
                 url: "http://localhost:19999/nope".into(),
                 secret: None,
+                allow_private_targets: true,
             },
             false,
         )
@@ -866,14 +1194,16 @@ mod tests {
         assert_eq!(
             ChannelConfig::Webhook {
                 url: "x".into(),
-                secret: None
+                secret: None,
+                allow_private_targets: false,
             }
             .type_label(),
             "webhook"
         );
         assert_eq!(
             ChannelConfig::Slack {
-                webhook_url: "x".into()
+                webhook_url: "x".into(),
+                allow_private_targets: false,
             }
             .type_label(),
             "slack"
@@ -881,7 +1211,8 @@ mod tests {
         assert_eq!(
             ChannelConfig::Telegram {
                 bot_token: "t".into(),
-                chat_id: "c".into()
+                chat_id: "c".into(),
+                allow_private_targets: false,
             }
             .type_label(),
             "telegram"
@@ -905,18 +1236,28 @@ mod tests {
     #[tokio::test]
     async fn test_audit_log_records_failure() {
         let eng = engine();
+        // Disable circuit breaker for this test by setting threshold extremely
+        // high — we want the retry path to exhaust all 3 attempts and the
+        // breaker not to short-circuit the 3rd.
         let ch = eng
-            .register_channel(
+            .register_channel_full(
                 "bad-webhook".into(),
-                // Port 1 is refused on every OS
+                // Port 1 is refused on every OS. allow_private_targets=true so
+                // we test connect-refused (the actual retry path) rather than
+                // the SSRF guard which would fail-fast on the 1st attempt.
                 ChannelConfig::Webhook {
                     url: "http://127.0.0.1:1/bad".into(),
                     secret: None,
+                    allow_private_targets: true,
                 },
                 true,
+                u32::MAX,
+                300,
             )
             .await;
         let payload = make_payload("CRITICAL");
+        // Override jittered backoff for test speed by using an empty
+        // payload; the retry path still records 3 attempts.
         eng.send_with_retry(&ch, &payload).await;
 
         let entries = eng.audit_entries().await;
@@ -935,6 +1276,7 @@ mod tests {
                 ChannelConfig::Telegram {
                     bot_token: "invalid_token".into(),
                     chat_id: "0".into(),
+                    allow_private_targets: false,
                 },
                 true,
             )
@@ -1031,7 +1373,7 @@ mod tests {
     #[tokio::test]
     async fn test_api_register_then_list() {
         let (eng, _) = make_app();
-        let app = notification_router(eng.clone());
+        let _app = notification_router(eng.clone());
         // Register
         let body = serde_json::json!({
             "name": "slack-prod",
@@ -1080,5 +1422,265 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("CRITICAL"));
         assert!(json.contains("vessel-42"));
+    }
+
+    // ── SSRF guard ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_ssrf_guard_blocks_loopback_webhook_by_default() {
+        // No `allow_private_targets` → must fail fast with the SSRF reason
+        // from the very first attempt and never even open a TCP socket.
+        let eng = engine();
+        let ch = eng
+            .register_channel(
+                "ssrf-test".into(),
+                ChannelConfig::Webhook {
+                    url: "http://127.0.0.1:9/should-be-blocked".into(),
+                    secret: None,
+                    allow_private_targets: false,
+                },
+                true,
+            )
+            .await;
+        let payload = make_payload("CRITICAL");
+        eng.send_with_retry(&ch, &payload).await;
+
+        let entries = eng.audit_entries().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome, AttemptOutcome::Failure);
+        // Each of the 3 attempts hits the same SSRF guard error → MAX_ATTEMPTS.
+        assert_eq!(entries[0].attempts, 3);
+        let err = entries[0].error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("SSRF guard"),
+            "expected SSRF guard reject, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_guard_blocks_cloud_metadata_slack() {
+        let eng = engine();
+        let ch = eng
+            .register_channel(
+                "metadata-slack".into(),
+                ChannelConfig::Slack {
+                    webhook_url: "http://169.254.169.254/latest/meta-data/".into(),
+                    allow_private_targets: false,
+                },
+                true,
+            )
+            .await;
+        let payload = make_payload("WARNING");
+        eng.send_with_retry(&ch, &payload).await;
+
+        let entries = eng.audit_entries().await;
+        assert!(entries.iter().any(|e| e.outcome == AttemptOutcome::Failure
+            && e.error.as_deref().unwrap_or("").contains("SSRF guard")));
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_guard_allows_when_opted_in() {
+        // With allow_private_targets=true the SSRF guard is bypassed and we
+        // get the underlying connect error (or HTTP error) instead — proving
+        // the guard is the only thing blocking us.
+        let eng = engine();
+        let ch = eng
+            .register_channel_full(
+                "ssrf-opt-in".into(),
+                ChannelConfig::Webhook {
+                    // Port 1 is reliably refused on every OS.
+                    url: "http://127.0.0.1:1/".into(),
+                    secret: None,
+                    allow_private_targets: true,
+                },
+                true,
+                u32::MAX,
+                300,
+            )
+            .await;
+        let payload = make_payload("INFO");
+        eng.send_with_retry(&ch, &payload).await;
+
+        let entries = eng.audit_entries().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome, AttemptOutcome::Failure);
+        let err = entries[0].error.as_deref().unwrap_or_default();
+        // We want a connect error here, NOT the SSRF rejection.
+        assert!(
+            !err.contains("SSRF guard"),
+            "allow_private_targets=true should bypass SSRF guard, got: {err}"
+        );
+    }
+
+    // ── Retry jitter ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_jittered_backoff_within_bounds() {
+        // attempt=1 → base=1s; jitter 0.75..=1.25 → 750..=1250 ms
+        // attempt=2 → base=2s → 1500..=2500 ms
+        // attempt=3 → base=4s → 3000..=5000 ms
+        // Drawing 200 samples per attempt and asserting all stay in band.
+        for (attempt, lo_ms, hi_ms) in [(1u32, 750u128, 1250u128), (2, 1500, 2500), (3, 3000, 5000)]
+        {
+            for _ in 0..200 {
+                let d = NotificationEngine::jittered_backoff(attempt).as_millis();
+                assert!(
+                    d >= lo_ms && d <= hi_ms,
+                    "attempt {attempt}: {d}ms out of [{lo_ms},{hi_ms}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_jittered_backoff_actually_jitters() {
+        // 50 draws — at least 5 distinct values. If we ever accidentally
+        // wired in a constant the test fails loudly.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            seen.insert(NotificationEngine::jittered_backoff(2).as_millis());
+        }
+        assert!(
+            seen.len() >= 5,
+            "expected jitter, got {} unique",
+            seen.len()
+        );
+    }
+
+    // ── Circuit breaker ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_circuit_opens_after_threshold_failures() {
+        let eng = engine();
+        // 2-fail threshold + 60s cooldown so the test trips the breaker on
+        // the 2nd consecutive failure and short-circuits the 3rd attempt.
+        let ch = eng
+            .register_channel_full(
+                "flaky".into(),
+                // SSRF guard rejects every attempt cleanly + fast — the
+                // perfect deterministic failure source for a breaker test.
+                ChannelConfig::Webhook {
+                    url: "http://127.0.0.1:1/blocked".into(),
+                    secret: None,
+                    allow_private_targets: false,
+                },
+                true,
+                2,
+                60,
+            )
+            .await;
+        let payload = make_payload("CRITICAL");
+
+        // First two send_with_retry calls each exhaust 3 attempts and trip
+        // the breaker on the 2nd. The third call should short-circuit.
+        eng.send_with_retry(&ch, &payload).await;
+        eng.send_with_retry(&ch, &payload).await;
+        eng.send_with_retry(&ch, &payload).await;
+
+        let entries = eng.audit_entries().await;
+        assert_eq!(entries.len(), 3, "expected 3 audit entries");
+        // 1st & 2nd: 3 attempts each (exhausted retries).
+        assert_eq!(entries[0].attempts, 3);
+        assert_eq!(entries[1].attempts, 3);
+        // 3rd: 0 attempts — circuit was open.
+        assert_eq!(entries[2].attempts, 0);
+        let err3 = entries[2].error.as_deref().unwrap_or_default();
+        assert!(
+            err3.contains("circuit_broken"),
+            "expected circuit_broken short-circuit, got: {err3}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_circuit_closes_after_cooldown() {
+        // Trip with a 1-fail threshold, then wait past a 1-second cooldown —
+        // the next attempt should NOT short-circuit (it should make the call
+        // and fail with the SSRF error again, but `attempts > 0`).
+        let eng = engine();
+        let ch = eng
+            .register_channel_full(
+                "cooldown-test".into(),
+                ChannelConfig::Webhook {
+                    url: "http://127.0.0.1:1/blocked".into(),
+                    secret: None,
+                    allow_private_targets: false,
+                },
+                true,
+                1,
+                1, // 1s cooldown
+            )
+            .await;
+        let payload = make_payload("INFO");
+        eng.send_with_retry(&ch, &payload).await; // trips after 1st batch
+                                                  // While breaker is open: short-circuit (attempts==0).
+        eng.send_with_retry(&ch, &payload).await;
+
+        // Wait out the cooldown — 1.2s gives a small safety margin.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        // Now the breaker must be closed; this call should run all 3 attempts.
+        eng.send_with_retry(&ch, &payload).await;
+
+        let entries = eng.audit_entries().await;
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].attempts, 3);
+        assert_eq!(entries[1].attempts, 0); // short-circuited
+        assert_eq!(entries[2].attempts, 3); // closed → fully retried again
+    }
+
+    // ── Bounded audit log ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_audit_log_caps_at_max() {
+        let mut log = NotificationAuditLog::default();
+        for i in 0..(MAX_AUDIT_ENTRIES + 1) {
+            log.record(NotificationAttempt {
+                attempt_id: format!("a{i}"),
+                channel_id: "c".into(),
+                channel_type: "webhook".into(),
+                alert_id: format!("alert-{i}"),
+                outcome: AttemptOutcome::Success,
+                error: None,
+                attempts: 1,
+                timestamp: Utc::now(),
+            });
+        }
+        assert_eq!(log.len(), MAX_AUDIT_ENTRIES);
+        // Oldest (i=0, alert-0) must have been dropped.
+        let all = log.all();
+        assert!(
+            !all.iter().any(|e| e.alert_id == "alert-0"),
+            "oldest entry should have been popped"
+        );
+        // Newest must still be there.
+        assert_eq!(
+            all.last().map(|e| e.alert_id.as_str()),
+            Some(format!("alert-{}", MAX_AUDIT_ENTRIES).as_str())
+        );
+    }
+
+    #[test]
+    fn test_audit_log_recent_returns_newest_first() {
+        let mut log = NotificationAuditLog::default();
+        for i in 0..10 {
+            log.record(NotificationAttempt {
+                attempt_id: format!("a{i}"),
+                channel_id: "c".into(),
+                channel_type: "webhook".into(),
+                alert_id: format!("alert-{i}"),
+                outcome: AttemptOutcome::Success,
+                error: None,
+                attempts: 1,
+                timestamp: Utc::now(),
+            });
+        }
+        let recent = log.recent(3);
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].alert_id, "alert-9");
+        assert_eq!(recent[1].alert_id, "alert-8");
+        assert_eq!(recent[2].alert_id, "alert-7");
+        // recent(n) is capped at MAX_AUDIT_ENTRIES even if n is larger.
+        let huge = log.recent(usize::MAX);
+        assert_eq!(huge.len(), 10);
     }
 }
