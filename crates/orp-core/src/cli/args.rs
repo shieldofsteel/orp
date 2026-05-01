@@ -243,6 +243,34 @@ pub enum Commands {
         action: ConfigAction,
     },
 
+    /// Run preflight diagnostics — `green/yellow/red` per check.
+    ///
+    /// Verifies that ORP can start cleanly on this host: `protoc` available,
+    /// DuckDB and RocksDB paths writable, the configured port free, the
+    /// config file (if present) parseable, and — when `--https-url` is
+    /// supplied — that the cert chain validates.
+    ///
+    /// Examples:
+    ///   orp doctor
+    ///   orp doctor --config config.yaml
+    ///   orp doctor --https-url https://orp.example.com/api/v1/health
+    ///
+    /// Exit codes:
+    ///   0   everything green or yellow (warnings only)
+    ///   1   at least one red check
+    Doctor {
+        /// Path to a config.yaml to validate alongside the host checks.
+        /// Defaults to `config.yaml` in the working directory if it exists.
+        #[arg(short, long, value_name = "PATH")]
+        config: Option<String>,
+
+        /// HTTPS URL to probe for cert chain validity (e.g.
+        /// `https://orp.example.com/api/v1/health`). When omitted the cert
+        /// check is skipped.
+        #[arg(long, value_name = "URL")]
+        https_url: Option<String>,
+    },
+
     /// Show version and build information
     Version,
 

@@ -1,0 +1,38 @@
+# examples/two-node-federation/configs/beta.yaml
+#
+# Reference config for the "beta" node. Mirror image of alpha.yaml.
+# The actual run.sh demo uses --in-memory and CLI flags.
+
+server:
+  host: "0.0.0.0"
+  port: 9091
+  log_level: "info"
+
+storage:
+  duckdb:
+    path: "./beta-data.duckdb"
+  rocksdb:
+    path: "./beta-state.db"
+  sqlite:
+    path: "./beta-config.sqlite"
+
+retention:
+  events_ttl_days: 7
+  audit_log_ttl_days: 30
+
+security:
+  abac:
+    enabled: true
+
+api:
+  cors_enabled: true
+  cors_allowed_origins: ["*"]
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+  audit_log_path: "./beta-audit.log"
+
+connectors: []
+monitors: []

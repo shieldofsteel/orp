@@ -1,0 +1,6 @@
+-- Anything moving faster than 20 knots — speed anomalies.
+MATCH (s:ship)
+WHERE s.speed > 20
+RETURN s.name, s.ship_type, s.speed, s.course
+ORDER BY s.speed DESC
+LIMIT 10

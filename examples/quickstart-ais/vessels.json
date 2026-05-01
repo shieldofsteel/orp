@@ -1,0 +1,18 @@
+[
+  { "name": "EVER GIVEN",     "entity_type": "ship", "mmsi": 353136000, "ship_type": "cargo",        "lat": 51.9225, "lon":  4.4792, "speed": 12.3, "course": 245, "flag": "PA" },
+  { "name": "MSC OSCAR",      "entity_type": "ship", "mmsi": 636017052, "ship_type": "cargo",        "lat": 52.0000, "lon":  4.0000, "speed": 21.8, "course": 264, "flag": "LR" },
+  { "name": "EMMA MAERSK",    "entity_type": "ship", "mmsi": 220417000, "ship_type": "cargo",        "lat": 51.9000, "lon":  3.9000, "speed":  0.0, "course":   0, "flag": "DK" },
+  { "name": "SEAWAY YUDIN",   "entity_type": "ship", "mmsi": 273419350, "ship_type": "tanker",       "lat": 51.8000, "lon":  4.5000, "speed":  9.7, "course":  88, "flag": "RU" },
+  { "name": "BLACK PEARL",    "entity_type": "ship", "mmsi": 235100000, "ship_type": "passenger",    "lat": 51.5000, "lon": -0.1000, "speed": 14.2, "course": 100, "flag": "GB" },
+  { "name": "QUEEN MARY 2",   "entity_type": "ship", "mmsi": 247064000, "ship_type": "passenger",    "lat": 50.8000, "lon": -1.4000, "speed": 22.5, "course":  90, "flag": "GB" },
+  { "name": "LR1 BENGAL",     "entity_type": "ship", "mmsi": 538003456, "ship_type": "tanker",       "lat": 51.7300, "lon":  4.2100, "speed": 28.0, "course": 270, "flag": "MH" },
+  { "name": "FREYA",          "entity_type": "ship", "mmsi": 219020700, "ship_type": "fishing",      "lat": 53.6000, "lon":  6.7000, "speed":  6.0, "course":  45, "flag": "DK" },
+  { "name": "AURORA",         "entity_type": "ship", "mmsi": 232011030, "ship_type": "passenger",    "lat": 50.7000, "lon":  1.6000, "speed": 18.4, "course": 120, "flag": "GB" },
+  { "name": "EAGLE OBSERVER", "entity_type": "ship", "mmsi": 538008787, "ship_type": "tanker",       "lat": 51.6500, "lon":  3.8000, "speed":  0.5, "course":   0, "flag": "MH" },
+  { "name": "CMA CGM JACQUES","entity_type": "ship", "mmsi": 228382900, "ship_type": "cargo",        "lat": 51.9700, "lon":  4.1200, "speed": 15.0, "course": 270, "flag": "FR" },
+  { "name": "COSCO ROSE",     "entity_type": "ship", "mmsi": 477772300, "ship_type": "cargo",        "lat": 52.0500, "lon":  4.5000, "speed": 11.1, "course":  88, "flag": "HK" },
+  { "name": "STENA NORDICA",  "entity_type": "ship", "mmsi": 266244000, "ship_type": "passenger",    "lat": 56.0000, "lon": 12.0000, "speed":  0.0, "course":   0, "flag": "SE" },
+  { "name": "SCANDLINES BERLIN","entity_type":"ship","mmsi": 211288000, "ship_type": "passenger",    "lat": 54.5000, "lon": 11.9000, "speed": 17.0, "course":  90, "flag": "DE" },
+  { "name": "SOMETHING WEIRD","entity_type": "ship", "mmsi": 999999999, "ship_type": "unknown",      "lat": 51.7600, "lon":  4.3300, "speed": 35.0, "course": 180, "flag": null },
+  { "name": "OSPREY",         "entity_type": "ship", "mmsi": 367000000, "ship_type": "fishing",      "lat": 41.0000, "lon":-71.0000, "speed":  3.4, "course":  10, "flag": "US" }
+]

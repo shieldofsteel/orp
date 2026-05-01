@@ -1,0 +1,4 @@
+-- Count of vessels per ship_type, biggest first.
+MATCH (s:ship)
+RETURN s.ship_type, COUNT(*) AS vessel_count
+ORDER BY vessel_count DESC

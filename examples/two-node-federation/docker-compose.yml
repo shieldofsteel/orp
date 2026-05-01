@@ -1,0 +1,61 @@
+# examples/two-node-federation/docker-compose.yml
+#
+# Two-node federation demo using the published image.
+# Bring up:
+#   docker compose -f examples/two-node-federation/docker-compose.yml up
+#
+# Once both are healthy, register each as the other's peer:
+#   docker compose exec orp-fed-alpha orp peer add orp-fed-beta:9090
+#   docker compose exec orp-fed-beta  orp peer add orp-fed-alpha:9090
+#
+# This reuses the upstream docker-compose.yml's `federation` profile but with
+# different external ports so it doesn't collide.
+
+version: "3.9"
+
+networks:
+  orp-fed-demo:
+    driver: bridge
+
+volumes:
+  fed-alpha-data:
+  fed-beta-data:
+
+services:
+  orp-fed-alpha:
+    image: ghcr.io/shieldofsteel/orp:latest
+    container_name: orp-fed-alpha
+    restart: unless-stopped
+    ports:
+      - "19092:9090"
+    environment:
+      ORP_LOG: info
+      ORP_DEV_MODE: "true"
+      ORP_ENV: "development"
+      ORP_FED_BASE_INTERVAL_SECS: "10"
+    command:
+      ["orp", "start", "--in-memory", "--headless", "--no-auth", "--port", "9090"]
+    volumes:
+      - fed-alpha-data:/var/lib/orp
+    networks:
+      - orp-fed-demo
+
+  orp-fed-beta:
+    image: ghcr.io/shieldofsteel/orp:latest
+    container_name: orp-fed-beta
+    restart: unless-stopped
+    ports:
+      - "19093:9090"
+    environment:
+      ORP_LOG: info
+      ORP_DEV_MODE: "true"
+      ORP_ENV: "development"
+      ORP_FED_BASE_INTERVAL_SECS: "10"
+    command:
+      ["orp", "start", "--in-memory", "--headless", "--no-auth", "--port", "9090"]
+    volumes:
+      - fed-beta-data:/var/lib/orp
+    networks:
+      - orp-fed-demo
+    depends_on:
+      - orp-fed-alpha

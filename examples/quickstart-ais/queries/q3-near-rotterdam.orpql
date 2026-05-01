@@ -1,0 +1,8 @@
+-- Vessels near the Port of Rotterdam (51.92°N, 4.27°E) — bounding-box variant.
+-- Uses literal lat/lon comparison rather than a geo function so it works
+-- against any storage backend without a geospatial extension loaded.
+MATCH (s:ship)
+WHERE s.lat BETWEEN 51.7 AND 52.1
+  AND s.lon BETWEEN  3.9 AND  4.7
+RETURN s.name, s.ship_type, s.lat, s.lon, s.speed
+ORDER BY s.speed DESC
