@@ -782,12 +782,10 @@ pub async fn run_status(host: &str, format: OutputFormat) -> Result<()> {
                         } else {
                             "OK ".to_string()
                         }
+                    } else if colors_enabled() {
+                        format!("{}", "●".red())
                     } else {
-                        if colors_enabled() {
-                            format!("{}", "●".red())
-                        } else {
-                            "ERR".to_string()
-                        }
+                        "ERR".to_string()
                     };
                     println!("  {} {}{}", indicator, name, latency);
                 }
