@@ -203,7 +203,7 @@ impl NotificationEngine {
     pub async fn list_channels(&self) -> Vec<NotificationChannel> {
         let map = self.channels.read().await;
         let mut v: Vec<_> = map.values().cloned().collect();
-        v.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        v.sort_by_key(|x| x.created_at);
         v
     }
 

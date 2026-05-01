@@ -228,6 +228,13 @@ pub fn parse_nffi_xml(xml_data: &str) -> Result<Vec<NffiTrack>, ConnectorError> 
 /// Parse NFFI XML and report whenever an anonymous fallback ID is
 /// synthesised (no `<trackId>` in the source). When supplied, the
 /// `anon_count` AtomicU64 is incremented once per fallback.
+//
+// The `Event::Text(e)` arm wraps a multi-line block in `if in_track { ... }`
+// that contains `continue` and a nested `match`. Clippy 1.95 wants this
+// collapsed into an arm guard, but the body's control-flow makes that
+// refactor noisy without changing behaviour. Allow the lint at the
+// function level rather than introduce a risky multi-line restructure.
+#[allow(clippy::collapsible_match)]
 pub fn parse_nffi_xml_with_counter(
     xml_data: &str,
     anon_count: Option<&AtomicU64>,
@@ -289,10 +296,8 @@ pub fn parse_nffi_xml_with_counter(
                             }
                         }
                     }
-                    "position" | "pos" | "location" => {
-                        if in_track {
-                            in_position = true;
-                        }
+                    "position" | "pos" | "location" if in_track => {
+                        in_position = true;
                     }
                     _ => {}
                 }
@@ -303,45 +308,43 @@ pub fn parse_nffi_xml_with_counter(
             Ok(Event::End(e)) => {
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_lowercase();
                 match tag_name.as_str() {
-                    "track" | "trackmessage" | "trackentry" => {
-                        if in_track {
-                            let lat = latitude.unwrap_or(0.0);
-                            let lon = longitude.unwrap_or(0.0);
+                    "track" | "trackmessage" | "trackentry" if in_track => {
+                        let lat = latitude.unwrap_or(0.0);
+                        let lon = longitude.unwrap_or(0.0);
 
-                            if track_id.is_empty() {
-                                // No <trackId> in source XML — synthesise a
-                                // restart-stable SHA-256 fallback so entity
-                                // resolution survives connector restarts.
-                                track_id = anon_track_id(name.as_deref(), lat, lon, &affiliation);
-                                tracing::warn!(
-                                    name = ?name, lat, lon,
-                                    affiliation = affiliation.as_str(),
-                                    track_id = %track_id,
-                                    "NFFI track missing <trackId>; synthesised anon id"
-                                );
-                                if let Some(c) = anon_count {
-                                    c.fetch_add(1, Ordering::Relaxed);
-                                }
+                        if track_id.is_empty() {
+                            // No <trackId> in source XML — synthesise a
+                            // restart-stable SHA-256 fallback so entity
+                            // resolution survives connector restarts.
+                            track_id = anon_track_id(name.as_deref(), lat, lon, &affiliation);
+                            tracing::warn!(
+                                name = ?name, lat, lon,
+                                affiliation = affiliation.as_str(),
+                                track_id = %track_id,
+                                "NFFI track missing <trackId>; synthesised anon id"
+                            );
+                            if let Some(c) = anon_count {
+                                c.fetch_add(1, Ordering::Relaxed);
                             }
-
-                            tracks.push(NffiTrack {
-                                track_id: track_id.clone(),
-                                name: name.clone(),
-                                latitude: lat,
-                                longitude: lon,
-                                altitude,
-                                speed,
-                                course,
-                                affiliation: affiliation.clone(),
-                                platform_type: platform_type.clone(),
-                                nationality: nationality.clone(),
-                                symbology: symbology.clone(),
-                                operational_status: operational_status.clone(),
-                                timestamp: timestamp.clone(),
-                                remarks: remarks.clone(),
-                            });
-                            in_track = false;
                         }
+
+                        tracks.push(NffiTrack {
+                            track_id: track_id.clone(),
+                            name: name.clone(),
+                            latitude: lat,
+                            longitude: lon,
+                            altitude,
+                            speed,
+                            course,
+                            affiliation: affiliation.clone(),
+                            platform_type: platform_type.clone(),
+                            nationality: nationality.clone(),
+                            symbology: symbology.clone(),
+                            operational_status: operational_status.clone(),
+                            timestamp: timestamp.clone(),
+                            remarks: remarks.clone(),
+                        });
+                        in_track = false;
                     }
                     "position" | "pos" | "location" => {
                         in_position = false;
@@ -359,10 +362,8 @@ pub fn parse_nffi_xml_with_counter(
                     }
 
                     match current_tag.as_str() {
-                        "trackid" | "id" => {
-                            if track_id.is_empty() {
-                                track_id = text;
-                            }
+                        "trackid" | "id" if track_id.is_empty() => {
+                            track_id = text;
                         }
                         "name" | "callsign" | "designation" => {
                             name = Some(text);
@@ -385,10 +386,8 @@ pub fn parse_nffi_xml_with_counter(
                         "identity" | "affiliation" | "hostility" => {
                             affiliation = parse_affiliation(&text);
                         }
-                        "platformtype" | "platform" | "type" | "category" => {
-                            if !in_position {
-                                platform_type = parse_platform_type(&text);
-                            }
+                        "platformtype" | "platform" | "type" | "category" if !in_position => {
+                            platform_type = parse_platform_type(&text);
                         }
                         "nationality" | "country" | "nation" => {
                             nationality = Some(text);

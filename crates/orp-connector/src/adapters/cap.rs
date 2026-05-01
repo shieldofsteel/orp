@@ -425,11 +425,9 @@ pub fn parse_cap_xml(xml: &str) -> Result<CapAlert, ConnectorError> {
                         "polygon" => area_polygons.push(text),
                         "circle" => area_circles.push(text),
                         "valueName" => geocode_name = text,
-                        "value" => {
-                            if !geocode_name.is_empty() {
-                                area_geocodes.push((geocode_name.clone(), text));
-                                geocode_name.clear();
-                            }
+                        "value" if !geocode_name.is_empty() => {
+                            area_geocodes.push((geocode_name.clone(), text));
+                            geocode_name.clear();
                         }
                         _ => {}
                     }
