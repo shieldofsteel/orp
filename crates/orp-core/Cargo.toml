@@ -42,6 +42,10 @@ csv = "1.3"
 sha2 = { workspace = true }
 rand = { workspace = true }
 hex = "0.4"
+# Argon2id for password hashing (users.rs). OWASP 2023 floor: m=19 MiB, t=2, p=1.
+# `password-hash` provides the PHC string format types (`SaltString`, `PasswordHash`).
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["alloc"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }

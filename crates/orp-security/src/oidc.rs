@@ -743,10 +743,19 @@ async fn handle_logout(State(state): State<AuthRouterState>) -> Response {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Generate a random CSRF state string.
+///
+/// Uses `OsRng` (the OS CSPRNG) — never `thread_rng()`. The CSRF state guards
+/// `/auth/callback` against forged callbacks; if an attacker can predict the
+/// state value, they can mount a CSRF attack on the authorization-code flow.
+/// `thread_rng()` is seeded from the OS but its internal state is recoverable
+/// from a few outputs, so it must not be used here. We draw 32 bytes and
+/// encode as URL-safe base64 (no padding) → 43 chars, ~256 bits of entropy.
 fn generate_csrf_state() -> String {
-    use rand::Rng;
-    let bytes: Vec<u8> = (0..16).map(|_| rand::thread_rng().gen::<u8>()).collect();
-    hex::encode(bytes)
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use rand::{rngs::OsRng, RngCore};
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Minimal URL encoding (replaces only the most important characters).
@@ -845,7 +854,39 @@ mod tests {
         let s1 = generate_csrf_state();
         let s2 = generate_csrf_state();
         assert_ne!(s1, s2);
-        assert_eq!(s1.len(), 32); // 16 bytes → 32 hex chars
+        // 32 random bytes → URL-safe base64 (no pad) = 43 chars
+        assert_eq!(s1.len(), 43);
+    }
+
+    /// CSRF state must come from a CSPRNG (`OsRng`) and have full entropy.
+    /// We generate 1000 states and assert (a) no collisions and (b) every
+    /// state decodes to ≥32 bytes of base64url. A non-cryptographic RNG
+    /// (e.g. `thread_rng()` configured with a small state) would either
+    /// produce shorter outputs or — far more importantly — be predictable
+    /// from a handful of observations, which is the actual attack we're
+    /// blocking. We can't easily test "non-predictable" directly, so the
+    /// regression guard is the explicit `OsRng` import in the function
+    /// body and the format assertion below.
+    #[test]
+    fn test_csrf_state_uses_osrng_high_entropy() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
+        for _ in 0..1000 {
+            let s = generate_csrf_state();
+            // URL-safe base64 (no pad) of 32 bytes = 43 chars
+            assert_eq!(s.len(), 43, "state must be 43 chars: {s:?}");
+            // Every char must be valid url-safe-base64
+            assert!(
+                s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "non-url-safe-base64 char in state: {s:?}"
+            );
+            // And it must round-trip to ≥ 32 bytes
+            let raw = URL_SAFE_NO_PAD.decode(&s).expect("decodes");
+            assert_eq!(raw.len(), 32, "state must encode 32 bytes");
+            assert!(seen.insert(s), "duplicate CSRF state — RNG is broken");
+        }
     }
 
     #[test]
