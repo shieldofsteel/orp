@@ -499,6 +499,7 @@ mod tests {
             jwt_service: Some(Arc::new(jwt_svc)),
             api_key_service: None,
             permissive_mode: false,
+            oidc_validator: None,
         };
 
         let auth = resolve_ws_auth(&auth_state, Some(&token), None)
@@ -523,6 +524,7 @@ mod tests {
             jwt_service: Some(Arc::new(jwt_svc)),
             api_key_service: None,
             permissive_mode: false,
+            oidc_validator: None,
         };
         let auth = resolve_ws_auth(&auth_state, Some(&token), None)
             .await
@@ -551,6 +553,7 @@ mod tests {
             jwt_service: Some(Arc::new(jwt_svc)),
             api_key_service: None,
             permissive_mode: false,
+            oidc_validator: None,
         };
         let auth = resolve_ws_auth(&auth_state, Some(&token), None)
             .await
@@ -572,6 +575,7 @@ mod tests {
             jwt_service: Some(Arc::new(jwt_svc)),
             api_key_service: None,
             permissive_mode: false,
+            oidc_validator: None,
         };
         let err = resolve_ws_auth(&auth_state, Some("not.a.jwt"), None)
             .await
@@ -585,6 +589,7 @@ mod tests {
             jwt_service: Some(Arc::new(make_jwt_service())),
             api_key_service: None,
             permissive_mode: false,
+            oidc_validator: None,
         };
         let err = resolve_ws_auth(&auth_state, None, None).await.unwrap_err();
         assert_eq!(err, "Missing authentication credentials");
@@ -596,6 +601,7 @@ mod tests {
             jwt_service: None,
             api_key_service: None,
             permissive_mode: true,
+            oidc_validator: None,
         };
         let auth = resolve_ws_auth(&auth_state, None, None).await.unwrap();
         assert_eq!(auth.method, WsAuthMethod::PermissiveDev);
@@ -619,6 +625,7 @@ mod tests {
             jwt_service: None,
             api_key_service: Some(Arc::new(svc)),
             permissive_mode: false,
+            oidc_validator: None,
         };
         let auth = resolve_ws_auth(&auth_state, None, Some(&resp.api_key))
             .await
@@ -648,6 +655,7 @@ mod tests {
             jwt_service: None,
             api_key_service: Some(Arc::new(svc)),
             permissive_mode: false,
+            oidc_validator: None,
         };
         let err = resolve_ws_auth(&auth_state, None, Some(&resp.api_key))
             .await

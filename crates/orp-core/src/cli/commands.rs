@@ -809,6 +809,7 @@ pub async fn run_start(args: StartArgs) -> Result<()> {
                     jwt_service: None,
                     api_key_service: Some(api_key_service.clone()),
                     permissive_mode: false,
+                    oidc_validator: None,
                 })
             }
         }
@@ -872,7 +873,7 @@ pub async fn run_start(args: StartArgs) -> Result<()> {
         federation_registry: Some(server::federation::PeerRegistry::new()),
         port,
         headless,
-        federation_tls: federation_tls_enabled,
+        federation_tls,
         federation_signing_key_path: federation_signing_key.map(std::path::PathBuf::from),
         local_node_id,
         tls: tls_config,
