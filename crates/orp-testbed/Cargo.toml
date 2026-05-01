@@ -14,10 +14,10 @@ rand = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { workspace = true }
 orp-query = { path = "../orp-query" }
 orp-stream = { path = "../orp-stream" }
-tempfile = "3"
+tempfile = { workspace = true }
 uuid = { workspace = true }
 
 [[bench]]

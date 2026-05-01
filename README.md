@@ -201,6 +201,22 @@ cd examples/quickstart-ais && ./run.sh
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — component-by-component deep dive.
 - **[CHANGELOG.md](CHANGELOG.md)** — what landed when.
 
+### Benchmarks
+
+ORP ships a `criterion`-based benchmark suite that covers the parser, storage, stream-processor, and query hot paths.
+
+```bash
+cargo bench --workspace             # full suite (~5–10 min)
+cargo bench -p orp-connector        # parser benches only (~1–2 min)
+cargo bench -p orp-storage          # DuckDB write/query benches
+```
+
+- Post-v0.2.0 baseline numbers: [`benches/baseline.md`](benches/baseline.md).
+- CI policy + how to add new benches: [`docs/BENCHES.md`](docs/BENCHES.md).
+- Criterion HTML reports land in `target/criterion/report/index.html`.
+
+Benchmarks are dev-only — `criterion` lives in `[dev-dependencies]`, so the release binary stays single-binary.
+
 ---
 
 ## Building from Source
