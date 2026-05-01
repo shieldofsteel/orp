@@ -1,7 +1,23 @@
-//! API key generation, validation, storage, and rate limiting.
+//! API key generation, validation, and rate limiting.
 //!
-//! Keys follow the format: `orpk_prod_<random-hex>` as specified in the ORP API spec.
+//! Keys follow the format `orpk_prod_<id>_<plaintext>`, where:
+//!   - `id` is a 32-char hex (UUIDv4 without hyphens) — used to look up
+//!     the stored Argon2id hash.
+//!   - `plaintext` is 24 random bytes hex-encoded — verified against the
+//!     stored hash with `argon2id.verify_password`.
+//!
+//! Verification flow:
+//!   1. Split the raw key on `_` and extract `id` + `plaintext`.
+//!   2. Look up the [`ApiKeyRecord`] by `id` in the [`KeyStore`].
+//!   3. `argon2id.verify_password(plaintext, &record.phc_hash)`.
+//!
+//! Storage is delegated to the [`KeyStore`](crate::keystore::KeyStore)
+//! trait — `InMemoryKeyStore` for tests and dev mode, `DuckDbKeyStore`
+//! for production. The previous SHA-256-unsalted scheme + global
+//! `HashMap<key_hash, record>` is gone; nothing in this module touches
+//! plaintext outside of `create_key` / `validate_key`.
 
+use crate::keystore::{InMemoryKeyStore, KeyStore, KeyStoreError};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -29,12 +45,26 @@ pub enum ApiKeyError {
     InvalidFormat,
 }
 
+impl From<KeyStoreError> for ApiKeyError {
+    fn from(e: KeyStoreError) -> Self {
+        ApiKeyError::Storage(e.to_string())
+    }
+}
+
 /// An API key record stored in the backend.
+///
+/// The `key_hash` field exists for backwards compatibility with code that
+/// peeked at it before the Argon2id migration — it is now always empty
+/// because the PHC hash never leaves the [`KeyStore`] backend. New
+/// callers must rely on `id` for lookups.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApiKeyRecord {
-    /// Full key with prefix (e.g. `orpk_prod_abc123...`). Only stored as hash in prod.
+    /// Stable key identifier (32-char hex, embedded in the raw key).
     pub id: String,
-    /// SHA-256 hex hash of the raw key
+    /// **Deprecated.** Was the SHA-256 hex of the raw key in v0.2.x; now
+    /// always empty. Kept on the struct so old `serde_json` blobs still
+    /// deserialise. Will be dropped in v0.4.0.
+    #[serde(default)]
     pub key_hash: String,
     /// Human-readable name
     pub name: String,
@@ -80,7 +110,7 @@ pub struct CreateApiKeyRequest {
 pub struct CreateApiKeyResponse {
     /// The raw key — shown exactly once; not stored in plaintext
     pub api_key: String,
-    /// Stable key ID (UUID)
+    /// Stable key ID (32-char hex)
     pub id: String,
     pub name: String,
     pub scopes: Vec<String>,
@@ -118,44 +148,72 @@ impl Default for RateLimitSlot {
     }
 }
 
-/// In-memory + optional persistent API key service.
+/// API key service — stateless façade over a [`KeyStore`] backend plus an
+/// in-memory rate-limiter.
 ///
-/// For production use, swap the `store` map with DuckDB queries via `duckdb` crate.
-/// The current implementation stores keys in memory with hash-based lookup.
-#[derive(Clone, Debug)]
+/// The default constructor [`Self::new`] returns a service backed by an
+/// [`InMemoryKeyStore`] — that's the right choice for tests and the
+/// `--dev` startup path. Production wires [`Self::with_store`] to a
+/// `DuckDbKeyStore` so keys survive process restarts.
+#[derive(Clone)]
 pub struct ApiKeyService {
-    /// key_hash → record
-    store: Arc<RwLock<HashMap<String, ApiKeyRecord>>>,
-    /// key_id → rate-limit window
+    store: Arc<dyn KeyStore>,
+    /// key_id → rate-limit window. Always in-memory — rate limit state
+    /// is intentionally process-local, even in the persistent build.
     rate_limits: Arc<RwLock<HashMap<String, RateLimitSlot>>>,
 }
 
+impl std::fmt::Debug for ApiKeyService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyService")
+            .field("store", &"Arc<dyn KeyStore>")
+            .finish()
+    }
+}
+
 impl ApiKeyService {
-    /// Create a new in-memory API key service.
+    /// Create a new API key service backed by an in-memory store.
+    ///
+    /// Identical durability semantics to v0.2.x (process restart drops
+    /// every key) but with Argon2id hashing instead of SHA-256.
     pub fn new() -> Self {
+        Self::with_store(Arc::new(InMemoryKeyStore::new()))
+    }
+
+    /// Create a new API key service with the supplied keystore. Use this
+    /// to wire a `DuckDbKeyStore` (production) or any custom backend.
+    pub fn with_store(store: Arc<dyn KeyStore>) -> Self {
         Self {
-            store: Arc::new(RwLock::new(HashMap::new())),
+            store,
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
+    /// Reference to the backing store. Used by the bootstrap path to
+    /// seed an admin key when the table is empty.
+    pub fn store(&self) -> &Arc<dyn KeyStore> {
+        &self.store
+    }
+
     /// Generate a new API key from the given request.
     ///
-    /// Returns both the record and the raw key (plaintext) — the raw key is shown once only.
+    /// Returns both the record and the raw key (plaintext). The raw key
+    /// is shown exactly once — only the Argon2id hash is persisted.
     pub fn create_key(
         &self,
         req: CreateApiKeyRequest,
     ) -> Result<CreateApiKeyResponse, ApiKeyError> {
-        let raw_key = generate_api_key();
-        let key_hash = hash_key(&raw_key);
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = generate_id();
+        let raw_key = build_raw_key(&id);
+        let plaintext =
+            extract_plaintext(&raw_key).expect("freshly-built key matches the canonical format");
         let now = Utc::now();
         let rate_limit = req.rate_limit.unwrap_or(1000);
         let expires_at = req.expires_in.map(|secs| now + Duration::seconds(secs));
 
         let record = ApiKeyRecord {
             id: id.clone(),
-            key_hash: key_hash.clone(),
+            key_hash: String::new(),
             name: req.name.clone(),
             scopes: req.scopes.clone(),
             rate_limit_per_second: rate_limit,
@@ -166,10 +224,7 @@ impl ApiKeyService {
             last_used_at: None,
         };
 
-        self.store
-            .write()
-            .map_err(|e| ApiKeyError::Storage(e.to_string()))?
-            .insert(key_hash, record);
+        self.store.insert(&record, plaintext)?;
 
         Ok(CreateApiKeyResponse {
             api_key: raw_key,
@@ -182,45 +237,52 @@ impl ApiKeyService {
         })
     }
 
+    /// Insert a record built outside this service (used by the bootstrap
+    /// admin-key flow which generates its own plaintext for the operator
+    /// to capture).
+    pub fn import_key(&self, record: ApiKeyRecord, plaintext: &str) -> Result<(), ApiKeyError> {
+        self.store.insert(&record, plaintext)?;
+        Ok(())
+    }
+
     /// Validate a raw API key and check rate limits.
+    ///
+    /// Resolution order:
+    ///   1. Format check on the raw key (`orpk_prod_<id>_<plain>`).
+    ///   2. `KeyStore::verify` — succeeds only on (correct id +
+    ///      correct plaintext + not-revoked + not-expired).
+    ///   3. On verify-miss, fall through to `lookup_by_id` so we can
+    ///      tell the caller *why* (revoked vs expired vs not-found).
+    ///      The plaintext is **not** re-checked in this branch — we
+    ///      only reach it after the constant-time Argon2id verifier
+    ///      has already rejected the request, so leaking
+    ///      revoked-vs-not-found here is acceptable: an attacker who
+    ///      can already query `/api/v1/api-keys` (admin scope) sees
+    ///      this exact distinction anyway.
     pub async fn validate_key(&self, raw_key: &str) -> Result<ApiKeyValidationResult, ApiKeyError> {
-        if !raw_key.starts_with("orpk_prod_") && !raw_key.starts_with("orpk_dev_") {
-            return Err(ApiKeyError::InvalidFormat);
-        }
+        let (id, plaintext) = parse_raw_key(raw_key).ok_or(ApiKeyError::InvalidFormat)?;
 
-        let key_hash = hash_key(raw_key);
-
-        let record = {
-            let store = self
-                .store
-                .read()
-                .map_err(|e| ApiKeyError::Storage(e.to_string()))?;
-            store.get(&key_hash).cloned().ok_or(ApiKeyError::NotFound)?
+        let record = match self.store.verify(id, plaintext)? {
+            Some(rec) => rec,
+            None => {
+                // verify rejected — figure out the reason for the response.
+                let by_id = self.store.lookup_by_id(id)?;
+                return Err(match by_id {
+                    Some(r) if r.is_revoked => ApiKeyError::Revoked,
+                    Some(r) if r.is_expired() => ApiKeyError::Expired,
+                    Some(_) => ApiKeyError::NotFound, // wrong plaintext
+                    None => ApiKeyError::NotFound,
+                });
+            }
         };
-
-        if record.is_revoked {
-            return Err(ApiKeyError::Revoked);
-        }
-
-        if record.is_expired() {
-            return Err(ApiKeyError::Expired);
-        }
 
         // Rate limit check — sliding 1-second window
         if record.rate_limit_per_second > 0 {
             self.check_rate_limit(&record.id, record.rate_limit_per_second)?;
         }
 
-        // Update last_used_at
-        {
-            let mut store = self
-                .store
-                .write()
-                .map_err(|e| ApiKeyError::Storage(e.to_string()))?;
-            if let Some(rec) = store.get_mut(&key_hash) {
-                rec.last_used_at = Some(Utc::now());
-            }
-        }
+        // Best-effort last_used_at update; we already authenticated.
+        let _ = self.store.mark_used(&record.id, Utc::now());
 
         Ok(ApiKeyValidationResult {
             key_id: record.id,
@@ -234,26 +296,16 @@ impl ApiKeyService {
 
     /// Revoke a key by its ID.
     pub fn revoke_key(&self, key_id: &str) -> Result<(), ApiKeyError> {
-        let mut store = self
-            .store
-            .write()
-            .map_err(|e| ApiKeyError::Storage(e.to_string()))?;
-        for record in store.values_mut() {
-            if record.id == key_id {
-                record.is_revoked = true;
-                return Ok(());
-            }
+        if self.store.revoke(key_id)? {
+            Ok(())
+        } else {
+            Err(ApiKeyError::NotFound)
         }
-        Err(ApiKeyError::NotFound)
     }
 
     /// List all keys (without exposing raw key material).
     pub fn list_keys(&self) -> Result<Vec<ApiKeyRecord>, ApiKeyError> {
-        let store = self
-            .store
-            .read()
-            .map_err(|e| ApiKeyError::Storage(e.to_string()))?;
-        Ok(store.values().cloned().collect())
+        Ok(self.store.list_all()?)
     }
 
     fn check_rate_limit(&self, key_id: &str, limit: u64) -> Result<(), ApiKeyError> {
@@ -289,24 +341,59 @@ impl Default for ApiKeyService {
     }
 }
 
-/// Generate a new API key with the `orpk_prod_` prefix followed by 24 random bytes
-/// (48 hex chars ≈ 192 bits of entropy) drawn from the OS CSPRNG.
+// ─── Key generation / parsing ────────────────────────────────────────────────
+
+/// Generate a 32-char hex stable key identifier (UUIDv4, hyphens stripped).
 ///
-/// `OsRng` (not `thread_rng`) is required: API keys grant scoped access to the
-/// API surface, and a non-cryptographic RNG would let an attacker enumerate
-/// valid keys after observing a few.
-fn generate_api_key() -> String {
+/// The id is embedded in the raw key so lookups don't need to hash every
+/// stored record on every request. Argon2id is intentionally slow; an
+/// O(N)-then-Argon2id-each scan would make request validation
+/// proportional to the key population.
+pub(crate) fn generate_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// Build a raw API key from an existing id. The plaintext is fresh
+/// 24 random bytes from the OS CSPRNG. `OsRng` is mandatory: API keys
+/// grant scoped access to the API surface, and a non-cryptographic RNG
+/// would let an attacker enumerate plaintexts after observing a few.
+pub(crate) fn build_raw_key(id: &str) -> String {
     use rand::{rngs::OsRng, RngCore};
     let mut bytes = [0u8; 24];
     OsRng.fill_bytes(&mut bytes);
-    format!("orpk_prod_{}", hex::encode(bytes))
+    format!("orpk_prod_{}_{}", id, hex::encode(bytes))
 }
 
-/// SHA-256 hash of the raw key for storage.
-fn hash_key(raw_key: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(raw_key.as_bytes());
-    hex::encode(hash)
+/// Generate a brand-new bootstrap key — used by the `--bootstrap-admin-key`
+/// auto-generation path when neither a CLI flag nor an existing key
+/// table is present.
+pub fn generate_bootstrap_key() -> (String, String) {
+    let id = generate_id();
+    let raw = build_raw_key(&id);
+    (id, raw)
+}
+
+/// Split a raw API key into `(id, plaintext)`. Returns `None` for any
+/// key that doesn't match the `orpk_prod_<id>_<plaintext>` shape.
+fn parse_raw_key(raw: &str) -> Option<(&str, &str)> {
+    // Two accepted prefixes — `orpk_prod_` (production) and `orpk_dev_`
+    // (legacy demo keys). Everything after the prefix is `<id>_<plain>`.
+    let body = raw
+        .strip_prefix("orpk_prod_")
+        .or_else(|| raw.strip_prefix("orpk_dev_"))?;
+    let underscore = body.find('_')?;
+    let (id, rest) = body.split_at(underscore);
+    let plain = rest.strip_prefix('_')?;
+    if id.is_empty() || plain.is_empty() {
+        return None;
+    }
+    Some((id, plain))
+}
+
+/// Extract just the plaintext half. Used at create-time, where we know
+/// the key is well-formed (we just built it).
+fn extract_plaintext(raw: &str) -> Option<&str> {
+    parse_raw_key(raw).map(|(_, p)| p)
 }
 
 #[cfg(test)]
@@ -329,10 +416,24 @@ mod tests {
 
     #[test]
     fn test_key_format() {
-        let key = generate_api_key();
+        let id = generate_id();
+        let key = build_raw_key(&id);
         assert!(key.starts_with("orpk_prod_"), "key={key}");
-        // prefix(10) + 48 hex chars
-        assert_eq!(key.len(), 10 + 48, "key={key}");
+        // prefix(10) + id(32) + '_' + 48 hex chars
+        assert_eq!(key.len(), 10 + 32 + 1 + 48, "key={key}");
+        let (parsed_id, plain) = parse_raw_key(&key).unwrap();
+        assert_eq!(parsed_id, id);
+        assert_eq!(plain.len(), 48);
+    }
+
+    #[test]
+    fn test_parse_raw_key_rejects_malformed() {
+        // Wrong prefix
+        assert!(parse_raw_key("totally-not-an-orp-key").is_none());
+        // Missing underscore between id and plaintext
+        assert!(parse_raw_key("orpk_prod_abcdef").is_none());
+        // Empty id
+        assert!(parse_raw_key("orpk_prod__plaintext").is_none());
     }
 
     #[test]
@@ -342,6 +443,9 @@ mod tests {
         assert!(resp.api_key.starts_with("orpk_prod_"));
         assert_eq!(resp.name, "test-key");
         assert!(resp.scopes.contains(&"entities:read".to_string()));
+        // The id in the response must match the id embedded in the raw key.
+        let (embedded_id, _) = parse_raw_key(&resp.api_key).unwrap();
+        assert_eq!(embedded_id, resp.id);
     }
 
     #[tokio::test]
@@ -365,7 +469,23 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_key_rejected() {
         let svc = test_service();
-        let result = svc.validate_key("orpk_prod_aaabbbccc000111").await;
+        // Well-formed but never inserted.
+        let id = generate_id();
+        let raw = build_raw_key(&id);
+        let result = svc.validate_key(&raw).await;
+        assert!(matches!(result, Err(ApiKeyError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_wrong_plaintext_rejected() {
+        let svc = test_service();
+        let resp = svc.create_key(make_request()).unwrap();
+        // Tamper the plaintext while keeping the id valid.
+        let (id, _) = parse_raw_key(&resp.api_key).unwrap();
+        let mut tampered = format!("orpk_prod_{id}_");
+        // Different plaintext of valid length.
+        tampered.push_str(&"a".repeat(48));
+        let result = svc.validate_key(&tampered).await;
         assert!(matches!(result, Err(ApiKeyError::NotFound)));
     }
 
@@ -375,7 +495,12 @@ mod tests {
         let resp = svc.create_key(make_request()).unwrap();
         svc.revoke_key(&resp.id).unwrap();
         let result = svc.validate_key(&resp.api_key).await;
-        assert!(matches!(result, Err(ApiKeyError::Revoked)));
+        // After revoke, `verify` returns None and the fallback
+        // `lookup_by_id` re-surfaces the revoked status.
+        assert!(
+            matches!(result, Err(ApiKeyError::Revoked)),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -387,7 +512,10 @@ mod tests {
         };
         let resp = svc.create_key(req).unwrap();
         let result = svc.validate_key(&resp.api_key).await;
-        assert!(matches!(result, Err(ApiKeyError::Expired)));
+        assert!(
+            matches!(result, Err(ApiKeyError::Expired)),
+            "got {result:?}"
+        );
     }
 
     #[test]

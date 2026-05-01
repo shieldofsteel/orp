@@ -8,6 +8,7 @@ use orp_connector::Connector;
 use orp_proto::{EventPayload, OrpEvent};
 use orp_query::QueryExecutor;
 use orp_security::api_keys::ApiKeyService;
+use orp_security::keystore::{DuckDbKeyStore, InMemoryKeyStore};
 use orp_security::{AbacEngine, AuthState, JwtService};
 use orp_storage::traits::Storage;
 use orp_storage::DuckDbStorage;
@@ -87,6 +88,123 @@ pub fn print_warning(msg: &str) {
 pub fn fatal(msg: &str) -> ! {
     print_error(msg);
     std::process::exit(1);
+}
+
+// ── Bootstrap admin key ───────────────────────────────────────────────────────
+
+/// Seed the API-key store with an admin key on first startup.
+///
+/// Two paths:
+///   1. Operator passed `--bootstrap-admin-key <RAW_KEY>` — we hash it
+///      (Argon2id) and persist; nothing is printed. The operator already
+///      has the value.
+///   2. No flag — we generate a fresh key, persist its hash, and print
+///      the raw value to **stderr** exactly once. Stdout is reserved
+///      for structured output; stderr is the right channel for "you
+///      need to write this down right now."
+///
+/// The raw plaintext leaves this function in exactly one place (the
+/// `eprintln!` below) and is dropped immediately after. It is never
+/// written to a log file via `tracing` because tracing subscribers may
+/// forward to remote sinks, and admin keys must never leak to remote
+/// observability stacks.
+fn seed_bootstrap_admin_key(svc: Arc<ApiKeyService>, user_supplied: Option<&str>) -> Result<()> {
+    use orp_security::api_keys::{generate_bootstrap_key, ApiKeyRecord};
+
+    let admin_scopes: Vec<String> = vec!["admin".to_string()];
+    let now = chrono::Utc::now();
+
+    if let Some(raw) = user_supplied {
+        // Re-derive the id from the user's raw key so the persisted
+        // record's `id` matches what the parser will extract on
+        // validate_key. We don't validate the format here beyond the
+        // basic prefix check — operators are trusted to paste the key
+        // they got from a previous run.
+        let id = parse_user_supplied_id(raw).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--bootstrap-admin-key value is malformed; expected \
+                 'orpk_prod_<id>_<plaintext>' shape"
+            )
+        })?;
+        let plaintext = parse_user_supplied_plaintext(raw).expect("validated above");
+        let record = ApiKeyRecord {
+            id: id.to_string(),
+            key_hash: String::new(),
+            name: "bootstrap-admin".to_string(),
+            scopes: admin_scopes,
+            rate_limit_per_second: 0,
+            expires_at: None,
+            is_revoked: false,
+            org_id: None,
+            created_at: now,
+            last_used_at: None,
+        };
+        svc.import_key(record, plaintext)
+            .map_err(|e| anyhow::anyhow!("bootstrap admin key insert failed: {}", e))?;
+        tracing::info!("Bootstrap admin key (operator-supplied) seeded into the api_keys table");
+        Ok(())
+    } else {
+        let (id, raw) = generate_bootstrap_key();
+        let plaintext = parse_user_supplied_plaintext(&raw)
+            .expect("freshly-built key matches canonical format");
+        let record = ApiKeyRecord {
+            id: id.clone(),
+            key_hash: String::new(),
+            name: "bootstrap-admin".to_string(),
+            scopes: admin_scopes,
+            rate_limit_per_second: 0,
+            expires_at: None,
+            is_revoked: false,
+            org_id: None,
+            created_at: now,
+            last_used_at: None,
+        };
+        svc.import_key(record, plaintext)
+            .map_err(|e| anyhow::anyhow!("bootstrap admin key insert failed: {}", e))?;
+        // Print to stderr exactly once. The operator MUST capture this
+        // value — it never appears in the database in plaintext form.
+        eprintln!(
+            "\n\
+             ╔═══════════════════════════════════════════════════════════════════════╗\n\
+             ║  ORP BOOTSTRAP ADMIN KEY — copy this NOW; it will not be shown again. ║\n\
+             ║                                                                       ║\n\
+             ║  X-API-Key: {raw}\n\
+             ║                                                                       ║\n\
+             ║  This key has scope=\"admin\" and no expiry. Rotate it via              ║\n\
+             ║  POST /api/v1/api-keys before opening the server to the public.       ║\n\
+             ╚═══════════════════════════════════════════════════════════════════════╝\n",
+        );
+        Ok(())
+    }
+}
+
+/// Extract the id half of a raw API key (prefix-stripped, before the
+/// underscore separator). Returns `None` for malformed input.
+fn parse_user_supplied_id(raw: &str) -> Option<&str> {
+    let body = raw
+        .strip_prefix("orpk_prod_")
+        .or_else(|| raw.strip_prefix("orpk_dev_"))?;
+    let underscore = body.find('_')?;
+    let id = &body[..underscore];
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+/// Extract the plaintext half of a raw API key.
+fn parse_user_supplied_plaintext(raw: &str) -> Option<&str> {
+    let body = raw
+        .strip_prefix("orpk_prod_")
+        .or_else(|| raw.strip_prefix("orpk_dev_"))?;
+    let underscore = body.find('_')?;
+    let plain = &body[underscore + 1..];
+    if plain.is_empty() {
+        None
+    } else {
+        Some(plain)
+    }
 }
 
 // ── Confirmation prompt ───────────────────────────────────────────────────────
@@ -254,6 +372,7 @@ fn base_url(host: &str) -> String {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 /// Start the ORP server
+#[allow(clippy::too_many_arguments)]
 pub async fn run_start(
     config_path: Option<String>,
     template: Option<String>,
@@ -262,6 +381,7 @@ pub async fn run_start(
     headless: bool,
     no_auth: bool,
     in_memory: bool,
+    bootstrap_admin_key: Option<String>,
 ) -> Result<()> {
     // --no-auth implies --dev and sets ORP_DEV_MODE
     let dev = dev || no_auth;
@@ -524,6 +644,70 @@ pub async fn run_start(
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
+    // ── API-key store ───────────────────────────────────────────────────
+    //
+    // Build *one* `ApiKeyService` and share it between `AuthState`
+    // (used by the AuthContext extractor to validate incoming keys) and
+    // `AppState` (used by `POST /api/v1/api-keys` to mint new ones).
+    // v0.2.x silently constructed two separate in-memory services here,
+    // which meant keys minted via the API could never authenticate.
+    //
+    // Backend choice:
+    //   - in-memory mode → InMemoryKeyStore (state vanishes on shutdown,
+    //     same as everything else under `--in-memory`).
+    //   - persistent mode → DuckDbKeyStore on a *separate* DuckDB file
+    //     next to the main storage path. We don't share the main
+    //     DuckDB connection because (a) DuckDbStorage keeps it behind
+    //     a private mutex and (b) auth state benefits from being on
+    //     its own file for backup / rotation purposes.
+    let api_key_service: Arc<ApiKeyService> = if in_memory || is_dev_mode {
+        Arc::new(ApiKeyService::with_store(Arc::new(InMemoryKeyStore::new())))
+    } else {
+        let auth_db_path = config
+            .storage
+            .duckdb
+            .path
+            .replace(".duckdb", "-auth.duckdb");
+        // If the configured storage path doesn't end in `.duckdb`,
+        // fall back to appending `-auth.duckdb` so we still get an
+        // isolated file rather than overwriting the main one.
+        let auth_db_path = if auth_db_path == config.storage.duckdb.path {
+            format!("{}-auth.duckdb", config.storage.duckdb.path)
+        } else {
+            auth_db_path
+        };
+        if let Some(parent) = std::path::Path::new(&auth_db_path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("Auth DB dir create failed: {}", e))?;
+        }
+        let store = DuckDbKeyStore::open_path(&auth_db_path)
+            .map_err(|e| anyhow::anyhow!("Auth keystore init failed at {}: {}", auth_db_path, e))?;
+        let svc = Arc::new(ApiKeyService::with_store(Arc::new(store)));
+
+        // Bootstrap: seed an admin key when the table is empty so the
+        // operator has *some* way to authenticate after a fresh
+        // install. This runs exactly once — on the first boot of a
+        // given auth DB file. We deliberately log the bootstrap key
+        // to stderr (not stdout), and only when we generated one
+        // ourselves (the `--bootstrap-admin-key` path doesn't reprint
+        // a value the operator already knows).
+        let count = svc
+            .store()
+            .count()
+            .map_err(|e| anyhow::anyhow!("Auth keystore count failed: {}", e))?;
+        if count == 0 {
+            seed_bootstrap_admin_key(svc.clone(), bootstrap_admin_key.as_deref())?;
+        } else if bootstrap_admin_key.is_some() {
+            tracing::warn!(
+                "--bootstrap-admin-key was supplied but the api_keys table already \
+                 contains {} key(s); the flag has been ignored. To rotate, revoke an \
+                 existing key via the admin API and re-bootstrap on a fresh DB.",
+                count,
+            );
+        }
+        svc
+    };
+
     let auth_state: Arc<AuthState> = if is_dev_mode {
         tracing::warn!("⚠️  ORP_DEV_MODE is enabled — authentication is permissive");
         // Refuse to boot if `ORP_DEV_MODE=true` is leaking into a
@@ -532,16 +716,21 @@ pub async fn run_start(
         Arc::new(AuthState::dev().map_err(|e| anyhow::anyhow!("auth state init failed: {}", e))?)
     } else {
         match JwtService::from_env() {
-            Ok(jwt_svc) => {
-                let api_key_svc = Arc::new(ApiKeyService::new());
-                Arc::new(AuthState::production(Arc::new(jwt_svc), api_key_svc))
-            }
+            Ok(jwt_svc) => Arc::new(AuthState::production(
+                Arc::new(jwt_svc),
+                api_key_service.clone(),
+            )),
             Err(_) => {
                 tracing::warn!(
-                    "JWT_SECRET not set and ORP_DEV_MODE not enabled — auth will reject all \
-                     requests. Set JWT_SECRET or pass --dev"
+                    "JWT_SECRET not set and ORP_DEV_MODE not enabled — JWT auth will \
+                     reject all requests. API-key auth still works via the persistent \
+                     keystore. Set JWT_SECRET to enable JWT, or pass --dev for permissive auth."
                 );
-                Arc::new(AuthState::default())
+                Arc::new(AuthState {
+                    jwt_service: None,
+                    api_key_service: Some(api_key_service.clone()),
+                    permissive_mode: false,
+                })
             }
         }
     };
@@ -556,8 +745,6 @@ pub async fn run_start(
     tracing::info!("Dashboard: http://localhost:{}/", port);
     tracing::info!("API:       http://localhost:{}/api/v1/", port);
     tracing::info!("Health:    http://localhost:{}/api/v1/health", port);
-
-    let api_key_service = Arc::new(ApiKeyService::new());
 
     // Initialize layer registry (separate in-memory DuckDB for overlays)
     let layer_registry = {
@@ -782,12 +969,10 @@ pub async fn run_status(host: &str, format: OutputFormat) -> Result<()> {
                         } else {
                             "OK ".to_string()
                         }
+                    } else if colors_enabled() {
+                        format!("{}", "●".red())
                     } else {
-                        if colors_enabled() {
-                            format!("{}", "●".red())
-                        } else {
-                            "ERR".to_string()
-                        }
+                        "ERR".to_string()
                     };
                     println!("  {} {}{}", indicator, name, latency);
                 }
