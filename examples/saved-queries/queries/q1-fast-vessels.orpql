@@ -1,0 +1,6 @@
+-- Vessels exceeding 25 knots in the last hour. Useful for a "speeders" panel.
+MATCH (s:ship)
+WHERE s.speed > 25
+RETURN s.name, s.mmsi, s.speed, s.lat, s.lon
+ORDER BY s.speed DESC
+LIMIT 50

@@ -1,4 +1,5 @@
 pub mod federation;
+pub mod federation_tls;
 pub mod handlers;
 pub mod http;
 pub mod ingest;

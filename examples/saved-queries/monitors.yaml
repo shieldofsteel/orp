@@ -1,0 +1,22 @@
+# examples/saved-queries/monitors.yaml
+#
+# Three monitor rules loaded via `orp monitors add` in run.sh. They use the
+# simple `<property> <op> <value>` form because that's what `orp monitors add`
+# accepts today; for richer predicates embed an ORP-QL query in a custom
+# rule per the API reference.
+
+monitors:
+  - name: "Fast vessel"
+    entity_type: "ship"
+    condition: "speed > 25"
+    severity: "warning"
+
+  - name: "Low aircraft"
+    entity_type: "aircraft"
+    condition: "altitude < 1000"
+    severity: "warning"
+
+  - name: "Critical sensor"
+    entity_type: "sensor"
+    condition: "status_code >= 500"
+    severity: "critical"

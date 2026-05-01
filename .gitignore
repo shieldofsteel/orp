@@ -5,3 +5,10 @@
 Cargo.lock
 .DS_Store
 .claude/
+
+# macOS resource-fork files created when external drives (Sony) sync
+# metadata back to APFS. Hundreds of these appear when working in worktrees
+# on HFS+ / exFAT external storage and would otherwise pollute commits.
+._*
+.AppleDouble
+.LSOverride

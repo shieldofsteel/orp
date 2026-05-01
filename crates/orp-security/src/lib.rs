@@ -44,9 +44,11 @@
 pub mod abac;
 pub mod api_keys;
 pub mod jwt;
+pub mod keystore;
 pub mod middleware;
 pub mod oidc;
 pub mod rbac;
+pub mod url_safety;
 
 // ─── Convenience re-exports ───────────────────────────────────────────────────
 
@@ -56,15 +58,17 @@ pub use abac::{
 };
 
 pub use api_keys::{
-    ApiKeyError, ApiKeyRecord, ApiKeyService, ApiKeyValidationResult, CreateApiKeyRequest,
-    CreateApiKeyResponse,
+    generate_bootstrap_key, ApiKeyError, ApiKeyRecord, ApiKeyService, ApiKeyValidationResult,
+    CreateApiKeyRequest, CreateApiKeyResponse,
 };
+
+pub use keystore::{DuckDbKeyStore, InMemoryKeyStore, KeyStore, KeyStoreError};
 
 pub use jwt::{Claims, JwtAlgorithm, JwtConfig, JwtError, JwtService};
 
 pub use middleware::{AuthContext, AuthError, AuthMethod, AuthState};
 
-pub use oidc::{OidcClient, OidcConfig, OidcError, SecurityError, TokenResponse};
+pub use oidc::{OidcClient, OidcConfig, OidcError, OidcValidator, SecurityError, TokenResponse};
 
 pub use rbac::{
     check_role_permission, check_role_permission_str, register_rbac_policies, Action as RbacAction,

@@ -20,6 +20,10 @@ orp-security = { path = "../orp-security" }
 orp-geospatial = { path = "../orp-geospatial" }
 tokio = { workspace = true }
 axum = { workspace = true }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 tower = { workspace = true }
 tower-http = { workspace = true }
 serde = { workspace = true }
@@ -30,9 +34,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "blocking", "rustls-tls"], default-features = false }
 base64 = "0.22"
+ed25519-dalek = { workspace = true }
 duckdb = { version = "1.2", features = ["bundled"] }
+which = "6"
 thiserror = { workspace = true }
 orp-testbed = { path = "../orp-testbed" }
 tabled = "0.17"
@@ -42,6 +48,13 @@ csv = "1.3"
 sha2 = { workspace = true }
 rand = { workspace = true }
 hex = "0.4"
+# Argon2id for password hashing (users.rs). OWASP 2023 floor: m=19 MiB, t=2, p=1.
+# `password-hash` provides the PHC string format types (`SaltString`, `PasswordHash`).
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["alloc"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["full", "test-util"] }

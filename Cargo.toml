@@ -35,12 +35,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 tower = "0.5"
-tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "fs", "set-header"] }
 clap = { version = "4", features = ["derive", "env"] }
 nom = "7.1"
 sha2 = "0.10"
-ed25519-dalek = { version = "2.1", features = ["serde"] }
+ed25519-dalek = { version = "2.1", features = ["serde", "pem"] }
 rand = "0.8"
+rustls-pemfile = "2.1"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = "0.13"
+# Bench harness — kept here so each crate can pull it as a dev-dep without
+# duplicating version pins. Criterion is dev-only; it never lands in the
+# release binary.
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

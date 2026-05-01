@@ -18,6 +18,7 @@
 //! `spawn_federation_sync` starts a Tokio task that wakes every 30 s and
 //! pulls `/api/v1/entities` from every registered peer.
 
+use crate::server::federation_tls::{PeerTrust, SignedFederationEnvelope, DEFAULT_CONFIDENCE_CAP};
 use crate::server::http::AppState;
 use axum::{
     extract::{Path, State},
@@ -43,7 +44,7 @@ pub struct Peer {
     pub id: String,
     /// Hostname or IP of the remote ORP instance.
     pub host: String,
-    /// HTTP port (usually 8080).
+    /// HTTP(S) port (usually 9090 for plaintext, 9443 for mTLS).
     pub port: u16,
     /// Entity types this peer is allowed to share with us.
     pub shared_entity_types: Vec<String>,
@@ -51,12 +52,37 @@ pub struct Peer {
     pub last_seen: Option<String>,
     /// Whether auto-sync is enabled for this peer.
     pub sync_enabled: bool,
+    /// When set, federation traffic to/from this peer uses HTTPS, requires a
+    /// valid mTLS handshake, and verifies Ed25519 envelope signatures using
+    /// `trust.signing_pubkey`. Inbound `confidence` is clamped to
+    /// `trust.max_confidence_cap` (default 0.9).
+    ///
+    /// `None` keeps the legacy v0.2.0 plain-HTTP behaviour for that single
+    /// peer — useful for staged rollouts where one bridge node still talks
+    /// to a fleet that has not been re-keyed.
+    #[serde(default)]
+    pub trust: Option<PeerTrust>,
 }
 
 impl Peer {
-    /// Base URL for the remote ORP REST API.
+    /// Base URL for the remote ORP REST API. Switches scheme based on whether
+    /// the peer has trust material configured: pinned-pubkey peers always
+    /// talk HTTPS; un-pinned peers continue using HTTP for backward compat.
     pub fn base_url(&self) -> String {
-        format!("http://{}:{}/api/v1", self.host, self.port)
+        let scheme = if self.trust.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{}://{}:{}/api/v1", scheme, self.host, self.port)
+    }
+
+    /// Effective confidence ceiling for entities received from this peer.
+    pub fn confidence_cap(&self) -> f64 {
+        self.trust
+            .as_ref()
+            .map(|t| t.confidence_cap())
+            .unwrap_or(DEFAULT_CONFIDENCE_CAP)
     }
 }
 
@@ -186,6 +212,12 @@ pub struct RegisterPeerRequest {
     pub shared_entity_types: Vec<String>,
     /// Defaults to true.
     pub sync_enabled: Option<bool>,
+    /// Optional pinned trust material. When provided, federation traffic
+    /// to/from this peer uses HTTPS + Ed25519 envelope signing, and the
+    /// receiver clamps incoming `confidence` to `max_confidence_cap`
+    /// (default 0.9).
+    #[serde(default)]
+    pub trust: Option<PeerTrust>,
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
@@ -236,6 +268,21 @@ pub async fn register_peer(
             .into_response();
         }
 
+        // Validate signing_pubkey early so a misconfigured peer is rejected
+        // at registration rather than at first sync. Failing fast here also
+        // prevents a quiet downgrade to plaintext when the operator typo's
+        // the pubkey but expected mTLS.
+        if let Some(t) = &body.trust {
+            if let Err(e) = t.verifying_key() {
+                return error_response(
+                    "VALIDATION_ERROR",
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid trust.signing_pubkey for peer '{}': {}", body.id, e),
+                )
+                .into_response();
+            }
+        }
+
         let peer = Peer {
             id: body.id.clone(),
             host: body.host,
@@ -243,6 +290,7 @@ pub async fn register_peer(
             shared_entity_types: body.shared_entity_types,
             last_seen: None,
             sync_enabled: body.sync_enabled.unwrap_or(true),
+            trust: body.trust,
         };
 
         registry.register(peer.clone()).await;
@@ -415,8 +463,9 @@ pub async fn pull_entities_from_peer(
             None => continue,
         };
 
+        let cap = peer.confidence_cap();
         for raw in &entities {
-            if let Ok(written) = upsert_federated_entity(raw, &peer.id, state).await {
+            if let Ok(written) = upsert_federated_entity(raw, &peer.id, cap, state).await {
                 if written {
                     total_written += 1;
                 }
@@ -437,6 +486,7 @@ pub async fn pull_entities_from_peer(
 async fn upsert_federated_entity(
     raw: &serde_json::Value,
     peer_id: &str,
+    confidence_cap: f64,
     state: &AppState,
 ) -> anyhow::Result<bool> {
     let entity_id = raw
@@ -451,10 +501,25 @@ async fn upsert_federated_entity(
         .unwrap_or("generic")
         .to_string();
 
-    let incoming_confidence = raw
+    // Clamp incoming confidence to the per-peer cap. A compromised peer
+    // sending `confidence = 1.0` for every entity can no longer override
+    // local truth — the highest a peer-sourced entity can ever score is
+    // its `max_confidence_cap` (default 0.9), strictly below a perfectly
+    // trusted local observation at 1.0.
+    let raw_confidence = raw
         .get("confidence")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.5);
+    let incoming_confidence = raw_confidence.min(confidence_cap).clamp(0.0, 1.0);
+    if (raw_confidence - incoming_confidence).abs() > f64::EPSILON {
+        tracing::debug!(
+            peer_id = %peer_id,
+            entity_id = %entity_id,
+            raw = raw_confidence,
+            clamped = incoming_confidence,
+            "Clamped peer confidence to per-peer cap"
+        );
+    }
 
     // Check local copy — if it exists with higher confidence, skip.
     if let Ok(Some(existing)) = state.storage.get_entity(&entity_id).await {
@@ -645,13 +710,51 @@ pub fn enqueue_outbound(
     outbox.enqueue(peer_id, entity_id, payload_json)
 }
 
-/// Push a single buffered entity to the peer's `/api/v1/entities` endpoint.
-/// Returns Ok(()) on a 2xx response — caller `ack`s the outbox key on success.
+/// Push a single buffered entity to the peer's federation endpoint.
+///
+/// When `peer.trust` is configured (the secure path), the payload is wrapped
+/// in a `SignedFederationEnvelope` and POSTed to `/federation/push` over
+/// HTTPS. Without trust, the legacy plaintext flow is preserved: bare entity
+/// JSON to `/entities`. Both paths return `Ok(())` only on 2xx; the outbox
+/// pump treats anything else as a retry-on-next-tick.
 async fn push_one_to_peer(
     client: &reqwest::Client,
     peer: &Peer,
     payload_json: &str,
+    state: &AppState,
 ) -> anyhow::Result<()> {
+    if let Some(trust) = &peer.trust {
+        // Belt-and-braces: validate the pinned pubkey on every push so a
+        // mid-life corruption of the registry doesn't let us silently sign
+        // for a key the receiver can't decode.
+        trust
+            .verifying_key()
+            .map_err(|e| anyhow::anyhow!("invalid peer pubkey: {}", e))?;
+
+        let payload: serde_json::Value = serde_json::from_str(payload_json)
+            .map_err(|e| anyhow::anyhow!("non-JSON payload in outbox: {}", e))?;
+        let local_id = state.local_node_id.clone();
+        let seq = state.federation_seq.next(&peer.id).await;
+        let signing_key = state.federation_signer.signing_key.clone();
+        let envelope = SignedFederationEnvelope::seal(&local_id, seq, &signing_key, payload)
+            .map_err(|e| anyhow::anyhow!("envelope seal failed: {}", e))?;
+        let url = format!("{}/federation/push", peer.base_url());
+        let resp = client
+            .post(&url)
+            .json(&envelope)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("HTTPS push failed: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "peer {} returned non-2xx (signed push): {}",
+                peer.id,
+                resp.status()
+            ));
+        }
+        return Ok(());
+    }
+
     let url = format!("{}/entities", peer.base_url());
     let resp = client
         .post(&url)
@@ -668,6 +771,125 @@ async fn push_one_to_peer(
         ));
     }
     Ok(())
+}
+
+// ── Inbound signed-push handler ──────────────────────────────────────────────
+
+/// `POST /api/v1/federation/push` — accept a signed entity push from a peer.
+///
+/// Verification chain:
+///   1. The sender claimed in the envelope must match a registered peer.
+///   2. That peer must have `trust.signing_pubkey` configured (we never
+///      accept signed pushes for "trustless" peers — operator opt-in only).
+///   3. Ed25519 signature must verify against the pinned pubkey.
+///   4. Timestamp must be within ±5 min of receiver clock.
+///   5. Sequence number must strictly exceed the highest previously seen
+///      seq from this sender.
+///
+/// On success, the inner payload is upserted using the same conflict
+/// resolution + confidence-cap clamp as the pull path, so signed pushes can
+/// never bypass any of the trust controls.
+pub async fn receive_signed_push(
+    State(state): State<Arc<AppState>>,
+    Json(envelope): Json<SignedFederationEnvelope>,
+) -> impl IntoResponse {
+    let registry = match &state.federation_registry {
+        Some(r) => r.clone(),
+        None => {
+            return error_response(
+                "FEDERATION_DISABLED",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Federation is not enabled on this instance",
+            )
+            .into_response();
+        }
+    };
+
+    let peer = match registry.get(&envelope.sender).await {
+        Some(p) => p,
+        None => {
+            return error_response(
+                "UNKNOWN_PEER",
+                StatusCode::UNAUTHORIZED,
+                &format!("No peer registered with id '{}'", envelope.sender),
+            )
+            .into_response();
+        }
+    };
+
+    let trust = match peer.trust.as_ref() {
+        Some(t) => t,
+        None => {
+            return error_response(
+                "TRUST_REQUIRED",
+                StatusCode::UNAUTHORIZED,
+                "Peer is registered but has no signing_pubkey configured; signed push refused",
+            )
+            .into_response();
+        }
+    };
+
+    let pubkey = match trust.verifying_key() {
+        Ok(k) => k,
+        Err(e) => {
+            return error_response(
+                "INVALID_PUBKEY",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Stored pubkey for peer '{}' is invalid: {}", peer.id, e),
+            )
+            .into_response();
+        }
+    };
+
+    if let Err(e) = envelope.verify(&pubkey) {
+        warn!(peer_id = %peer.id, error = %e, "Federation: signature verification failed");
+        return error_response(
+            "BAD_SIGNATURE",
+            StatusCode::UNAUTHORIZED,
+            "Signature verification failed",
+        )
+        .into_response();
+    }
+
+    let tracker = match &state.federation_replay {
+        Some(t) => t.clone(),
+        None => {
+            return error_response(
+                "FEDERATION_DISABLED",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Replay tracker not initialised",
+            )
+            .into_response();
+        }
+    };
+
+    if let Err(e) = tracker.check_and_record(&envelope).await {
+        warn!(peer_id = %peer.id, error = %e, "Federation: replay/skew check failed");
+        return error_response(
+            "REPLAY_REJECTED",
+            StatusCode::UNAUTHORIZED,
+            &format!("{}", e),
+        )
+        .into_response();
+    }
+
+    let cap = peer.confidence_cap();
+    let raw_entity = envelope.payload;
+    match upsert_federated_entity(&raw_entity, &peer.id, cap, &state).await {
+        Ok(written) => Json(serde_json::json!({
+            "status": "ok",
+            "written": written,
+            "sender": peer.id,
+            "seq": envelope.seq,
+        }))
+        .into_response(),
+        Err(e) => error_response(
+            "UPSERT_FAILED",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("{}", e),
+        )
+        .into_response(),
+    }
 }
 
 /// Background task that drains the federation outbox to peers as they are
@@ -730,7 +952,7 @@ pub fn spawn_outbox_pump(state: Arc<AppState>) {
                 }
                 let mut delivered = 0usize;
                 for (key, entry) in &batch {
-                    match push_one_to_peer(&client, peer, &entry.payload_json).await {
+                    match push_one_to_peer(&client, peer, &entry.payload_json, &state).await {
                         Ok(()) => match outbox.ack(key) {
                             Ok(()) => delivered += 1,
                             Err(e) => {
@@ -787,6 +1009,7 @@ mod tests {
             shared_entity_types: vec!["ship".to_string(), "aircraft".to_string()],
             last_seen: None,
             sync_enabled: true,
+            trust: None,
         }
     }
 

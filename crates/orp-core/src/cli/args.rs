@@ -47,7 +47,9 @@ pub enum Commands {
     ///   orp start --headless              # API-only mode for servers/Pi/embedded
     ///   orp start --no-auth               # Dev shortcut (permissive auth + dev mode)
     Start {
-        /// Override the server port
+        /// Override the server port. Defaults to the value in config.yaml
+        /// (typically 9090 for HTTP). When TLS flags are passed and `--port`
+        /// is not, the default becomes 9443.
         #[arg(short, long)]
         port: Option<u16>,
 
@@ -79,6 +81,75 @@ pub enum Commands {
         /// vanish on shutdown.
         #[arg(long)]
         in_memory: bool,
+
+        /// Seed the API-key store with this admin key on first startup
+        /// (only when the `api_keys` table is empty). Pass the literal raw
+        /// key value (e.g. `orpk_prod_<id>_<plaintext>`); ORP hashes it
+        /// with Argon2id before persisting. If the table is already
+        /// non-empty this flag is ignored. If the table is empty AND
+        /// this flag is unset, ORP generates a random admin key and
+        /// prints it to stderr exactly once — capture it from the
+        /// startup logs and rotate before going to production.
+        #[arg(long, value_name = "RAW_KEY")]
+        bootstrap_admin_key: Option<String>,
+
+        /// Enable the dedicated federation mTLS listener. When set, ORP
+        /// also requires `--federation-cert`, `--federation-key`, and
+        /// `--federation-ca`.
+        #[arg(long, env = "ORP_FED_TLS")]
+        federation_tls: bool,
+
+        /// Server certificate (PEM) presented to peers connecting in over
+        /// the federation mTLS port. Required when `--federation-tls` is set.
+        #[arg(long, env = "ORP_FED_CERT", value_name = "PATH")]
+        federation_cert: Option<String>,
+
+        /// Server private key (PEM) for `--federation-cert`.
+        #[arg(long, env = "ORP_FED_KEY", value_name = "PATH")]
+        federation_key: Option<String>,
+
+        /// CA certificate (PEM) used to verify connecting peers' client
+        /// certs. Required when `--federation-tls` is set.
+        #[arg(long, env = "ORP_FED_CA", value_name = "PATH")]
+        federation_ca: Option<String>,
+
+        /// Bind address for the federation mTLS listener.
+        /// Defaults to `0.0.0.0:9443`.
+        #[arg(long, env = "ORP_FED_TLS_LISTEN", value_name = "ADDR")]
+        federation_tls_listen: Option<String>,
+
+        /// Path to the local Ed25519 signing key (32 raw bytes or 64-char
+        /// hex). Without this, ORP generates an ephemeral key at startup
+        /// and peers must be re-keyed on every restart.
+        #[arg(long, env = "ORP_FED_SIGNING_KEY", value_name = "PATH")]
+        federation_signing_key: Option<String>,
+
+        /// Stable identifier for this node when pushing federated entities
+        /// to peers. Defaults to a per-process UUID.
+        #[arg(long, env = "ORP_NODE_ID", value_name = "ID")]
+        node_id: Option<String>,
+
+        /// Path to PEM-encoded TLS server certificate (chain). Pair with
+        /// `--tls-key` to enable HTTPS termination via rustls.
+        #[arg(long, value_name = "PATH", requires = "tls_key")]
+        tls_cert: Option<String>,
+
+        /// Path to PEM-encoded TLS server private key. Required with
+        /// `--tls-cert`.
+        #[arg(long, value_name = "PATH", requires = "tls_cert")]
+        tls_key: Option<String>,
+
+        /// Optional path to a PEM bundle of trusted client CAs. When set,
+        /// the server requires every client to present a certificate signed
+        /// by one of these CAs (mTLS). Requires `--tls-cert`/`--tls-key`.
+        #[arg(long, value_name = "PATH", requires_all = ["tls_cert", "tls_key"])]
+        tls_client_ca: Option<String>,
+
+        /// When TLS is active, also bind a plain-HTTP listener on this port
+        /// that 301-redirects every request to the HTTPS origin. Common
+        /// values: 80 (when ORP is fronted directly).
+        #[arg(long, value_name = "PORT", requires_all = ["tls_cert", "tls_key"])]
+        redirect_http: Option<u16>,
     },
 
     /// Connect a data source in one command
@@ -243,6 +314,48 @@ pub enum Commands {
         action: ConfigAction,
     },
 
+    /// Run preflight diagnostics — `green/yellow/red` per check.
+    ///
+    /// Verifies that ORP can start cleanly on this host: `protoc` available,
+    /// DuckDB and RocksDB paths writable, the configured port free, the
+    /// config file (if present) parseable, and — when `--https-url` is
+    /// supplied — that the cert chain validates.
+    ///
+    /// Examples:
+    ///   orp doctor
+    ///   orp doctor --config config.yaml
+    ///   orp doctor --https-url https://orp.example.com/api/v1/health
+    ///
+    /// Exit codes:
+    ///   0   everything green or yellow (warnings only)
+    ///   1   at least one red check
+    Doctor {
+        /// Path to a config.yaml to validate alongside the host checks.
+        /// Defaults to `config.yaml` in the working directory if it exists.
+        #[arg(short, long, value_name = "PATH")]
+        config: Option<String>,
+
+        /// HTTPS URL to probe for cert chain validity (e.g.
+        /// `https://orp.example.com/api/v1/health`). When omitted the cert
+        /// check is skipped.
+        #[arg(long, value_name = "URL")]
+        https_url: Option<String>,
+    },
+
+    /// Inspect, verify, and export the persistent audit log.
+    ///
+    /// Reads directly from the DuckDB audit_log table — does not require a
+    /// running ORP server. Useful for compliance audits where an external
+    /// reviewer needs cryptographic proof the log was not tampered with.
+    ///
+    /// Examples:
+    ///   orp audit verify --db ~/.local/share/orp/orp.duckdb --public-key <hex>
+    ///   orp audit export --db ~/.local/share/orp/orp.duckdb --out audit.jsonl
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
+
     /// Show version and build information
     Version,
 
@@ -256,6 +369,50 @@ pub enum Commands {
     Completions {
         /// Target shell
         shell: Shell,
+    },
+
+    /// Generate a self-signed TLS certificate for development and testing
+    ///
+    /// Writes `cert.pem` and `key.pem` (or the paths given) suitable for
+    /// `orp start --tls-cert cert.pem --tls-key key.pem`. NOT for production —
+    /// browsers and clients will reject the cert by default. For production,
+    /// see docs/TLS.md (Let's Encrypt + corporate PKI).
+    ///
+    /// Examples:
+    ///   orp gen-cert
+    ///   orp gen-cert --cn orp.example.test --san orp.example.test --san 127.0.0.1
+    ///   orp gen-cert --out-dir /etc/orp/tls --days 90
+    GenCert {
+        /// Output path for the certificate PEM
+        #[arg(long, value_name = "PATH", default_value = "cert.pem")]
+        cert_out: String,
+
+        /// Output path for the private key PEM
+        #[arg(long, value_name = "PATH", default_value = "key.pem")]
+        key_out: String,
+
+        /// Optional output directory. When set, both files are written here
+        /// using their default names (cert.pem, key.pem) unless `--cert-out`
+        /// / `--key-out` are absolute paths.
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<String>,
+
+        /// Common Name (CN) for the certificate subject
+        #[arg(long, default_value = "localhost")]
+        cn: String,
+
+        /// Subject Alternative Names. Repeat the flag for multiple values.
+        /// Accepts DNS names and IP literals. Defaults: localhost, 127.0.0.1, ::1.
+        #[arg(long = "san", value_name = "DNS_OR_IP")]
+        sans: Vec<String>,
+
+        /// Validity period in days
+        #[arg(long, default_value_t = 365)]
+        days: u32,
+
+        /// Overwrite existing files instead of refusing
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -390,6 +547,45 @@ pub enum MonitorAction {
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AuditAction {
+    /// Re-derive every audit row's hash, walk the prev-hash chain, and verify
+    /// each Ed25519 signature with the supplied public key. Exits non-zero
+    /// (and prints the offending sequence number) on any mismatch.
+    Verify {
+        /// Path to the DuckDB file containing `audit_log`.
+        #[arg(long, value_name = "PATH")]
+        db: String,
+
+        /// Hex-encoded Ed25519 public key (32 bytes / 64 hex chars). Falls
+        /// back to `ORP_AUDIT_PUBKEY` when omitted.
+        #[arg(long = "public-key", env = "ORP_AUDIT_PUBKEY")]
+        public_key: String,
+    },
+
+    /// Stream every audit row to a JSONL file. Each line carries `prev_hash`,
+    /// `hash`, `signature`, and a per-row `verified` boolean (true iff both
+    /// the chain hash and the signature check pass). External auditors can
+    /// then re-verify lines independently with `--public-key`.
+    Export {
+        /// Path to the DuckDB file containing `audit_log`.
+        #[arg(long, value_name = "PATH")]
+        db: String,
+
+        /// Output JSONL path. Use `-` for stdout. (`--out` rather than
+        /// `--output` to avoid conflicting with the global `-o/--output`
+        /// format flag.)
+        #[arg(long = "out", short = 'O', value_name = "PATH", default_value = "-")]
+        out: String,
+
+        /// Hex-encoded Ed25519 public key. When omitted (and `ORP_AUDIT_PUBKEY`
+        /// is unset), `verified` is reported as `false` for every row — the
+        /// chain hash is still recomputed but signatures cannot be checked.
+        #[arg(long = "public-key", env = "ORP_AUDIT_PUBKEY")]
+        public_key: Option<String>,
     },
 }
 

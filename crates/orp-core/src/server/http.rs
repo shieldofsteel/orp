@@ -1,18 +1,20 @@
 use crate::server::federation::{self, PeerRegistry};
+use crate::server::federation_tls::{FederationTlsConfig, LocalSigner, OutboundSeq, ReplayTracker};
 use crate::server::handlers;
 use crate::server::ingest;
 use crate::server::layers;
 use crate::server::websocket;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::StatusCode,
+    http::{HeaderName, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Router,
 };
 use orp_audit::crypto::EventSigner;
+use orp_audit::AuditLogger;
 use orp_connector::Connector;
 use orp_query::QueryExecutor;
 use orp_security::{AbacEngine, ApiKeyService, AuthState};
@@ -20,10 +22,12 @@ use orp_storage::traits::Storage;
 use orp_stream::{FederationOutbox, MonitorEngine, StreamProcessor};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 pub struct AppState {
@@ -34,8 +38,18 @@ pub struct AppState {
     pub auth_state: Arc<AuthState>,
     pub abac_engine: Arc<AbacEngine>,
     pub api_key_service: Arc<ApiKeyService>,
-    /// Ed25519 signer for audit log cryptographic integrity.
+    /// Ed25519 signer for audit log cryptographic integrity. Retained on the
+    /// state so out-of-band consumers (notification signing, federation
+    /// outbox proofs) can borrow the same key the audit log signs with.
+    /// Currently no in-tree consumer reads it directly; the field is part of
+    /// the v0.2.0 public surface and removing it would be a breaking change.
+    #[allow(dead_code)]
     pub audit_signer: Arc<EventSigner>,
+    /// Persistent (or in-memory) audit log. Production code uses
+    /// [`PersistentAuditLog`]; tests and `--in-memory` use
+    /// [`InMemoryAuditLog`]. Both implement [`AuditLogger`] so handlers
+    /// only see the trait.
+    pub audit_log: Arc<dyn AuditLogger>,
     pub broadcast_tx: broadcast::Sender<websocket::BroadcastEvent>,
     pub started_at: std::time::Instant,
     /// Layer registry for intelligence overlays (optional — None if DB unavailable).
@@ -54,6 +68,19 @@ pub struct AppState {
     /// existing processor flow — connectors push events to the processor; this
     /// registry is purely for observability.
     pub connectors: Arc<Mutex<Vec<Arc<dyn Connector>>>>,
+    /// This node's stable identifier as the federation **sender** in signed
+    /// envelopes. Defaults to a process-local UUID; operators set
+    /// `ORP_NODE_ID` in production so peers can pin one ID per cluster.
+    pub local_node_id: String,
+    /// Local Ed25519 signing key for outbound federation pushes. Optional
+    /// only because federation can be disabled entirely; when federation is
+    /// enabled this is always populated (ephemeral if no key file is set).
+    pub federation_signer: Arc<LocalSigner>,
+    /// Per-receiver outbound sequence allocator. Only used on the push path.
+    pub federation_seq: Arc<OutboundSeq>,
+    /// Per-sender highest-seq tracker for inbound replay protection. None
+    /// when federation is disabled.
+    pub federation_replay: Option<Arc<ReplayTracker>>,
 }
 
 /// Per-IP rate limiter state — token bucket with 100 req/sec.
@@ -205,6 +232,20 @@ async fn rate_limit_middleware(
     }
 }
 
+/// TLS configuration for the inbound HTTP server. When `Some`, the server
+/// terminates TLS via `rustls`; when `None`, it serves plain HTTP.
+#[derive(Clone, Debug)]
+pub struct TlsConfig {
+    /// Path to the PEM-encoded server certificate (chain).
+    pub cert_path: PathBuf,
+    /// Path to the PEM-encoded server private key.
+    pub key_path: PathBuf,
+    /// Optional path to a PEM bundle of trusted client CAs. When set, the
+    /// server requires clients to present a certificate signed by one of
+    /// these CAs (mTLS).
+    pub client_ca_path: Option<PathBuf>,
+}
+
 /// Configuration for starting the HTTP server.
 pub struct ServerConfig {
     pub storage: Arc<dyn Storage>,
@@ -216,6 +257,10 @@ pub struct ServerConfig {
     pub api_key_service: Arc<ApiKeyService>,
     /// Optional Ed25519 signer; a fresh one is generated if None.
     pub audit_signer: Option<Arc<EventSigner>>,
+    /// Optional pre-built audit logger. If `None` an [`InMemoryAuditLog`]
+    /// using `audit_signer` is created — that's the path the v0.2.0 test
+    /// harness relies on. `run_start` always passes a `PersistentAuditLog`.
+    pub audit_log: Option<Arc<dyn AuditLogger>>,
     /// Optional layer registry for intelligence overlays.
     pub layer_registry: Option<Arc<layers::LayerRegistry>>,
     /// Optional federation peer registry. Pass `Some(PeerRegistry::new())` to enable federation.
@@ -225,6 +270,30 @@ pub struct ServerConfig {
     /// Enables deployment on servers, Raspberry Pi, embedded, and CI environments
     /// where the web UI build artefacts are absent or unwanted.
     pub headless: bool,
+    /// Optional dedicated mTLS listener for the federation push endpoint.
+    /// When `enabled` and complete (cert/key/ca all set), a separate
+    /// rustls-backed `axum-server` listener is spawned on
+    /// `tls_config.listen_addr` (default `0.0.0.0:9443`) that requires every
+    /// connecting peer to present a client certificate signed by the
+    /// configured CA. The plaintext port (this struct's `port`) continues
+    /// serving the frontend + non-federation REST API.
+    pub federation_tls: FederationTlsConfig,
+    /// Path to the local Ed25519 signing key (32-byte raw seed or 64-char
+    /// hex). When unset, an ephemeral key is generated at startup and a
+    /// warning is logged — fine for dev, not fine for production.
+    pub federation_signing_key_path: Option<std::path::PathBuf>,
+    /// Stable identifier for this node when it appears as the *sender* in
+    /// signed federation envelopes. Defaults to a fresh UUID per process.
+    /// Operators set this to a stable value (e.g. `cluster-east`) in
+    /// production so receivers can pin pubkeys per logical node, not per
+    /// process restart.
+    pub local_node_id: Option<String>,
+    /// Optional TLS configuration. When `Some`, the server serves HTTPS; when
+    /// `None`, it serves plain HTTP and emits a startup warning.
+    pub tls: Option<TlsConfig>,
+    /// When TLS is active and this is `Some`, spawn a second listener on the
+    /// given port that 301-redirects every request to the HTTPS origin.
+    pub redirect_http_port: Option<u16>,
 }
 
 pub async fn start_server(config: ServerConfig) -> Result<()> {
@@ -233,6 +302,15 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
     let audit_signer = config
         .audit_signer
         .unwrap_or_else(|| Arc::new(EventSigner::new()));
+
+    // Default to an in-memory backend when the caller hasn't wired one up —
+    // tests get a working logger without pulling in DuckDB; production code
+    // (`run_start`) always supplies the persistent backend.
+    let audit_log: Arc<dyn AuditLogger> = config.audit_log.unwrap_or_else(|| {
+        Arc::new(orp_audit::InMemoryAuditLog::with_signer(
+            audit_signer.clone(),
+        ))
+    });
 
     // Open the federation outbox if federation is enabled. The path is
     // `ORP_FED_OUTBOX_PATH` or `~/.local/share/orp/federation-outbox` by
@@ -266,6 +344,24 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         None
     };
 
+    // Federation crypto state — only meaningful when the registry is wired,
+    // but we always allocate a signer so callers can introspect the local
+    // pubkey via `state.federation_signer.pubkey_hex()`.
+    let federation_signer = Arc::new(LocalSigner::load_or_ephemeral(
+        config.federation_signing_key_path.as_deref(),
+    ));
+    let federation_seq = OutboundSeq::new();
+    let federation_replay = if config.federation_registry.is_some() {
+        Some(ReplayTracker::new())
+    } else {
+        None
+    };
+    let local_node_id = config
+        .local_node_id
+        .clone()
+        .or_else(|| std::env::var("ORP_NODE_ID").ok())
+        .unwrap_or_else(|| format!("node-{}", uuid::Uuid::new_v4()));
+
     let state = Arc::new(AppState {
         storage: config.storage,
         query_executor: config.query_executor,
@@ -275,12 +371,17 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         abac_engine: config.abac_engine,
         api_key_service: config.api_key_service,
         audit_signer,
+        audit_log,
         broadcast_tx,
         started_at: std::time::Instant::now(),
         layer_registry: config.layer_registry,
         federation_registry: config.federation_registry.clone(),
         federation_outbox,
         connectors: Arc::new(Mutex::new(Vec::new())),
+        local_node_id,
+        federation_signer,
+        federation_seq,
+        federation_replay,
     });
 
     // Spawn federation background sync if registry provided. Also spawn the
@@ -361,54 +462,551 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         .route("/api/v1/peers", post(federation::register_peer))
         .route("/api/v1/peers/{id}", delete(federation::remove_peer))
         .route("/api/v1/peers/{id}/sync", post(federation::sync_peer))
+        // Inbound signed-push endpoint — terminates the receiver side of
+        // the mTLS + Ed25519 envelope flow. No auth middleware: the trust
+        // is the client cert and the envelope signature, not a JWT.
+        .route(
+            "/api/v1/federation/push",
+            post(federation::receive_signed_push),
+        )
         // WebSocket
         .route("/ws/updates", get(websocket::ws_handler));
 
+    // HSTS layer — only attached when TLS is active. The header tells
+    // compliant browsers to refuse HTTP for one year, mitigating downgrade
+    // attacks. We set it unconditionally on TLS responses (no
+    // `includeSubDomains` / `preload` by default — operators add those
+    // explicitly via reverse proxy when they own the apex domain).
+    let hsts_layer = config.tls.as_ref().map(|_| {
+        SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("strict-transport-security"),
+            HeaderValue::from_static("max-age=31536000"),
+        )
+    });
+
     // In headless mode we skip static file serving entirely — no frontend/dist
     // required, making ORP deployable on Raspberry Pi, servers, and embedded.
-    let mut app: Router = if config.headless {
+    let base_router: Router<Arc<AppState>> = if config.headless {
         tracing::info!("Headless mode: static frontend disabled");
         api_routes
-            .layer(axum::middleware::from_fn_with_state(
-                rate_limiter,
-                rate_limit_middleware,
-            ))
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                inject_auth_state,
-            ))
-            .layer(cors)
-            .layer(TraceLayer::new_for_http())
-            .with_state(state)
     } else {
-        api_routes
-            // Frontend — serve built Vite assets from frontend/dist/
-            .fallback_service(
-                ServeDir::new("frontend/dist")
-                    .not_found_service(ServeFile::new("frontend/dist/index.html")),
-            )
-            .layer(axum::middleware::from_fn_with_state(
-                rate_limiter,
-                rate_limit_middleware,
-            ))
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                inject_auth_state,
-            ))
-            .layer(cors)
-            .layer(TraceLayer::new_for_http())
-            .with_state(state)
+        api_routes.fallback_service(
+            ServeDir::new("frontend/dist")
+                .not_found_service(ServeFile::new("frontend/dist/index.html")),
+        )
     };
 
-    // Nest the layers sub-router if registry is available
+    let stateful: Router<Arc<AppState>> = base_router
+        .layer(axum::middleware::from_fn_with_state(
+            rate_limiter,
+            rate_limit_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            inject_auth_state,
+        ))
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
+
+    let mut app: Router = stateful.with_state(state);
+
+    if let Some(layer) = hsts_layer {
+        app = app.layer(layer);
+    }
+
+    // Nest the layers sub-router if registry is available. It's a stateless
+    // `Router<()>` so this only works once the main router has had its state
+    // resolved via `with_state(state)` above.
     if let Some(subrouter) = layers_subrouter {
         app = app.nest("/api/v1", subrouter);
     }
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
-    tracing::info!("ORP server listening on port {}", config.port);
+    // Federation mTLS listener (separate port). Spawned only when:
+    //   1. Federation is enabled (registry present)
+    //   2. `tls_config.enabled` is true
+    //   3. cert/key/ca are all configured
+    // Otherwise we log and continue with the plaintext listener only —
+    // backward compatible with v0.2.0.
+    if config.federation_registry.is_some() {
+        if config.federation_tls.enabled {
+            if config.federation_tls.is_complete() {
+                let app_for_tls = app.clone();
+                let tls_cfg = config.federation_tls.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_federation_tls(app_for_tls, tls_cfg).await {
+                        tracing::error!(error = %e, "Federation mTLS listener exited");
+                    }
+                });
+            } else {
+                tracing::warn!(
+                    "federation.tls.enabled=true but cert/key/ca not all set; \
+                     mTLS listener NOT started — federation will accept plaintext only"
+                );
+            }
+        } else {
+            tracing::warn!(
+                "Federation enabled with TLS DISABLED — peers can spoof signed pushes \
+                 if you also have not pinned signing pubkeys. Set federation.tls.enabled=true \
+                 in production."
+            );
+        }
+    }
 
-    axum::serve(listener, app).await?;
+    let addr: SocketAddr = format!("0.0.0.0:{}", config.port)
+        .parse()
+        .context("invalid bind address")?;
+
+    match config.tls.as_ref() {
+        Some(tls) => {
+            tracing::info!(
+                cert = %tls.cert_path.display(),
+                key  = %tls.key_path.display(),
+                mtls = tls.client_ca_path.is_some(),
+                "Starting HTTPS server on {}",
+                addr,
+            );
+            let rustls = build_rustls_config(tls).await?;
+
+            // Optional plain-HTTP redirector. Returns 301 to the HTTPS origin
+            // for every request. Spawned as a background task so the main
+            // listener controls process lifetime.
+            if let Some(redirect_port) = config.redirect_http_port {
+                spawn_http_to_https_redirect(redirect_port, config.port);
+            }
+
+            axum_server::bind_rustls(addr, rustls)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .context("HTTPS server error")?;
+        }
+        None => {
+            tracing::warn!(
+                "Starting plain HTTP server on {} — TLS is DISABLED. Pass --tls-cert and \
+                 --tls-key to enable HTTPS, or run `orp gen-cert` for a dev cert.",
+                addr,
+            );
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
+        }
+    }
 
     Ok(())
+}
+
+/// Bring up the dedicated federation mTLS listener. Pinned to rustls (no
+/// native-tls anywhere in the workspace, per security policy) and configured
+/// to require client authentication — connections without a valid client
+/// cert signed by `tls_cfg.ca_path` are dropped before any HTTP frames are
+/// served.
+async fn serve_federation_tls(app: Router, tls_cfg: FederationTlsConfig) -> Result<()> {
+    use axum_server::tls_rustls::RustlsConfig;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::server::WebPkiClientVerifier;
+    use rustls::RootCertStore;
+
+    // Install ring crypto provider once. Idempotent — if another component
+    // already installed it, install_default returns Err which we deliberately
+    // ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let cert_path = tls_cfg
+        .cert_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("cert_path missing"))?;
+    let key_path = tls_cfg
+        .key_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("key_path missing"))?;
+    let ca_path = tls_cfg
+        .ca_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("ca_path missing"))?;
+
+    let server_certs: Vec<CertificateDer<'static>> = {
+        let pem = std::fs::read(cert_path)?;
+        rustls_pemfile::certs(&mut pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("parse server cert: {}", e))?
+    };
+    if server_certs.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no certificates found in {}",
+            cert_path.display()
+        ));
+    }
+
+    let server_key: PrivateKeyDer<'static> = {
+        let pem = std::fs::read(key_path)?;
+        rustls_pemfile::private_key(&mut pem.as_slice())
+            .map_err(|e| anyhow::anyhow!("parse server key: {}", e))?
+            .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?
+    };
+
+    let mut roots = RootCertStore::empty();
+    {
+        let pem = std::fs::read(ca_path)?;
+        for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+            let cert = cert.map_err(|e| anyhow::anyhow!("parse CA cert: {}", e))?;
+            roots.add(cert)?;
+        }
+    }
+    if roots.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no CA certificates found in {}",
+            ca_path.display()
+        ));
+    }
+
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| anyhow::anyhow!("build client verifier: {}", e))?;
+
+    let tls_server_cfg = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(server_certs, server_key)
+        .map_err(|e| anyhow::anyhow!("rustls server config: {}", e))?;
+
+    let tls_config = RustlsConfig::from_config(Arc::new(tls_server_cfg));
+
+    let addr: std::net::SocketAddr = tls_cfg
+        .listen_addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid federation TLS listen_addr: {}", e))?;
+
+    tracing::info!(
+        addr = %addr,
+        cert = %cert_path.display(),
+        ca = %ca_path.display(),
+        "Federation mTLS listener starting"
+    );
+
+    axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .await
+        .map_err(|e| anyhow::anyhow!("federation mTLS serve: {}", e))?;
+    Ok(())
+}
+
+/// Build a `rustls`-backed `axum_server` config from PEM files on disk. When
+/// `client_ca_path` is provided, the resulting config requires clients to
+/// present a certificate signed by one of the CAs in that bundle (mTLS).
+pub async fn build_rustls_config(tls: &TlsConfig) -> Result<axum_server::tls_rustls::RustlsConfig> {
+    use axum_server::tls_rustls::RustlsConfig;
+
+    // Ensure a default CryptoProvider is installed. axum-server-rustls picks
+    // the process-wide provider; calling install on every start is idempotent
+    // (Err means a provider is already installed, which is fine).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    if let Some(ca_path) = tls.client_ca_path.as_ref() {
+        let server_config = build_mtls_server_config(&tls.cert_path, &tls.key_path, ca_path)
+            .context("failed to build mTLS rustls server config")?;
+        Ok(RustlsConfig::from_config(Arc::new(server_config)))
+    } else {
+        RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load TLS cert={} key={}",
+                    tls.cert_path.display(),
+                    tls.key_path.display()
+                )
+            })
+    }
+}
+
+/// Build a rustls `ServerConfig` that requires clients to present a
+/// certificate signed by one of the CAs in `client_ca_path`. Used when mTLS
+/// is enabled.
+fn build_mtls_server_config(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    client_ca_path: &std::path::Path,
+) -> Result<rustls::ServerConfig> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::BufReader;
+
+    let cert_file = std::fs::File::open(cert_path)
+        .with_context(|| format!("failed to open cert {}", cert_path.display()))?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::result::Result<_, _>>()
+        .with_context(|| format!("failed to parse cert PEM {}", cert_path.display()))?;
+    if cert_chain.is_empty() {
+        anyhow::bail!("no certificates found in {}", cert_path.display());
+    }
+
+    let key_file = std::fs::File::open(key_path)
+        .with_context(|| format!("failed to open key {}", key_path.display()))?;
+    let mut key_reader = BufReader::new(key_file);
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
+        .with_context(|| format!("failed to parse key PEM {}", key_path.display()))?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
+
+    let ca_file = std::fs::File::open(client_ca_path)
+        .with_context(|| format!("failed to open client CA {}", client_ca_path.display()))?;
+    let mut ca_reader = BufReader::new(ca_file);
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in rustls_pemfile::certs(&mut ca_reader) {
+        let ca = ca.with_context(|| {
+            format!("failed to parse client CA PEM {}", client_ca_path.display())
+        })?;
+        roots
+            .add(ca)
+            .context("failed to add client CA to root store")?;
+    }
+    if roots.is_empty() {
+        anyhow::bail!(
+            "no certificates found in client CA bundle {}",
+            client_ca_path.display()
+        );
+    }
+
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .context("failed to build client cert verifier")?;
+
+    rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, key)
+        .context("failed to assemble rustls ServerConfig")
+}
+
+/// Spawn a tiny background server on `port` that 301-redirects every request
+/// to the same path on the HTTPS origin. Used when the operator passes
+/// `--redirect-http`.
+fn spawn_http_to_https_redirect(port: u16, https_port: u16) {
+    use axum::extract::Host;
+    use axum::http::Uri;
+    use axum::response::Redirect;
+
+    let redirect_addr: SocketAddr = match format!("0.0.0.0:{}", port).parse() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "Invalid HTTP-to-HTTPS redirect address; skipping");
+            return;
+        }
+    };
+
+    let app = Router::new().fallback(move |Host(host): Host, uri: Uri| async move {
+        // Strip any port the client sent and append the HTTPS port.
+        let host_no_port = host.split(':').next().unwrap_or(&host).to_string();
+        let path = uri
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/")
+            .to_string();
+        let target = if https_port == 443 {
+            format!("https://{}{}", host_no_port, path)
+        } else {
+            format!("https://{}:{}{}", host_no_port, https_port, path)
+        };
+        Redirect::permanent(&target)
+    });
+
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(redirect_addr).await {
+            Ok(listener) => {
+                tracing::info!(
+                    "HTTP-to-HTTPS redirector listening on {} → :{}",
+                    redirect_addr,
+                    https_port
+                );
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::warn!(error = %e, "HTTP redirector exited");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, addr = %redirect_addr, "HTTP redirector bind failed");
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tls_tests {
+    //! Inbound TLS tests. We exercise `build_rustls_config` against a real
+    //! loopback `axum_server` listener with rcgen-generated certs.
+    use super::*;
+    use axum::routing::get;
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+    use std::path::Path;
+
+    /// rcgen helper — write a self-signed cert+key into `dir`. Returns the
+    /// PEM cert and the on-disk paths.
+    fn write_self_signed(dir: &Path, cn: &str) -> (String, PathBuf, PathBuf) {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn.to_string());
+        params.distinguished_name = dn;
+        params
+            .subject_alt_names
+            .push(SanType::DnsName(cn.to_string().try_into().unwrap()));
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let cert_pem = cert.pem();
+        let key_pem = key.serialize_pem();
+        let cert_path = dir.join(format!("{cn}-cert.pem"));
+        let key_path = dir.join(format!("{cn}-key.pem"));
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        (cert_pem, cert_path, key_path)
+    }
+
+    /// Spawn an axum-server listener on an ephemeral loopback port. Returns
+    /// the bound address. The listener stops when the test exits.
+    async fn spawn_https_server(
+        rustls_cfg: axum_server::tls_rustls::RustlsConfig,
+        app: Router,
+    ) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let handle_for_task = handle.clone();
+        tokio::spawn(async move {
+            let _ = axum_server::from_tcp_rustls(listener, rustls_cfg)
+                .handle(handle_for_task)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .await;
+        });
+        handle.listening().await;
+        addr
+    }
+
+    fn hello_app() -> Router {
+        Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .layer(SetResponseHeaderLayer::if_not_present(
+                HeaderName::from_static("strict-transport-security"),
+                HeaderValue::from_static("max-age=31536000"),
+            ))
+    }
+
+    #[tokio::test]
+    async fn test_tls_server_serves_https() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_pem, cert_path, key_path) = write_self_signed(dir.path(), "localhost");
+        let cfg = build_rustls_config(&TlsConfig {
+            cert_path,
+            key_path,
+            client_ca_path: None,
+        })
+        .await
+        .expect("rustls config");
+        let addr = spawn_https_server(cfg, hello_app()).await;
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let resp = client
+            .get(format!("https://{addr}/health"))
+            .send()
+            .await
+            .expect("https request");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn test_tls_rejects_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_pem, cert_path, key_path) = write_self_signed(dir.path(), "localhost");
+        let cfg = build_rustls_config(&TlsConfig {
+            cert_path,
+            key_path,
+            client_ca_path: None,
+        })
+        .await
+        .unwrap();
+        let addr = spawn_https_server(cfg, hello_app()).await;
+
+        let result = reqwest::Client::builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/health"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+        assert!(
+            result.is_err(),
+            "plain HTTP must fail against a TLS listener, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hsts_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_pem, cert_path, key_path) = write_self_signed(dir.path(), "localhost");
+        let cfg = build_rustls_config(&TlsConfig {
+            cert_path,
+            key_path,
+            client_ca_path: None,
+        })
+        .await
+        .unwrap();
+        let addr = spawn_https_server(cfg, hello_app()).await;
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let resp = client
+            .get(format!("https://{addr}/health"))
+            .send()
+            .await
+            .unwrap();
+        let hsts = resp
+            .headers()
+            .get("strict-transport-security")
+            .expect("HSTS header present on TLS responses")
+            .to_str()
+            .unwrap();
+        assert!(
+            hsts.starts_with("max-age=31536000"),
+            "unexpected HSTS value: {hsts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mtls_requires_client_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_server_pem, server_cert, server_key) = write_self_signed(dir.path(), "localhost");
+        // Use a separate self-signed cert as the trusted client-CA bundle.
+        // The point is that the test client presents *no* cert at all, so
+        // the handshake fails regardless of which CAs are trusted.
+        let (ca_pem, _ca_cert, _ca_key) = write_self_signed(dir.path(), "test-client-ca");
+        let ca_bundle = dir.path().join("client-ca.pem");
+        std::fs::write(&ca_bundle, &ca_pem).unwrap();
+
+        let cfg = build_rustls_config(&TlsConfig {
+            cert_path: server_cert,
+            key_path: server_key,
+            client_ca_path: Some(ca_bundle),
+        })
+        .await
+        .expect("mTLS rustls config");
+        let addr = spawn_https_server(cfg, hello_app()).await;
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let result = client.get(format!("https://{addr}/health")).send().await;
+        assert!(
+            result.is_err(),
+            "mTLS server must reject clients without a cert, got {:?}",
+            result
+        );
+    }
 }

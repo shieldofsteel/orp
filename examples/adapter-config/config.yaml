@@ -1,0 +1,194 @@
+# examples/adapter-config/config.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# A heavily annotated, six-adapter config.yaml. This is reference material —
+# copy the blocks you need into your own deployment and fill in the URLs/keys.
+# Field-by-field reference: docs/CONFIG.md.
+#
+# Quick tips:
+#   - Every section uses #[serde(default)] in schema.rs, so a 4-line file boots.
+#     This file is intentionally verbose for didactic purposes.
+#   - `${env.VAR_NAME}` substitution is supported in any string value. Use it
+#     for secrets — never commit literal credentials.
+#   - `trust_score` is the conflict-resolution weight when two sources describe
+#     the same physical entity. Range 0.0–1.0.
+
+server:
+  host: "0.0.0.0"          # bind everything; restrict via firewall or ABAC
+  port: 9090               # API + WebSocket + frontend on a single port
+  log_level: "info"        # error/warn/info/debug/trace; RUST_LOG overrides
+
+storage:
+  duckdb:
+    path: "/var/lib/orp/data.duckdb"
+    memory_limit_gb: 8     # ~half your RAM is a sane default
+  rocksdb:
+    path: "/var/lib/orp/state.db"
+    cache_size_mb: 512
+  sqlite:
+    path: "/var/lib/orp/config.sqlite"
+
+retention:
+  events_ttl_days: 90      # raw events
+  snapshots_ttl_days: 30
+  audit_log_ttl_days: 0    # 0 = never delete (compliance use case)
+
+security:
+  oidc:
+    enabled: false         # flip to true and fill out below for SSO
+    provider_url: null
+    client_id: null
+    client_secret: "${env.ORP_OIDC_CLIENT_SECRET}"
+    scopes: ["openid", "profile"]
+    redirect_uri: null
+  abac:
+    enabled: true          # production-default policy
+    policy_file: null      # null = built-in default_production policy
+  signing:
+    algorithm: "Ed25519"
+    private_key_path: null   # auto-generated on first start
+
+api:
+  rate_limit_per_minute: 1000
+  cors_enabled: true
+  cors_allowed_origins:
+    - "https://app.example.com"   # NEVER use ["*"] in production
+  api_key_header: "X-API-Key"
+  jwt_secret: "${env.JWT_SECRET}"
+
+frontend:
+  enabled: true
+  default_map_center: [51.92, 4.27]   # Rotterdam
+  default_zoom: 8
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+  audit_log_path: "/var/lib/orp/audit.log"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Connectors — six representative adapters.
+# ─────────────────────────────────────────────────────────────────────────────
+connectors:
+
+  # ── 1. AISStream.io WebSocket — live global maritime AIS ──────────────────
+  # The aisstream connector activates the moment AISSTREAM_API_KEY is set in
+  # the environment. The URL field is unused for this connector — auth happens
+  # via the env var. Trust 0.95 because aisstream's data is high quality.
+  - name: "aisstream-global"
+    type: "aisstream"
+    enabled: true
+    entity_type: "ship"
+    trust_score: 0.95
+
+  # ── 2. ADS-B from a local SDR ──────────────────────────────────────────────
+  # dump1090 (FlightAware fork) exposes Beast format on TCP/30005. Lower
+  # trust_score reflects the noisiness of consumer SDRs.
+  - name: "adsb-local-sdr"
+    type: "adsb"
+    enabled: true
+    url: "tcp://127.0.0.1:30005"
+    entity_type: "aircraft"
+    trust_score: 0.85
+    retry_policy:
+      max_retries: 5
+      backoff_ms: 1000
+
+  # ── 3. MAVLink heartbeat listener ──────────────────────────────────────────
+  # 14550 is the canonical MAVLink GCS port. UDP because that's what
+  # PX4/ArduPilot/QGroundControl emit.
+  - name: "drone-fleet"
+    type: "mavlink"
+    enabled: true
+    url: "mavlink://0.0.0.0:14550"
+    entity_type: "aircraft"
+    trust_score: 0.95
+
+  # ── 4. Modbus polling — industrial PLC tags ────────────────────────────────
+  # Polls a Modbus/TCP server once a second; mapping declares which registers
+  # to read and how to scale them.
+  - name: "plc-floor-1"
+    type: "modbus"
+    enabled: true
+    url: "tcp://192.168.1.50:502"
+    entity_type: "sensor"
+    trust_score: 0.9
+    schedule: "every 1s"
+    mapping:
+      registers:
+        - { name: "tank_level_pct", address: 30001, type: "input", scale: 0.1 }
+        - { name: "pump_running",   address: 10001, type: "coil"  }
+
+  # ── 5. Zeek conn.log file watcher ──────────────────────────────────────────
+  # Tails Zeek's conn.log; each line becomes a "host" entity update plus a
+  # "connection" event. Trust 0.85 because TSV parsing is unambiguous but the
+  # data itself is just observation.
+  - name: "zeek-conn"
+    type: "zeek"
+    enabled: true
+    url: "file:///var/log/zeek/current/conn.log"
+    entity_type: "host"
+    trust_score: 0.85
+
+  # ── 6. Generic REST API polling ────────────────────────────────────────────
+  # Polls https://api.weather.gov for current alerts every 5 minutes and maps
+  # the response into WeatherAlert entities. Useful template for any REST API.
+  - name: "noaa-alerts"
+    type: "http_poll"
+    enabled: true
+    url: "https://api.weather.gov/alerts/active"
+    entity_type: "weather_alert"
+    trust_score: 0.95
+    schedule: "every 5m"
+    headers:
+      User-Agent: "ORP/0.1 (https://github.com/shieldofsteel/orp)"
+      Accept: "application/geo+json"
+    mapping:
+      json_path_root: "$.features[*]"
+      entity_id:       "$.id"
+      properties:
+        event:        "$.properties.event"
+        severity:     "$.properties.severity"
+        urgency:      "$.properties.urgency"
+        certainty:    "$.properties.certainty"
+        headline:     "$.properties.headline"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entity resolution — which fields collapse two events into the same entity.
+# ─────────────────────────────────────────────────────────────────────────────
+entity_resolution:
+  enabled: true
+  phase: "structural"             # exact match on `fields` below
+  structural:
+    fields:
+      - mmsi          # AIS / aisstream
+      - icao          # ADS-B / aircraft
+      - icao_hex      # alias
+      - vin           # vehicles
+      - hostname      # zeek hosts
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Monitor rules — declarative thresholds. The simple form is the only form the
+# CLI's `orp monitors add` accepts today; for richer predicates use the API.
+# ─────────────────────────────────────────────────────────────────────────────
+monitors:
+  - rule_id: "fast-ship"
+    name: "Fast vessel (>25 kn)"
+    entity_type: "ship"
+    condition: "speed > 25"
+    action: "alert"
+    enabled: true
+
+  - rule_id: "low-aircraft"
+    name: "Low aircraft (<1000 ft)"
+    entity_type: "aircraft"
+    condition: "altitude < 1000"
+    action: "alert"
+    enabled: true
+
+  - rule_id: "tank-low"
+    name: "Tank level <10%"
+    entity_type: "sensor"
+    condition: "tank_level_pct < 10"
+    action: "alert"
+    enabled: true

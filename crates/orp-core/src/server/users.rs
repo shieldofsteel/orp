@@ -7,7 +7,7 @@
 //! Multi-user management for ORP operations rooms.
 //!
 //! Provides a user registry backed by DuckDB, REST endpoints for CRUD,
-//! and password hashing (SHA-256 + salt — no external dependency required).
+//! and password hashing (Argon2id, OWASP-2023 parameters).
 //!
 //! ## REST API
 //!
@@ -21,10 +21,20 @@
 //!
 //! ## Password Hashing
 //!
-//! Uses SHA-256 + random 32-byte salt stored as `$sha256$<hex_salt>$<hex_hash>`.
-//! This is a minimum-viable implementation. When the `argon2` crate is added
-//! as a dependency, replace `hash_password` / `verify_password` with argon2id.
+//! Uses **Argon2id** (PHC string format) with the OWASP 2023 floor parameters:
+//! `m=19456 KiB (≈19 MiB), t=2, p=1`. The per-user salt is drawn from
+//! `OsRng` (the OS CSPRNG) — never `thread_rng()`, which is non-cryptographic
+//! and whose state can be inferred from a few outputs.
+//!
+//! Stored hash format is the standard PHC string emitted by the `argon2`
+//! crate, e.g. `$argon2id$v=19$m=19456,t=2,p=1$<salt-b64>$<hash-b64>`. This
+//! lets us tune cost parameters in the future without a schema migration:
+//! the parameters are encoded inside each row.
 
+use argon2::{
+    password_hash::{PasswordHasher, PasswordVerifier, SaltString},
+    Algorithm, Argon2, Params, PasswordHash, Version,
+};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -38,9 +48,8 @@ use orp_security::{
     middleware::AuthContext,
     rbac::{check_role_permission, Action, Role},
 };
-use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -166,54 +175,55 @@ fn error_resp(code: &str, status: StatusCode, message: &str) -> (StatusCode, Jso
 
 // ─── Password hashing ─────────────────────────────────────────────────────────
 
-/// Hash a password with a random 32-byte salt using SHA-256.
+/// OWASP 2023 floor parameters for Argon2id.
 ///
-/// Output format: `$sha256$<hex_salt>$<hex_hash>`
+/// - `m_cost` (memory)  : 19_456 KiB ≈ 19 MiB
+/// - `t_cost` (time)    : 2 iterations
+/// - `p_cost` (parallel): 1 lane
 ///
-/// NOTE: Replace with argon2id when `argon2` crate is available for production
-/// deployments. SHA-256 is acceptable for internal ops rooms without external
-/// access, but argon2id provides better brute-force resistance.
-pub fn hash_password(password: &str) -> String {
-    let mut salt = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut salt);
-    let hash = sha256_hash_with_salt(password, &salt);
-    format!("$sha256${}${}", hex::encode(salt), hex::encode(hash))
+/// These are the *minimum* recommended settings; deployments with more RAM
+/// budget per request should raise `m_cost`. Because we store the full PHC
+/// string (which encodes the parameters), we can tune in future without a
+/// schema migration — old rows verify against their original parameters,
+/// new rows are written with the current floor.
+const ARGON2_M_COST: u32 = 19_456;
+const ARGON2_T_COST: u32 = 2;
+const ARGON2_P_COST: u32 = 1;
+
+/// Build an `Argon2` configured to OWASP 2023 floor parameters.
+fn argon2_hasher() -> Argon2<'static> {
+    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, None)
+        .expect("OWASP 2023 floor params are valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
-/// Verify a password against a stored hash.
-pub fn verify_password(password: &str, stored: &str) -> bool {
-    let parts: Vec<&str> = stored.splitn(4, '$').collect();
-    // Format: ["", "sha256", "<salt_hex>", "<hash_hex>"]
-    if parts.len() != 4 || parts[1] != "sha256" {
-        return false;
-    }
-    let Ok(salt) = hex::decode(parts[2]) else {
+/// Hash a password with Argon2id and a fresh OS-CSPRNG salt.
+///
+/// Returns the standard PHC string (`$argon2id$v=19$m=19456,t=2,p=1$...`).
+/// The salt is generated via `SaltString::generate(&mut OsRng)` — never
+/// `thread_rng()`, which is non-cryptographic and whose internal state is
+/// recoverable from a few outputs.
+pub fn hash_password(password: &str) -> Result<String, anyhow::Error> {
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = argon2_hasher()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("argon2 hash failed: {e}"))?
+        .to_string();
+    Ok(hash)
+}
+
+/// Verify a password against a stored PHC string.
+///
+/// Returns `false` for any error path (bad PHC, mismatched algorithm,
+/// wrong password, etc.) — never panics, never leaks the failure mode.
+/// Argon2's `verify_password` is constant-time.
+pub fn verify_password(password: &str, stored_phc: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(stored_phc) else {
         return false;
     };
-    let Ok(expected_hash) = hex::decode(parts[3]) else {
-        return false;
-    };
-    let actual_hash = sha256_hash_with_salt(password, &salt);
-    // Constant-time comparison
-    constant_time_eq(&actual_hash, &expected_hash)
-}
-
-fn sha256_hash_with_salt(password: &str, salt: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(salt);
-    hasher.update(password.as_bytes());
-    hasher.finalize().to_vec()
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    argon2_hasher()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
 }
 
 // ─── UserRegistry ─────────────────────────────────────────────────────────────
@@ -234,6 +244,8 @@ pub enum UserError {
     InvalidRole(String),
     #[error("Database error: {0}")]
     Db(#[from] duckdb::Error),
+    #[error("Password hashing failed: {0}")]
+    Hash(String),
     #[error("Lock poisoned")]
     Lock,
 }
@@ -272,7 +284,8 @@ impl UserRegistry {
         let user_id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let display_name = req.display_name.unwrap_or_else(|| req.username.clone());
-        let password_hash = hash_password(&req.password);
+        let password_hash =
+            hash_password(&req.password).map_err(|e| UserError::Hash(e.to_string()))?;
 
         let c = self.conn.lock().map_err(|_| UserError::Lock)?;
         c.execute(
@@ -767,29 +780,50 @@ mod tests {
 
     // ── Password hashing ──────────────────────────────────────────────────────
 
+    /// Argon2id hash → verify round-trip: the returned PHC string must
+    /// verify against the original plaintext, and only against it.
     #[test]
-    fn password_hash_roundtrip() {
-        let hash = hash_password("MySecret123");
-        assert!(verify_password("MySecret123", &hash));
+    fn test_password_argon2id_roundtrip() {
+        let hash = hash_password("MySecret123").expect("hash ok");
+        assert!(
+            verify_password("MySecret123", &hash),
+            "correct pw must verify"
+        );
+        assert!(!verify_password("wrong", &hash), "wrong pw must not verify");
+        assert!(!verify_password("", &hash), "empty pw must not verify");
     }
 
+    /// The stored hash must be a PHC string for argon2id at the OWASP 2023
+    /// floor parameters. If anyone changes the algorithm, version, or
+    /// parameters silently, this test catches it.
     #[test]
-    fn wrong_password_fails_verification() {
-        let hash = hash_password("correct");
-        assert!(!verify_password("wrong", &hash));
+    fn test_password_phc_format() {
+        let h = hash_password("phc-format-check").expect("hash ok");
+        assert!(
+            h.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "unexpected PHC prefix: {h}"
+        );
     }
 
+    /// Two hashes of the same plaintext must differ — proves the salt is
+    /// fresh per call and not derived deterministically from the input.
     #[test]
-    fn two_hashes_of_same_password_differ() {
-        let h1 = hash_password("same");
-        let h2 = hash_password("same");
-        assert_ne!(h1, h2, "Different salts should produce different hashes");
+    fn test_password_unique_salts() {
+        let h1 = hash_password("same").expect("h1");
+        let h2 = hash_password("same").expect("h2");
+        assert_ne!(h1, h2, "fresh salt must produce different PHC strings");
+        // Both must still verify against the original plaintext
+        assert!(verify_password("same", &h1));
+        assert!(verify_password("same", &h2));
     }
 
+    /// Malformed / non-PHC stored values must verify as `false` rather
+    /// than panicking (e.g. a legacy SHA-256 row from the pre-Argon2 era).
     #[test]
-    fn hash_format_starts_with_sha256() {
-        let h = hash_password("test");
-        assert!(h.starts_with("$sha256$"));
+    fn test_password_legacy_format_rejected() {
+        assert!(!verify_password("anything", ""));
+        assert!(!verify_password("anything", "$sha256$deadbeef$cafebabe"));
+        assert!(!verify_password("anything", "not-a-phc-string"));
     }
 
     // ── CRUD operations ──────────────────────────────────────────────────────

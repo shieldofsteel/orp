@@ -1,0 +1,6 @@
+-- Aircraft below 5000 feet and not on the ground — handy for approach monitoring.
+MATCH (a:aircraft)
+WHERE a.altitude > 0 AND a.altitude < 5000
+RETURN a.callsign, a.icao, a.altitude, a.speed
+ORDER BY a.altitude ASC
+LIMIT 50

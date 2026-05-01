@@ -29,9 +29,41 @@ async fn main() -> Result<()> {
             headless,
             no_auth,
             in_memory,
+            bootstrap_admin_key,
+            federation_tls,
+            federation_cert,
+            federation_key,
+            federation_ca,
+            federation_tls_listen,
+            federation_signing_key,
+            node_id,
+            tls_cert,
+            tls_key,
+            tls_client_ca,
+            redirect_http,
         } => {
-            cli::commands::run_start(config, template, port, dev, headless, no_auth, in_memory)
-                .await?;
+            cli::commands::run_start(cli::commands::StartArgs {
+                config_path: config,
+                template,
+                port_override: port,
+                dev,
+                headless,
+                no_auth,
+                in_memory,
+                bootstrap_admin_key,
+                federation_tls_enabled: federation_tls,
+                federation_cert,
+                federation_key,
+                federation_ca,
+                federation_tls_listen,
+                federation_signing_key,
+                local_node_id: node_id,
+                tls_cert,
+                tls_key,
+                tls_client_ca,
+                redirect_http,
+            })
+            .await?;
         }
 
         cli::args::Commands::Query {
@@ -221,12 +253,52 @@ async fn main() -> Result<()> {
                 .await?;
         }
 
+        cli::args::Commands::Audit { action } => match action {
+            cli::args::AuditAction::Verify { db, public_key } => {
+                cli::commands::run_audit_verify(&db, &public_key)?;
+            }
+            cli::args::AuditAction::Export {
+                db,
+                out,
+                public_key,
+            } => {
+                cli::commands::run_audit_export(&db, &out, public_key.as_deref())?;
+            }
+        },
+
         cli::args::Commands::Version => {
             cli::commands::run_version();
         }
 
+        cli::args::Commands::Doctor { config, https_url } => {
+            let status = cli::doctor::run_doctor(config.as_deref(), https_url.as_deref())?;
+            if status == cli::doctor::DoctorStatus::Red {
+                std::process::exit(1);
+            }
+        }
+
         cli::args::Commands::Completions { shell } => {
             cli::commands::run_completions(shell);
+        }
+
+        cli::args::Commands::GenCert {
+            cert_out,
+            key_out,
+            out_dir,
+            cn,
+            sans,
+            days,
+            force,
+        } => {
+            cli::commands::run_gen_cert(cli::commands::GenCertArgs {
+                cert_out,
+                key_out,
+                out_dir,
+                cn,
+                sans,
+                days,
+                force,
+            })?;
         }
     }
 

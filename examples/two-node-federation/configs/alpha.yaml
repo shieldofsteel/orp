@@ -1,0 +1,43 @@
+# examples/two-node-federation/configs/alpha.yaml
+#
+# Reference config for the "alpha" node in the two-node federation demo.
+# This file is illustrative — the run.sh harness uses --in-memory and CLI flags
+# rather than this file. Use it as a template for your own deployment.
+
+server:
+  host: "0.0.0.0"
+  port: 9090
+  log_level: "info"
+
+storage:
+  duckdb:
+    path: "./alpha-data.duckdb"
+  rocksdb:
+    path: "./alpha-state.db"
+  sqlite:
+    path: "./alpha-config.sqlite"
+
+retention:
+  events_ttl_days: 7         # short — this is a demo
+  audit_log_ttl_days: 30
+
+security:
+  abac:
+    enabled: true            # production-default ABAC
+
+api:
+  cors_enabled: true
+  cors_allowed_origins: ["*"]    # demo-only — never in production
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+  audit_log_path: "./alpha-audit.log"
+
+# Peers are registered at runtime in the demo via `orp peer add`. To
+# pre-register them, you would normally use `orp connectors add` plus the
+# /api/v1/peers endpoint described in openapi.yaml.
+
+connectors: []
+monitors: []

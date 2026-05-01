@@ -357,10 +357,14 @@ async fn process_payload(
         .await
         .map_err(|e| format!("Storage error: {}", e))?;
 
-    // Audit log
+    // Route through the signed AuditLogger chain (same path as
+    // handlers::audit_log). Writing via `state.storage.log_audit` would
+    // produce a second row through the legacy Storage trait and collide with
+    // the AuditLogger's seq PK — B's audit-persist refactor made this the
+    // single canonical writer; ingest was the last caller on the old path.
     if let Err(e) = state
-        .storage
-        .log_audit(
+        .audit_log
+        .record(
             if existed {
                 "entity_updated_via_ingest"
             } else {
