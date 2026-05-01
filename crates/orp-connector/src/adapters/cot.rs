@@ -508,18 +508,26 @@ pub fn source_event_to_cot(ev: &SourceEvent, cfg: &CotProducerConfig) -> CotEven
     }
 }
 
-/// Read the `ORP_COT_PEERS` env var into a list of unicast peers.
+/// Read `ORP_COT_PEERS` into a list of unicast peers.
+///
+/// Each comma-separated entry is parsed as a `SocketAddr`. Malformed
+/// entries (typos, IPv6 missing brackets, no port, ...) are logged via
+/// `tracing::warn!` and skipped. Previously `.filter_map(.. .ok())`
+/// dropped them silently — operators saw "0 peers" with no signal.
 fn read_unicast_peers() -> Vec<SocketAddr> {
-    std::env::var("ORP_COT_PEERS")
-        .ok()
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .filter_map(|s| s.parse::<SocketAddr>().ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    let raw = match std::env::var("ORP_COT_PEERS") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut peers = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match entry.parse::<SocketAddr>() {
+            Ok(addr) => peers.push(addr),
+            Err(e) => tracing::warn!(entry = %entry, error = %e,
+                "ORP_COT_PEERS entry is not a valid SocketAddr; skipping"),
+        }
+    }
+    peers
 }
 
 /// Spawn a background task that consumes `SourceEvent`s and emits CoT
@@ -1112,5 +1120,26 @@ mod tests {
         drop(tx);
         let _ = handle.await;
         unsafe { std::env::remove_var("ORP_COT_PEERS"); }
+    }
+
+    /// Regression: `read_unicast_peers` must warn on malformed entries
+    /// instead of silently dropping them. Two valid + three bad entries
+    /// → exactly the two valid peers.
+    #[test]
+    fn read_unicast_peers_warns_on_malformed_entries() {
+        // SAFETY: env mutation is global; same pattern as
+        // `test_spawn_cot_producer_unicast_round_trip`.
+        unsafe {
+            std::env::set_var(
+                "ORP_COT_PEERS",
+                "10.0.0.1:9999, ,not-a-socket,,[::1]:7777",
+            );
+        }
+        let peers = read_unicast_peers();
+        unsafe { std::env::remove_var("ORP_COT_PEERS"); }
+        assert_eq!(peers.len(), 2,
+            "expected exactly two well-formed entries, got {:?}", peers);
+        assert!(peers.contains(&"10.0.0.1:9999".parse().unwrap()));
+        assert!(peers.contains(&"[::1]:7777".parse().unwrap()));
     }
 }

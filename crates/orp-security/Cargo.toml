@@ -32,3 +32,4 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+serial_test = "3"

@@ -13,7 +13,10 @@ pub use analytics::{
     detect_dwell, detect_manoeuvres, score_anomaly,
 };
 pub use dedup::{DedupError, DedupResult, RocksDbDedupWindow};
-pub use dlq::{DeadLetterQueue, DlqEntry, DlqError, DlqResult};
+pub use dlq::{
+    DeadLetterQueue, DlqEntry, DlqError, DlqResult, FederationOutbox, OutboxEntry,
+    outbox_retention_secs, DEFAULT_OUTBOX_RETENTION_SECS,
+};
 pub use monitor::{
     Alert, AlertSeverity, GeofenceTrigger, MonitorAction, MonitorCondition, MonitorEngine,
     MonitorRule, ThresholdOp,

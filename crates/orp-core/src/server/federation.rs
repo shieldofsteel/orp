@@ -27,6 +27,7 @@ use axum::{
 use orp_proto::{Entity, GeoPoint};
 use orp_security::middleware::AuthContext;
 use orp_security::{AbacEngine, EvaluationContext, EvaluationResult, Resource, Subject};
+use orp_stream::{outbox_retention_secs, FederationOutbox};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -561,6 +562,11 @@ pub fn spawn_federation_sync(state: Arc<AppState>) {
             };
 
             let peers = registry.list().await;
+            // Evict per-peer state for peers that have left the registry.
+            // Without this, both maps grow without bound as peers churn
+            // (dynamic mesh deployments, satcom uplinks bouncing in/out).
+            evict_stale_peer_state(&peers, &mut next_run_at, &mut backoff);
+
             if peers.is_empty() {
                 continue;
             }
@@ -605,6 +611,163 @@ pub fn spawn_federation_sync(state: Arc<AppState>) {
                         next_run_at.insert(peer.id.clone(), now + next);
                     }
                 }
+            }
+        }
+    });
+}
+
+/// Drop entries from per-peer state maps whose peer is no longer in the
+/// registry. Called once per federation tick to plug the slow leak that
+/// would otherwise grow `next_run_at` and `backoff` unbounded as peers
+/// register and de-register over the lifetime of the process. Generic
+/// over the value types so the same helper covers both maps.
+pub(crate) fn evict_stale_peer_state<V1, V2>(
+    current_peers: &[Peer],
+    next_run_at: &mut HashMap<String, V1>,
+    backoff: &mut HashMap<String, V2>,
+) {
+    use std::collections::HashSet;
+    let current_ids: HashSet<&str> =
+        current_peers.iter().map(|p| p.id.as_str()).collect();
+    next_run_at.retain(|k, _| current_ids.contains(k.as_str()));
+    backoff.retain(|k, _| current_ids.contains(k.as_str()));
+}
+
+// ── Outbound outbox pump ──────────────────────────────────────────────────────
+
+/// Buffer an outbound entity for `peer_id` in the disk-backed outbox so it
+/// survives process restarts and peer-link outages. No-op when the outbox is
+/// not configured (federation disabled or open() failed).
+pub fn enqueue_outbound(
+    outbox: &FederationOutbox,
+    peer_id: &str,
+    entity_id: &str,
+    payload_json: &str,
+) -> Result<(), orp_stream::DlqError> {
+    outbox.enqueue(peer_id, entity_id, payload_json)
+}
+
+/// Push a single buffered entity to the peer's `/api/v1/entities` endpoint.
+/// Returns Ok(()) on a 2xx response — caller `ack`s the outbox key on success.
+async fn push_one_to_peer(
+    client: &reqwest::Client,
+    peer: &Peer,
+    payload_json: &str,
+) -> anyhow::Result<()> {
+    let url = format!("{}/entities", peer.base_url());
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(payload_json.to_string())
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("HTTP push failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "peer {} returned non-2xx: {}",
+            peer.id,
+            resp.status()
+        ));
+    }
+    Ok(())
+}
+
+/// Background task that drains the federation outbox to peers as they are
+/// reachable. Runs every 10 s; for each peer it pulls up to 64 oldest
+/// buffered entries and pushes them in order, acking on success and aborting
+/// the batch on first failure (so ordering is preserved on retry).
+///
+/// Also runs the retention sweep (`evict_older_than`) once per minute so the
+/// outbox cannot grow unbounded for permanently-dead peers.
+pub fn spawn_outbox_pump(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let pump_interval = std::time::Duration::from_secs(
+            std::env::var("ORP_FED_OUTBOX_PUMP_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
+        );
+        let batch_size: usize = std::env::var("ORP_FED_OUTBOX_BATCH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let retention_secs = outbox_retention_secs();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent(concat!("ORP-federation/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_default();
+
+        let mut last_evict = tokio::time::Instant::now();
+
+        loop {
+            tokio::time::sleep(pump_interval).await;
+
+            let outbox = match &state.federation_outbox {
+                Some(o) => o.clone(),
+                None => continue,
+            };
+            let registry = match &state.federation_registry {
+                Some(r) => r.clone(),
+                None => continue,
+            };
+            let peers = registry.list().await;
+            if peers.is_empty() {
+                continue;
+            }
+
+            for peer in &peers {
+                if !peer.sync_enabled {
+                    continue;
+                }
+                let batch = match outbox.next_batch(&peer.id, batch_size) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(peer_id = %peer.id, error = %e, "Outbox: next_batch failed");
+                        continue;
+                    }
+                };
+                if batch.is_empty() {
+                    continue;
+                }
+                let mut delivered = 0usize;
+                for (key, entry) in &batch {
+                    match push_one_to_peer(&client, peer, &entry.payload_json).await {
+                        Ok(()) => match outbox.ack(key) {
+                            Ok(()) => delivered += 1,
+                            Err(e) => {
+                                warn!(peer_id = %peer.id, error = %e, "Outbox: ack failed");
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            warn!(
+                                peer_id = %peer.id,
+                                pending = batch.len() - delivered,
+                                error = %e,
+                                "Outbox: push failed; will retry on next tick"
+                            );
+                            break;
+                        }
+                    }
+                }
+                if delivered > 0 {
+                    info!(
+                        peer_id = %peer.id,
+                        delivered = delivered,
+                        "Outbox: drained buffered events"
+                    );
+                }
+            }
+
+            // Retention sweep once per minute per peer.
+            if last_evict.elapsed() >= std::time::Duration::from_secs(60) {
+                for peer in &peers {
+                    if let Err(e) = outbox.evict_older_than(&peer.id, retention_secs) {
+                        warn!(peer_id = %peer.id, error = %e, "Outbox: eviction failed");
+                    }
+                }
+                last_evict = tokio::time::Instant::now();
             }
         }
     });
@@ -813,5 +976,49 @@ mod tests {
         let stored = storage.get_entity("ship-upgrade").await.unwrap().unwrap();
         // DuckDB stores confidence as FLOAT (f32); allow for f32 precision loss.
         assert!((stored.confidence - 0.95).abs() < 1e-6, "confidence was {}", stored.confidence);
+    }
+
+    // ── Per-peer state map eviction ───────────────────────────────────────────
+
+    /// Simulates one tick of `spawn_federation_sync` against the in-memory
+    /// state maps. Confirms that when a peer leaves the registry, its
+    /// entries in `next_run_at` and `backoff` are dropped on the next tick
+    /// (preventing the slow leak the production loop used to have).
+    #[tokio::test]
+    async fn federation_state_evicts_removed_peers() {
+        let registry = PeerRegistry::new();
+        for id in &["alpha", "beta", "gamma"] {
+            registry.register(make_peer(id)).await;
+        }
+
+        let mut next_run_at: HashMap<String, tokio::time::Instant> = HashMap::new();
+        let mut backoff: HashMap<String, std::time::Duration> = HashMap::new();
+        let now = tokio::time::Instant::now();
+        let base = std::time::Duration::from_secs(30);
+
+        // Tick 1: register all peers in the per-peer state maps the way
+        // spawn_federation_sync does after a successful pull.
+        let peers = registry.list().await;
+        evict_stale_peer_state(&peers, &mut next_run_at, &mut backoff);
+        for p in &peers {
+            next_run_at.insert(p.id.clone(), now + base);
+            backoff.insert(p.id.clone(), base);
+        }
+        assert_eq!(next_run_at.len(), 3);
+        assert_eq!(backoff.len(), 3);
+
+        // One peer leaves the registry between ticks.
+        assert!(registry.remove("beta").await);
+
+        // Tick 2: stale entries for "beta" must be dropped.
+        let peers = registry.list().await;
+        evict_stale_peer_state(&peers, &mut next_run_at, &mut backoff);
+
+        assert_eq!(next_run_at.len(), 2);
+        assert_eq!(backoff.len(), 2);
+        assert!(!next_run_at.contains_key("beta"));
+        assert!(!backoff.contains_key("beta"));
+        assert!(next_run_at.contains_key("alpha"));
+        assert!(next_run_at.contains_key("gamma"));
     }
 }

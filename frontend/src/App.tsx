@@ -1,17 +1,24 @@
-import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, lazy, Suspense } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { useAppStore } from './store/useAppStore';
 import { useEntities } from './hooks/useEntities';
 import { useEntityTypes } from './hooks/useEntityTypes';
 import { useWebSocket } from './hooks/useWebSocket';
-import { MapView } from './components/MapView';
-import { EntityInspector } from './components/EntityInspector';
 import { TimelineScrubber } from './components/TimelineScrubber';
 import { Sidebar } from './components/Sidebar';
 import { LoginPage } from './components/LoginPage';
-import { Dashboard } from './components/Dashboard';
-import { SearchPanel } from './components/SearchPanel';
-import { QueryConsole } from './components/QueryConsole';
+
+// Tab-level code-splitting: each tab panel loads on first activation, keeping
+// the initial bundle small (Leaflet weighs ~170 KB on its own).
+const MapView         = lazy(() => import('./components/MapView').then(m => ({ default: m.MapView })));
+const EntityInspector = lazy(() => import('./components/EntityInspector').then(m => ({ default: m.EntityInspector })));
+const Dashboard       = lazy(() => import('./components/Dashboard').then(m => ({ default: m.Dashboard })));
+const SearchPanel     = lazy(() => import('./components/SearchPanel').then(m => ({ default: m.SearchPanel })));
+const QueryConsole    = lazy(() => import('./components/QueryConsole').then(m => ({ default: m.QueryConsole })));
+
+const TabFallback = () => (
+  <div className="flex-1 flex items-center justify-center text-gray-500 text-xs">Loading…</div>
+);
 
 type AppTab = 'map' | 'dashboard' | 'search' | 'query';
 
@@ -349,38 +356,41 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
           className="flex-1 flex overflow-hidden relative"
           tabIndex={-1}
         >
-          {/* Map tab */}
-          {activeTab === 'map' && (
-            <>
-              <MapView />
-              {inspectorOpen && (
-                <aside role="complementary" aria-label="Entity details inspector">
-                  <EntityInspector />
-                </aside>
-              )}
-            </>
-          )}
+          {/* Single Suspense boundary; each tab body is its own lazy chunk. */}
+          <Suspense fallback={<TabFallback />}>
+            {/* Map tab */}
+            {activeTab === 'map' && (
+              <>
+                <MapView />
+                {inspectorOpen && (
+                  <aside role="complementary" aria-label="Entity details inspector">
+                    <EntityInspector />
+                  </aside>
+                )}
+              </>
+            )}
 
-          {/* Dashboard tab */}
-          {activeTab === 'dashboard' && (
-            <div className="flex-1 overflow-hidden">
-              <Dashboard onNavigate={(tab) => setActiveTab(tab as AppTab)} />
-            </div>
-          )}
+            {/* Dashboard tab */}
+            {activeTab === 'dashboard' && (
+              <div className="flex-1 overflow-hidden">
+                <Dashboard onNavigate={(tab) => setActiveTab(tab as AppTab)} />
+              </div>
+            )}
 
-          {/* Search tab */}
-          {activeTab === 'search' && (
-            <div className="flex-1 overflow-hidden relative">
-              <SearchPanel />
-            </div>
-          )}
+            {/* Search tab */}
+            {activeTab === 'search' && (
+              <div className="flex-1 overflow-hidden relative">
+                <SearchPanel />
+              </div>
+            )}
 
-          {/* Query tab */}
-          {activeTab === 'query' && (
-            <div className="flex-1 overflow-hidden relative">
-              <QueryConsole />
-            </div>
-          )}
+            {/* Query tab */}
+            {activeTab === 'query' && (
+              <div className="flex-1 overflow-hidden relative">
+                <QueryConsole />
+              </div>
+            )}
+          </Suspense>
         </main>
       </div>
 

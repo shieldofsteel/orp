@@ -166,12 +166,61 @@ pub struct HealthComponents {
     stream_processor: ComponentHealth,
     api_server: ComponentHealth,
     monitor_engine: ComponentHealth,
+    /// Per-connector live health, derived from each `Connector::stats()`.
+    /// Empty if no connectors are registered with the AppState.
+    connectors: Vec<ConnectorHealthEntry>,
+    /// Per-peer pending outbox count (federation outbound buffer). Empty when
+    /// federation is disabled or the outbox failed to open. Each entry maps
+    /// `peer_id` → number of events currently buffered for that peer.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    federation_outbox: Vec<FederationOutboxHealth>,
+}
+
+#[derive(Serialize)]
+pub struct FederationOutboxHealth {
+    pub peer_id: String,
+    pub pending_count: u64,
 }
 
 #[derive(Serialize)]
 pub struct ComponentHealth {
     status: String,
     latency_ms: Option<f64>,
+}
+
+#[derive(Serialize)]
+pub struct ConnectorHealthEntry {
+    pub id: String,
+    pub connector_type: String,
+    /// "healthy" | "degraded" | "unhealthy". Computed from
+    /// `error_rate_window_pct`: rate > 50% → unhealthy, > 10% → degraded,
+    /// else healthy.
+    pub status: String,
+    pub events_processed: u64,
+    pub errors: u64,
+    /// errors / (events + errors) over the connector's lifetime, expressed
+    /// as a percentage. `0.0` when `events + errors == 0` so a freshly-
+    /// started connector reads as healthy.
+    pub error_rate_window_pct: f64,
+}
+
+/// Compute a connector's status string from its (events, errors) counters.
+/// Policy: > 50% error rate → unhealthy, > 10% → degraded, else healthy.
+/// `events + errors == 0` is healthy by definition.
+fn connector_status_from_counts(events: u64, errors: u64) -> (String, f64) {
+    let total = events.saturating_add(errors);
+    if total == 0 {
+        return ("healthy".to_string(), 0.0);
+    }
+    let rate = errors as f64 / total as f64;
+    let status = if rate > 0.50 {
+        "unhealthy"
+    } else if rate > 0.10 {
+        "degraded"
+    } else {
+        "healthy"
+    };
+    (status.to_string(), rate * 100.0)
 }
 
 pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
@@ -185,8 +234,57 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResp
     let _proc_stats = state.processor.stats();
     let uptime = state.started_at.elapsed().as_secs();
 
+    // Snapshot the live connector registry. We hold the lock just long enough
+    // to read each connector's config + stats; both are sync calls so we never
+    // suspend with the lock held.
+    let connector_entries: Vec<ConnectorHealthEntry> = {
+        let guard = state.connectors.lock().await;
+        guard
+            .iter()
+            .map(|c| {
+                let cfg = c.config();
+                let stats = c.stats();
+                let (status, rate_pct) =
+                    connector_status_from_counts(stats.events_processed, stats.errors);
+                ConnectorHealthEntry {
+                    id: cfg.connector_id.clone(),
+                    connector_type: cfg.connector_type.clone(),
+                    status,
+                    events_processed: stats.events_processed,
+                    errors: stats.errors,
+                    error_rate_window_pct: rate_pct,
+                }
+            })
+            .collect()
+    };
+
+    // If any connector is unhealthy, the top-level status degrades but we
+    // never fail the /health endpoint outright — dashboards still get JSON.
+    let any_unhealthy = connector_entries.iter().any(|c| c.status == "unhealthy");
+    let top_status = if any_unhealthy { "degraded" } else { "healthy" };
+
+    // Surface per-peer outbox pending counts when federation is enabled.
+    // We touch RocksDB synchronously; the prefix scan is O(pending) per peer
+    // and only runs on /health hits, which are not on a hot path.
+    let federation_outbox_entries: Vec<FederationOutboxHealth> =
+        match (&state.federation_registry, &state.federation_outbox) {
+            (Some(registry), Some(outbox)) => {
+                let peers = registry.list().await;
+                let mut entries = Vec::with_capacity(peers.len());
+                for peer in peers {
+                    let count = outbox.pending_count(&peer.id).unwrap_or(0);
+                    entries.push(FederationOutboxHealth {
+                        peer_id: peer.id,
+                        pending_count: count,
+                    });
+                }
+                entries
+            }
+            _ => Vec::new(),
+        };
+
     Json(HealthResponse {
-        status: "healthy".to_string(),
+        status: top_status.to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: uptime,
@@ -215,6 +313,8 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResp
                 status: "healthy".to_string(),
                 latency_ms: None,
             },
+            connectors: connector_entries,
+            federation_outbox: federation_outbox_entries,
         },
     })
 }
@@ -1904,6 +2004,8 @@ mod tests {
             started_at: std::time::Instant::now(),
             layer_registry: None,
             federation_registry: None,
+            federation_outbox: None,
+            connectors: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -2860,5 +2962,132 @@ mod tests {
         assert!(limiter.check("1.2.3.4").await.is_ok());
         assert!(limiter.check("5.6.7.8").await.is_ok());
         assert!(limiter.check("1.2.3.4").await.is_err());
+    }
+
+    // ── Connector health surfacing ───────────────────────────────────────────
+
+    /// Stub adapter that lets tests pump arbitrary event/error counts into
+    /// `Connector::stats()` without spinning up a real network listener.
+    struct StubConnector {
+        cfg: orp_connector::ConnectorConfig,
+        events: u64,
+        errors: u64,
+    }
+
+    impl StubConnector {
+        fn new(id: &str, kind: &str, events: u64, errors: u64) -> Self {
+            Self {
+                cfg: orp_connector::ConnectorConfig {
+                    connector_id: id.to_string(),
+                    connector_type: kind.to_string(),
+                    url: None,
+                    entity_type: "test".to_string(),
+                    enabled: true,
+                    trust_score: 1.0,
+                    properties: std::collections::HashMap::new(),
+                },
+                events,
+                errors,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl orp_connector::Connector for StubConnector {
+        fn connector_id(&self) -> &str {
+            &self.cfg.connector_id
+        }
+        async fn start(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<orp_connector::SourceEvent>,
+        ) -> Result<(), orp_connector::ConnectorError> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), orp_connector::ConnectorError> {
+            Ok(())
+        }
+        async fn health_check(&self) -> Result<(), orp_connector::ConnectorError> {
+            Ok(())
+        }
+        fn config(&self) -> &orp_connector::ConnectorConfig {
+            &self.cfg
+        }
+        fn stats(&self) -> orp_connector::ConnectorStats {
+            orp_connector::ConnectorStats {
+                events_processed: self.events,
+                errors: self.errors,
+                last_event_timestamp: None,
+                uptime_seconds: 0,
+            }
+        }
+    }
+
+    async fn read_health(app: Router) -> serde_json::Value {
+        let resp = app
+            .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_includes_connectors_field() {
+        let (app, state) = make_test_app().await;
+        {
+            let mut guard = state.connectors.lock().await;
+            guard.push(Arc::new(StubConnector::new("ais-1", "ais", 10, 0)));
+            guard.push(Arc::new(StubConnector::new("adsb-1", "adsb", 20, 0)));
+        }
+
+        let json = read_health(app).await;
+        let connectors = json["components"]["connectors"]
+            .as_array()
+            .expect("connectors array missing");
+        assert_eq!(connectors.len(), 2);
+        // Healthy when error rate is zero.
+        assert_eq!(connectors[0]["status"], "healthy");
+        assert_eq!(connectors[1]["status"], "healthy");
+        assert_eq!(json["status"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn health_status_degraded_when_connector_error_rate_high() {
+        // 80 errors / (20 events + 80 errors) = 80% → unhealthy at the
+        // connector level, which propagates to a top-level "degraded".
+        // A degraded threshold (>10%, ≤50%) is exercised separately below
+        // by tweaking events/errors without crossing 50%.
+        let (app, state) = make_test_app().await;
+        {
+            let mut guard = state.connectors.lock().await;
+            // 6 errors / (50 + 6) ≈ 10.7% — > 10% so this is "degraded".
+            guard.push(Arc::new(StubConnector::new("ais-1", "ais", 50, 6)));
+        }
+
+        let json = read_health(app).await;
+        let entry = &json["components"]["connectors"][0];
+        assert_eq!(entry["status"], "degraded");
+        // No unhealthy connector → top-level stays healthy.
+        assert_eq!(json["status"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn health_status_unhealthy_when_connector_error_rate_critical() {
+        // 99 / (1 + 99) = 99% → unhealthy. Top-level should become "degraded"
+        // (we never fail /health outright — dashboards still get JSON).
+        let (app, state) = make_test_app().await;
+        {
+            let mut guard = state.connectors.lock().await;
+            guard.push(Arc::new(StubConnector::new("ais-1", "ais", 1, 99)));
+        }
+
+        let json = read_health(app).await;
+        let entry = &json["components"]["connectors"][0];
+        assert_eq!(entry["status"], "unhealthy");
+        assert_eq!(entry["events_processed"], 1);
+        assert_eq!(entry["errors"], 99);
+        assert_eq!(json["status"], "degraded");
     }
 }

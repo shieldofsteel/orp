@@ -50,9 +50,22 @@ pub enum MlError {
     Serialize(String),
     #[error("Invalid model: {0}")]
     InvalidModel(String),
+    #[error("Model schema version mismatch: got {got}, expected {expected}")]
+    ModelVersionMismatch { got: u16, expected: u16 },
 }
 
 pub type MlResult<T> = Result<T, MlError>;
+
+/// Current on-disk schema version for [`IsolationForestModel`].
+///
+/// Bump this whenever the serialised representation changes in a way that
+/// is not bincode-compatible with prior versions — i.e. adding, removing,
+/// reordering, or changing the type of any `pub(crate)` field on
+/// [`IsolationForestModel`] or [`IfNode`]. Adding a new enum variant to
+/// [`IfNode`] also requires a bump because bincode encodes the discriminant.
+/// When you bump it, also extend [`IsolationForestScorer::from_bytes`] to
+/// either accept the old version (with migration) or reject it cleanly.
+pub const ISOLATION_FOREST_SCHEMA_VERSION: u16 = 1;
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
@@ -94,14 +107,28 @@ impl AnomalyScorer for NullScorer {
 // ── OnlineQuantileScorer ──────────────────────────────────────────────────────
 
 const QUANTILE_BUFFER_CAP: usize = 2048;
-const QUANTILE_TARGET: f32 = 0.995;
+const QUANTILE_HIGH: f32 = 0.9975;
+const QUANTILE_LOW: f32 = 0.0025;
 
-/// Per-feature streaming p99.5 anomaly flagger.
+/// Per-feature streaming two-sided envelope anomaly flagger.
 ///
-/// Maintains a rolling buffer of the last `N=2048` samples per feature and
-/// computes p99.5 from that buffer on demand. Any feature value above its
-/// p99.5 contributes to the score; the score is the fraction of axes
-/// triggered, scaled to `[0, 100]`.
+/// Maintains a rolling buffer of the last `N=2048` samples per feature and,
+/// on each call, computes a two-sided envelope `[p0.25, p99.75]` from that
+/// buffer. A feature value is "outside" if it is `< low` or `> high` on
+/// that axis. The returned score is the maximum normalised excursion
+/// across all axes, scaled to `[0, 100]`:
+///
+/// - `0` — the sample is inside the envelope on every axis.
+/// - `100` — the sample is outside the envelope on at least one axis with
+///   an excursion at or beyond one envelope-width past the boundary
+///   (i.e. saturates here so a single rogue axis cannot dominate the
+///   downstream linear blend with rule-based scores).
+///
+/// Two-sided is important for cyclical features like `hour_sin` /
+/// `hour_cos` where values live in `[-1, 1]`: a single-sided `abs()` test
+/// would incorrectly flag legitimate values near `-1`. The envelope flags
+/// values that fall outside the *observed* per-axis distribution on
+/// either side.
 ///
 /// During warmup (fewer than 64 samples) the scorer always returns 0 — it
 /// will not flag noise on a cold start.
@@ -151,8 +178,8 @@ impl AnomalyScorer for OnlineQuantileScorer {
 
         // Compute score against the *current* distribution before folding the
         // new sample in — otherwise an extreme value contaminates its own
-        // p99.5 estimate.
-        let mut triggered = 0usize;
+        // envelope estimate.
+        let mut max_excursion = 0.0f32;
         let mut warming_up = false;
         for (i, &f) in features.iter().enumerate() {
             let buf = &bufs[i];
@@ -162,11 +189,24 @@ impl AnomalyScorer for OnlineQuantileScorer {
             }
             let mut sorted: Vec<f32> = buf.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let idx =
-                ((sorted.len() as f32) * QUANTILE_TARGET).floor() as usize;
-            let cutoff = sorted[idx.min(sorted.len().saturating_sub(1))];
-            if f.abs() > cutoff.abs() {
-                triggered += 1;
+            let last = sorted.len().saturating_sub(1);
+            let hi_idx = ((sorted.len() as f32) * QUANTILE_HIGH).floor() as usize;
+            let lo_idx = ((sorted.len() as f32) * QUANTILE_LOW).floor() as usize;
+            let hi = sorted[hi_idx.min(last)];
+            let lo = sorted[lo_idx.min(last)];
+            // `width` guards against a degenerate envelope (lo == hi); when
+            // the distribution is constant the only meaningful excursion is
+            // "outside vs inside", saturating to 1.0.
+            let width = (hi - lo).max(1e-6);
+            let excursion = if f > hi {
+                (f - hi) / width
+            } else if f < lo {
+                (lo - f) / width
+            } else {
+                0.0
+            };
+            if excursion > max_excursion {
+                max_excursion = excursion;
             }
         }
 
@@ -182,7 +222,7 @@ impl AnomalyScorer for OnlineQuantileScorer {
         if warming_up || self.feature_dim == 0 {
             return 0.0;
         }
-        (triggered as f32 / self.feature_dim as f32) * 100.0
+        (max_excursion * 100.0).clamp(0.0, 100.0)
     }
 
     fn model_id(&self) -> &str {
@@ -197,6 +237,10 @@ impl AnomalyScorer for OnlineQuantileScorer {
 // ── IsolationForestScorer ─────────────────────────────────────────────────────
 
 /// One node of an isolation tree. Either an internal split or a leaf.
+///
+/// Fields are `pub(crate)` so they're visible to serde and tests but
+/// not part of the public API surface — the on-disk shape is governed by
+/// [`ISOLATION_FOREST_SCHEMA_VERSION`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum IfNode {
     Split {
@@ -214,11 +258,32 @@ pub enum IfNode {
 ///
 /// Train offline via [`IsolationForestModel::fit`] then serialize with
 /// `bincode`. The runtime loads with [`IsolationForestScorer::from_bytes`].
+///
+/// The `schema_version` field is the first field by design: bincode encodes
+/// fields in declaration order, so it's the first thing the loader sees and
+/// can use to reject incompatible blobs before mis-decoding any later field.
+/// All other fields are `pub(crate)` to keep the on-disk shape an internal
+/// concern of this crate; bumps are governed by
+/// [`ISOLATION_FOREST_SCHEMA_VERSION`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IsolationForestModel {
-    pub feature_dim: usize,
-    pub sample_size: u32,
-    pub trees: Vec<IfNode>,
+    pub schema_version: u16,
+    pub(crate) feature_dim: usize,
+    pub(crate) sample_size: u32,
+    pub(crate) trees: Vec<IfNode>,
+}
+
+impl IsolationForestModel {
+    /// Construct an empty model carrying the current schema version.
+    /// Useful for tests and as a building block before populating trees.
+    pub fn new(feature_dim: usize, sample_size: u32) -> Self {
+        Self {
+            schema_version: ISOLATION_FOREST_SCHEMA_VERSION,
+            feature_dim,
+            sample_size,
+            trees: Vec::new(),
+        }
+    }
 }
 
 impl IsolationForestModel {
@@ -253,6 +318,7 @@ impl IsolationForestModel {
             trees.push(build_tree(&subset, 0, height_limit, &mut rng));
         }
         Ok(Self {
+            schema_version: ISOLATION_FOREST_SCHEMA_VERSION,
             feature_dim,
             sample_size: sample_size as u32,
             trees,
@@ -276,9 +342,19 @@ pub struct IsolationForestScorer {
 
 impl IsolationForestScorer {
     /// Construct from a serialized [`IsolationForestModel`] (bincode bytes).
+    ///
+    /// Rejects blobs whose `schema_version` does not match
+    /// [`ISOLATION_FOREST_SCHEMA_VERSION`] — silently mis-decoding a stale
+    /// model is worse than refusing to load it.
     pub fn from_bytes(model_id: &str, bytes: &[u8], feature_dim: usize) -> MlResult<Self> {
         let model: IsolationForestModel = bincode::deserialize(bytes)
             .map_err(|e| MlError::Deserialize(e.to_string()))?;
+        if model.schema_version != ISOLATION_FOREST_SCHEMA_VERSION {
+            return Err(MlError::ModelVersionMismatch {
+                got: model.schema_version,
+                expected: ISOLATION_FOREST_SCHEMA_VERSION,
+            });
+        }
         if model.feature_dim != feature_dim {
             return Err(MlError::FeatureDimMismatch {
                 expected: model.feature_dim,
@@ -594,5 +670,66 @@ mod tests {
         let data: Vec<Vec<f32>> = vec![vec![1.0, 2.0], vec![1.0, 2.0, 3.0]];
         let err = IsolationForestModel::fit(&data, 4, 8, 0).unwrap_err();
         assert!(matches!(err, MlError::InvalidModel(_)));
+    }
+
+    #[test]
+    fn isolation_forest_rejects_wrong_schema_version() {
+        // Build a model, mutate schema_version, re-serialise, expect rejection.
+        let data: Vec<Vec<f32>> = (0..32).map(|i| vec![i as f32, (i * 2) as f32]).collect();
+        let mut model = IsolationForestModel::fit(&data, 8, 16, 0).unwrap();
+        assert_eq!(model.schema_version, ISOLATION_FOREST_SCHEMA_VERSION);
+        model.schema_version = 999;
+        let bytes = bincode::serialize(&model).unwrap();
+        let err = IsolationForestScorer::from_bytes("if", &bytes, 2).unwrap_err();
+        assert!(matches!(
+            err,
+            MlError::ModelVersionMismatch {
+                got: 999,
+                expected: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn isolation_forest_new_carries_current_schema_version() {
+        let m = IsolationForestModel::new(4, 16);
+        assert_eq!(m.schema_version, ISOLATION_FOREST_SCHEMA_VERSION);
+        assert_eq!(m.feature_dim, 4);
+        assert_eq!(m.sample_size, 16);
+        assert!(m.trees.is_empty());
+    }
+
+    #[test]
+    fn online_quantile_ignores_negative_cyclical_values() {
+        // Reproduces the abs()-based bug: with two-sided envelope, a value
+        // near the *low* end of the observed distribution should NOT score
+        // as anomalous when the in-distribution values bracket it.
+        let s = OnlineQuantileScorer::new("test", 1);
+        let mut rng = StdRng::seed_from_u64(123);
+        // Simulate hour_sin: samples roughly uniformly in [-1, 1].
+        for _ in 0..256 {
+            let v: f32 = rng.gen_range(-1.0..1.0);
+            s.score(&[v]);
+        }
+        // -0.99 is well within the observed support; the old abs()-based
+        // scorer would have flagged it because |-0.99| > p99.5(|x|). The
+        // envelope-based scorer should leave it alone.
+        let score = s.score(&[-0.99]);
+        assert!(
+            score < 5.0,
+            "near-boundary in-distribution value should not be flagged, got {}",
+            score
+        );
+        // Conversely, a value far below the envelope should flag.
+        let outlier = s.score(&[-100.0]);
+        assert!(outlier > 50.0, "far-below outlier should be flagged, got {}", outlier);
+    }
+
+    #[test]
+    fn anomaly_scorer_impls_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<IsolationForestScorer>();
+        assert_send_sync::<OnlineQuantileScorer>();
+        assert_send_sync::<NullScorer>();
     }
 }

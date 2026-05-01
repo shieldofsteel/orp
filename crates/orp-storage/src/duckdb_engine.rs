@@ -2248,4 +2248,101 @@ mod tests {
         let active = s.get_entities_by_type("ship", 100, 0).await.unwrap();
         assert!(active.iter().all(|e| e.entity_id != "soft-del"));
     }
+
+    // ── new_with_path persistence tests ──────────────────────────────────────
+    //
+    // These exercise the file-backed constructor that the rest of the suite
+    // (which uses `new_in_memory`) leaves untouched.
+
+    #[tokio::test]
+    async fn test_new_with_path_creates_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("orp.duckdb");
+        let path_str = db_path.to_str().unwrap();
+
+        let original_created_at = {
+            let s = DuckDbStorage::new_with_path(path_str).unwrap();
+            s.insert_entity(&make_entity("persist-1", "ship"))
+                .await
+                .unwrap();
+            let e = s.get_entity("persist-1").await.unwrap().unwrap();
+            e.created_at
+            // `s` drops here, releasing the DuckDB connection.
+        };
+        assert!(db_path.exists(), "DuckDB file was not created on disk");
+
+        // Reopen and confirm the row survived with the same created_at.
+        let s2 = DuckDbStorage::new_with_path(path_str).unwrap();
+        let e2 = s2.get_entity("persist-1").await.unwrap().unwrap();
+        assert_eq!(e2.entity_type, "ship");
+        let delta = (e2.created_at - original_created_at).num_milliseconds().abs();
+        assert!(
+            delta < 1000,
+            "created_at drifted across reopen: original={}, reopened={}",
+            original_created_at,
+            e2.created_at
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_with_path_creates_parent_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // Two missing levels — `create_dir_all` must create both.
+        let nested = temp.path().join("a").join("b");
+        let db_path = nested.join("orp.duckdb");
+        assert!(!nested.exists(), "preconditions: parent dir should not exist");
+
+        let _s = DuckDbStorage::new_with_path(db_path.to_str().unwrap()).unwrap();
+        assert!(
+            nested.is_dir(),
+            "constructor did not create missing parent directory: {:?}",
+            nested
+        );
+        assert!(db_path.exists(), "DuckDB file was not created");
+    }
+
+    #[tokio::test]
+    async fn test_new_with_path_rejects_directory_target() {
+        // Pass the temp dir itself as the target — it's a directory, not a file.
+        let temp = tempfile::TempDir::new().unwrap();
+        let path_str = temp.path().to_str().unwrap();
+        let result = DuckDbStorage::new_with_path(path_str);
+        assert!(result.is_err(), "expected Err when path is a directory");
+        match result {
+            Err(StorageError::DatabaseError(_)) | Err(StorageError::IoError(_)) => {}
+            Err(other) => panic!("unexpected error variant: {:?}", other),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn test_new_with_path_rejects_unwritable_target() {
+        // /etc exists on macOS/Linux but is not writable to non-root users.
+        // If we *are* root (e.g. CI containers), skip the assertion rather
+        // than fail spuriously.
+        if unsafe { libc_geteuid() } == 0 {
+            eprintln!("skipping unwritable-target test: running as root");
+            return;
+        }
+        let result = DuckDbStorage::new_with_path("/etc/orp_test_should_not_exist.duckdb");
+        assert!(
+            result.is_err(),
+            "expected Err when target is unwritable, got Ok"
+        );
+        match result {
+            Err(StorageError::DatabaseError(_)) | Err(StorageError::IoError(_)) => {}
+            Err(other) => panic!("unexpected error variant: {:?}", other),
+            Ok(_) => unreachable!(),
+        }
+    }
+
+    /// Tiny libc shim so we can detect root without pulling in the `libc` dep.
+    #[cfg(not(target_os = "windows"))]
+    unsafe fn libc_geteuid() -> u32 {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        geteuid()
+    }
 }

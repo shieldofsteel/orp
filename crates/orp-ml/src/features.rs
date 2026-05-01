@@ -231,4 +231,106 @@ mod tests {
         let b = bearing_deg(0.0, 0.0, 1.0, 0.0);
         assert!(b.abs() < 1e-6 || (b - 360.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_extract_handles_identical_points() {
+        // Six samples at the same location, same speed, only timestamp differs.
+        let history: Vec<(f64, f64, f64, f64)> = (0..6)
+            .map(|i| (1_700_000_000.0 + (i as f64) * 60.0, 51.0, 4.0, 12.5))
+            .collect();
+        let feats = extract_kinematic_features("e", &history).unwrap();
+        assert_eq!(feats.len(), KINEMATIC_FEATURE_DIM);
+        // speed_z must be exactly 0: zero variance triggers the std-guard.
+        assert_eq!(feats[0], 0.0, "speed_z should be 0 for constant speed");
+        // distance_to_centroid_km must be ~0: every point is the centroid.
+        assert!(
+            feats[5].abs() < 1e-3,
+            "distance_to_centroid_km should be ~0, got {}",
+            feats[5]
+        );
+        // All features must be finite.
+        for (i, v) in feats.iter().enumerate() {
+            assert!(v.is_finite(), "feature {} not finite: {}", i, v);
+        }
+    }
+
+    #[test]
+    fn test_extract_handles_antipodal_coordinates() {
+        // Alternate between (0, 0) and (0, 180) — antipodal points; the
+        // great-circle distance is ~half the Earth's circumference (~20015 km).
+        let history: Vec<(f64, f64, f64, f64)> = (0..6)
+            .map(|i| {
+                let lon = if i % 2 == 0 { 0.0 } else { 180.0 };
+                (1_700_000_000.0 + (i as f64) * 60.0, 0.0, lon, 10.0)
+            })
+            .collect();
+        // Sanity-check our setup: the haversine between antipodal lon points
+        // at the equator is roughly half the Earth's circumference.
+        let d = haversine_km(0.0, 0.0, 0.0, 180.0);
+        assert!(
+            (d - 20015.0).abs() < 50.0,
+            "antipodal haversine should be ~20015 km, got {}",
+            d
+        );
+        // The extractor must not panic and must return finite values.
+        let feats = extract_kinematic_features("e", &history).unwrap();
+        assert_eq!(feats.len(), KINEMATIC_FEATURE_DIM);
+        for (i, v) in feats.iter().enumerate() {
+            assert!(v.is_finite(), "feature {} not finite: {}", i, v);
+        }
+    }
+
+    #[test]
+    fn test_extract_handles_min_history_boundary() {
+        // Exactly MIN_HISTORY samples -> Some.
+        let exact: Vec<(f64, f64, f64, f64)> = (0..MIN_HISTORY)
+            .map(|i| (1_700_000_000.0 + (i as f64) * 60.0, 51.0, 4.0, 10.0))
+            .collect();
+        assert!(
+            extract_kinematic_features("e", &exact).is_some(),
+            "MIN_HISTORY samples should produce features"
+        );
+        // One less than MIN_HISTORY -> None.
+        let short: Vec<(f64, f64, f64, f64)> = (0..MIN_HISTORY - 1)
+            .map(|i| (1_700_000_000.0 + (i as f64) * 60.0, 51.0, 4.0, 10.0))
+            .collect();
+        assert!(
+            extract_kinematic_features("e", &short).is_none(),
+            "MIN_HISTORY-1 samples should return None"
+        );
+    }
+
+    #[test]
+    fn test_extract_handles_negative_unix_time() {
+        // Pre-epoch timestamps must still produce a sensible hour-of-day.
+        let history: Vec<(f64, f64, f64, f64)> = (0..6)
+            .map(|i| (-3600.0 + (i as f64) * 60.0, 51.0, 4.0, 10.0))
+            .collect();
+        let feats = extract_kinematic_features("e", &history).unwrap();
+        let s = feats[3];
+        let c = feats[4];
+        assert!((-1.0..=1.0).contains(&s), "hour_sin must be in [-1, 1], got {}", s);
+        assert!((-1.0..=1.0).contains(&c), "hour_cos must be in [-1, 1], got {}", c);
+        for (i, v) in feats.iter().enumerate() {
+            assert!(v.is_finite(), "feature {} not finite: {}", i, v);
+        }
+    }
+
+    #[test]
+    fn test_extract_handles_far_future_time() {
+        // 1e18 seconds is past chrono's representable range; the extractor
+        // must not panic and must return finite features (the hour-of-day
+        // path falls back to 0 when chrono refuses to convert).
+        let history: Vec<(f64, f64, f64, f64)> = (0..6)
+            .map(|i| (1.0e18 + (i as f64) * 60.0, 51.0, 4.0, 10.0))
+            .collect();
+        let result = extract_kinematic_features("e", &history);
+        // Either Some(finite) or None; never panic, never NaN.
+        if let Some(feats) = result {
+            assert_eq!(feats.len(), KINEMATIC_FEATURE_DIM);
+            for (i, v) in feats.iter().enumerate() {
+                assert!(v.is_finite(), "feature {} not finite: {}", i, v);
+            }
+        }
+    }
 }

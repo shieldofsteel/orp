@@ -1474,4 +1474,100 @@ mod tests {
         let s5b = drep(8, 0.0, 0, 0, 0);
         assert!(unpack_template_5_0(&s5b, &[], 0).unwrap().is_empty());
     }
+
+    // ── Section 7 boundary tests ─────────────────────────────────────────
+
+    #[test]
+    fn read_bits_13_bit_non_aligned_4_values() {
+        // Pack 0x123, 0x456, 0x789, 0xABC — each 13 bits — into 7 bytes
+        // (52 bits total). MSB-first, no padding between values.
+        // Concatenation as a 52-bit value:
+        //   v = (0x123 << 39) | (0x456 << 26) | (0x789 << 13) | 0xABC
+        let v: u64 = (0x123u64 << 39)
+            | (0x456u64 << 26)
+            | (0x789u64 << 13)
+            | 0xABCu64;
+        // Left-align the 52-bit packed value in 7 bytes (56 bits) so the
+        // first bit lands at offset 0.
+        let v_shifted = v << (56 - 52);
+        let bytes = v_shifted.to_be_bytes(); // 8 bytes; we only need bytes 1..8
+        let buf: [u8; 7] = [
+            bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ];
+        assert_eq!(read_bits(&buf, 0, 13), Some(0x123));
+        assert_eq!(read_bits(&buf, 13, 13), Some(0x456));
+        assert_eq!(read_bits(&buf, 26, 13), Some(0x789));
+        assert_eq!(read_bits(&buf, 39, 13), Some(0xABC));
+    }
+
+    #[test]
+    fn read_bits_64_bit_value() {
+        let v: u64 = 0x0123_4567_89AB_CDEF;
+        let buf = v.to_be_bytes();
+        assert_eq!(read_bits(&buf, 0, 64), Some(v));
+    }
+
+    #[test]
+    fn read_bits_rejects_nbits_over_64() {
+        // 65-bit reads can't fit in u64 — reject without reading.
+        assert_eq!(read_bits(&[0u8; 16], 0, 65), None);
+    }
+
+    #[test]
+    fn unpack_template_5_0_negative_binary_scale() {
+        // E = -3 ⇒ 2^E = 0.125. With R=100, X=16, D=0:
+        //   Y = (100 + 16 * 0.125) / 1 = 102.0
+        let s5 = drep(8, 100.0, -3, 0, 1);
+        let out = unpack_template_5_0(&s5, &[0x10], 1).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(
+            (out[0] - 102.0).abs() <= 1e-6,
+            "expected 102.0, got {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn unpack_template_5_0_negative_decimal_scale() {
+        // D = -2 ⇒ dec_div = 10^-2 = 0.01, so divide-by-0.01 == multiply-by-100.
+        // R=0.5, E=0, X=3 ⇒ Y = (0.5 + 3) / 0.01 = 350.0
+        let s5 = drep(8, 0.5, 0, -2, 1);
+        let out = unpack_template_5_0(&s5, &[0x03], 1).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(
+            (out[0] - 350.0).abs() <= 1e-6,
+            "expected 350.0, got {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn unpack_template_5_0_num_data_points_mismatch() {
+        // num_data_points=100 with nbits=8 needs 100 bytes; only 5 supplied.
+        let s5 = drep(8, 0.0, 0, 0, 100);
+        match unpack_template_5_0(&s5, &[0u8; 5], 100) {
+            Err(ConnectorError::ParseError(m)) => {
+                assert!(
+                    m.contains("Section 7"),
+                    "expected Section 7 error, got: {}",
+                    m
+                );
+            }
+            other => panic!(
+                "expected ParseError on truncation, got: {:?}",
+                other.is_err()
+            ),
+        }
+    }
+
+    #[test]
+    fn unpack_template_5_0_nbits_zero_with_huge_n() {
+        // Constant-field path: nbits=0 short-circuits to a Vec of R/10^D
+        // without touching the buffer. 1M points must succeed.
+        let s5 = drep(0, 42.0, 0, 0, 1_000_000);
+        let out = unpack_template_5_0(&s5, &[], 1_000_000).unwrap();
+        assert_eq!(out.len(), 1_000_000);
+        assert!((out[0] - 42.0).abs() < 1e-9);
+        assert!((out[out.len() - 1] - 42.0).abs() < 1e-9);
+    }
 }

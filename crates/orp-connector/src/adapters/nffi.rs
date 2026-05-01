@@ -4,6 +4,7 @@ use chrono::Utc;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -179,8 +180,58 @@ pub struct NffiTrack {
 // XML Parser
 // ---------------------------------------------------------------------------
 
+/// Deterministic fallback ID for an unnamed NFFI track.
+///
+/// SHA-256 of the (name, lat, lon, affiliation) tuple, truncated to 16
+/// hex chars. SHA-256 (not `DefaultHasher`) gives a *restart-stable* id
+/// so entity-resolution history survives reboots and stays reproducible
+/// across machines.
+pub fn anon_track_id(
+    name: Option<&str>,
+    latitude: f64,
+    longitude: f64,
+    affiliation: &NffiAffiliation,
+) -> String {
+    let mut h = Sha256::new();
+    h.update(b"orp-nffi-anon-v1\0");
+    match name {
+        Some(s) => {
+            h.update(b"name:");
+            h.update((s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
+        }
+        None => h.update(b"name:none"),
+    }
+    h.update(b"\0lat:");
+    h.update(((latitude * 1e7) as i64).to_le_bytes());
+    h.update(b"\0lon:");
+    h.update(((longitude * 1e7) as i64).to_le_bytes());
+    h.update(b"\0aff:");
+    h.update(affiliation.as_str().as_bytes());
+    let digest = h.finalize();
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        use std::fmt::Write;
+        let _ = write!(hex, "{:02x}", byte);
+    }
+    format!("nffi-anon-{}", hex)
+}
+
 /// Parse NFFI XML string into a list of tracks.
+///
+/// Defers to `parse_nffi_xml_with_counter` with no counter — kept as a
+/// thin wrapper for callers that don't need the fallback-ID metric.
 pub fn parse_nffi_xml(xml_data: &str) -> Result<Vec<NffiTrack>, ConnectorError> {
+    parse_nffi_xml_with_counter(xml_data, None)
+}
+
+/// Parse NFFI XML and report whenever an anonymous fallback ID is
+/// synthesised (no `<trackId>` in the source). When supplied, the
+/// `anon_count` AtomicU64 is incremented once per fallback.
+pub fn parse_nffi_xml_with_counter(
+    xml_data: &str,
+    anon_count: Option<&AtomicU64>,
+) -> Result<Vec<NffiTrack>, ConnectorError> {
     let mut reader = Reader::from_str(xml_data);
 
     let mut tracks = Vec::new();
@@ -260,19 +311,20 @@ pub fn parse_nffi_xml(xml_data: &str) -> Result<Vec<NffiTrack>, ConnectorError> 
                             let lon = longitude.unwrap_or(0.0);
 
                             if track_id.is_empty() {
-                                // No trackId in the source XML. Synthesise one from a
-                                // hash of the (name, lat, lon, affiliation) tuple so
-                                // two different unnamed tracks don't collide on
-                                // entity-resolution. Index-based fallback ("track-0",
-                                // "track-1") would merge unrelated tracks every load.
-                                use std::collections::hash_map::DefaultHasher;
-                                use std::hash::{Hash, Hasher};
-                                let mut h = DefaultHasher::new();
-                                name.hash(&mut h);
-                                ((lat * 1e7) as i64).hash(&mut h);
-                                ((lon * 1e7) as i64).hash(&mut h);
-                                affiliation.hash(&mut h);
-                                track_id = format!("nffi-anon-{:016x}", h.finish());
+                                // No <trackId> in source XML — synthesise a
+                                // restart-stable SHA-256 fallback so entity
+                                // resolution survives connector restarts.
+                                track_id =
+                                    anon_track_id(name.as_deref(), lat, lon, &affiliation);
+                                tracing::warn!(
+                                    name = ?name, lat, lon,
+                                    affiliation = affiliation.as_str(),
+                                    track_id = %track_id,
+                                    "NFFI track missing <trackId>; synthesised anon id"
+                                );
+                                if let Some(c) = anon_count {
+                                    c.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
 
                             tracks.push(NffiTrack {
@@ -440,6 +492,9 @@ pub struct NffiConnector {
     running: Arc<AtomicBool>,
     events_processed: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
+    /// Count of NFFI tracks where `<trackId>` was missing and the
+    /// fallback deterministic anon id was synthesised.
+    anonymous_tracks_total: Arc<AtomicU64>,
 }
 
 impl NffiConnector {
@@ -449,7 +504,15 @@ impl NffiConnector {
             running: Arc::new(AtomicBool::new(false)),
             events_processed: Arc::new(AtomicU64::new(0)),
             errors: Arc::new(AtomicU64::new(0)),
+            anonymous_tracks_total: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// `nffi_anonymous_tracks_total` — number of tracks for which the
+    /// fallback `nffi-anon-…` id was synthesised because the source XML
+    /// omitted `<trackId>`.
+    pub fn anonymous_tracks_total(&self) -> u64 {
+        self.anonymous_tracks_total.load(Ordering::Relaxed)
     }
 }
 
@@ -480,8 +543,9 @@ impl Connector for NffiConnector {
         let events_processed = Arc::clone(&self.events_processed);
         let errors = Arc::clone(&self.errors);
         let running = Arc::clone(&self.running);
+        let anon = Arc::clone(&self.anonymous_tracks_total);
 
-        match parse_nffi_xml(&content) {
+        match parse_nffi_xml_with_counter(&content, Some(anon.as_ref())) {
             Ok(tracks) => {
                 for track in tracks {
                     if !running.load(Ordering::Relaxed) {
@@ -826,5 +890,35 @@ mod tests {
         let tracks = parse_nffi_xml(xml).unwrap();
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].track_id, "ATTR-ID");
+    }
+
+    /// Regression: the fallback ID generator must be deterministic
+    /// across processes/restarts (used to be `DefaultHasher`, whose
+    /// seed resets on each process — broke entity-resolution history).
+    #[test]
+    fn nffi_anon_id_is_deterministic() {
+        let a = anon_track_id(Some("Alpha"), 51.5074, -0.1278, &NffiAffiliation::Friendly);
+        let b = anon_track_id(Some("Alpha"), 51.5074, -0.1278, &NffiAffiliation::Friendly);
+        assert_eq!(a, b, "anon track id must be deterministic");
+        assert!(a.starts_with("nffi-anon-"));
+        assert_eq!(a.len(), "nffi-anon-".len() + 16);
+        // Sanity: distinct inputs → distinct IDs.
+        let c = anon_track_id(Some("Bravo"), 51.5074, -0.1278, &NffiAffiliation::Friendly);
+        let d = anon_track_id(Some("Alpha"), 51.5074, -0.1278, &NffiAffiliation::Hostile);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
+
+        // Through the parser the counter must increment, and the same
+        // XML produces the same id on a second parse.
+        let xml = r#"<nffi><track><position><latitude>51.5074</latitude>
+            <longitude>-0.1278</longitude></position><identity>FRIENDLY</identity>
+            <platformType>GROUND_VEHICLE</platformType></track></nffi>"#;
+        let ctr = AtomicU64::new(0);
+        let t1 = parse_nffi_xml_with_counter(xml, Some(&ctr)).unwrap();
+        let t2 = parse_nffi_xml_with_counter(xml, None).unwrap();
+        assert_eq!(t1.len(), 1);
+        assert!(t1[0].track_id.starts_with("nffi-anon-"));
+        assert_eq!(ctr.load(Ordering::Relaxed), 1);
+        assert_eq!(t1[0].track_id, t2[0].track_id);
     }
 }

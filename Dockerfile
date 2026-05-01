@@ -79,3 +79,21 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 EXPOSE 9090
 
 ENTRYPOINT ["orp", "start"]
+
+# ── Stage 3: Distroless runtime (recommended production target) ───────────────
+# Smaller, no shell, runs as the pre-baked `nonroot` (uid/gid 65532) user.
+# Build with: docker build -t orp:distroless --target distroless .
+FROM gcr.io/distroless/cc-debian12:nonroot AS distroless
+
+# Copy the binary and CA bundle from the builder. CA certs come pre-installed
+# in the rust:1.75-bookworm builder image at /etc/ssl/certs/ca-certificates.crt.
+COPY --from=builder /build/target/release/orp /usr/local/bin/orp
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+USER nonroot:nonroot
+
+WORKDIR /var/lib/orp
+
+EXPOSE 9090
+
+ENTRYPOINT ["/usr/local/bin/orp", "start"]

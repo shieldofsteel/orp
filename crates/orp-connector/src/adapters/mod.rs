@@ -32,3 +32,10 @@ pub mod syslog;
 pub mod websocket_client;
 pub mod zeek;
 pub mod aisstream;
+#[cfg(feature = "kafka")]
+pub mod kafka;
+#[cfg(feature = "nats")]
+pub mod nats;
+pub mod hl7;
+pub mod ccsds;
+pub mod klv;

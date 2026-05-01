@@ -13,14 +13,15 @@ use axum::{
     Router,
 };
 use orp_audit::crypto::EventSigner;
+use orp_connector::Connector;
 use orp_query::QueryExecutor;
 use orp_security::{AbacEngine, ApiKeyService, AuthState};
 use orp_storage::traits::Storage;
-use orp_stream::{MonitorEngine, StreamProcessor};
+use orp_stream::{FederationOutbox, MonitorEngine, StreamProcessor};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -41,6 +42,18 @@ pub struct AppState {
     pub layer_registry: Option<Arc<layers::LayerRegistry>>,
     /// Federation peer registry (optional — None if federation is disabled).
     pub federation_registry: Option<Arc<PeerRegistry>>,
+    /// Disk-backed outbox for outbound federation events. Survives process
+    /// restarts so events queued while a peer is unreachable are replayed on
+    /// reconnect. None when federation is disabled or when the outbox path is
+    /// not openable (e.g. read-only filesystem) — callers should treat as
+    /// best-effort.
+    pub federation_outbox: Option<Arc<FederationOutbox>>,
+    /// Live connector registry. Each running adapter exposes `stats()` so the
+    /// `/api/v1/health` endpoint can surface error rates instead of silently
+    /// reporting "running" while the connector 100%-fails. Coexists with the
+    /// existing processor flow — connectors push events to the processor; this
+    /// registry is purely for observability.
+    pub connectors: Arc<Mutex<Vec<Arc<dyn Connector>>>>,
 }
 
 /// Per-IP rate limiter state — token bucket with 100 req/sec.
@@ -223,6 +236,40 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         .audit_signer
         .unwrap_or_else(|| Arc::new(EventSigner::new()));
 
+    // Open the federation outbox if federation is enabled. The path is
+    // `ORP_FED_OUTBOX_PATH` or `~/.local/share/orp/federation-outbox` by
+    // default. Failure to open is non-fatal — federation degrades to "no
+    // buffering" and `pending_count` always reads as 0.
+    let federation_outbox: Option<Arc<FederationOutbox>> =
+        if config.federation_registry.is_some() {
+            let path = std::env::var("ORP_FED_OUTBOX_PATH")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    std::path::PathBuf::from(home)
+                        .join(".local/share/orp/federation-outbox")
+                });
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match FederationOutbox::open(&path) {
+                Ok(o) => {
+                    tracing::info!(path = %path.display(), "Federation outbox opened");
+                    Some(Arc::new(o))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to open federation outbox; outbound buffering disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let state = Arc::new(AppState {
         storage: config.storage,
         query_executor: config.query_executor,
@@ -236,11 +283,16 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         started_at: std::time::Instant::now(),
         layer_registry: config.layer_registry,
         federation_registry: config.federation_registry.clone(),
+        federation_outbox,
+        connectors: Arc::new(Mutex::new(Vec::new())),
     });
 
-    // Spawn federation background sync if registry provided
+    // Spawn federation background sync if registry provided. Also spawn the
+    // outbound outbox pump that drains buffered events to peers as they come
+    // back online.
     if config.federation_registry.is_some() {
         federation::spawn_federation_sync(state.clone());
+        federation::spawn_outbox_pump(state.clone());
     }
 
     let cors = build_cors_layer();

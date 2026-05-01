@@ -171,6 +171,12 @@ pub struct OidcClient {
     /// without a server restart.
     discovery: Option<(OidcDiscovery, std::time::Instant)>,
     discovery_ttl: std::time::Duration,
+    /// Hard upper bound on how stale a cached discovery doc may be served
+    /// when refresh is failing. Beyond this we fail closed rather than
+    /// continue trusting (potentially-retired) keys forever. Default
+    /// `discovery_ttl * 24`; configurable via
+    /// `ORP_OIDC_DISCOVERY_MAX_STALENESS_SECS`.
+    discovery_max_staleness: std::time::Duration,
     /// Optional local JWT service — if set, we issue our own JWTs wrapping provider claims
     jwt_service: Option<Arc<JwtService>>,
 }
@@ -178,17 +184,27 @@ pub struct OidcClient {
 impl OidcClient {
     /// Create a new OIDC client.
     pub fn new(config: OidcConfig) -> Self {
+        // Default 1 hour. Override via `with_discovery_ttl` or via the
+        // `ORP_OIDC_DISCOVERY_TTL_SECS` env var (read in `new`).
+        let discovery_ttl = std::env::var("ORP_OIDC_DISCOVERY_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|| std::time::Duration::from_secs(3600));
+        // Default `discovery_ttl * 24`. Override via
+        // `with_discovery_max_staleness` or via
+        // `ORP_OIDC_DISCOVERY_MAX_STALENESS_SECS`.
+        let discovery_max_staleness = std::env::var("ORP_OIDC_DISCOVERY_MAX_STALENESS_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(discovery_ttl * 24);
         Self {
             config,
             http: Client::new(),
             discovery: None,
-            // Default 1 hour. Override via `with_discovery_ttl` or via the
-            // `ORP_OIDC_DISCOVERY_TTL_SECS` env var (read in `new`).
-            discovery_ttl: std::env::var("ORP_OIDC_DISCOVERY_TTL_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .map(std::time::Duration::from_secs)
-                .unwrap_or_else(|| std::time::Duration::from_secs(3600)),
+            discovery_ttl,
+            discovery_max_staleness,
             jwt_service: None,
         }
     }
@@ -196,6 +212,15 @@ impl OidcClient {
     /// Override the discovery cache TTL (mostly for tests).
     pub fn with_discovery_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.discovery_ttl = ttl;
+        self
+    }
+
+    /// Override the discovery staleness cap (mostly for tests).
+    ///
+    /// Cached discovery is served up to this duration after the last
+    /// successful fetch when refresh is failing; beyond it we fail closed.
+    pub fn with_discovery_max_staleness(mut self, max: std::time::Duration) -> Self {
+        self.discovery_max_staleness = max;
         self
     }
 
@@ -246,12 +271,30 @@ impl OidcClient {
     }
 
     /// On refresh failure, return the still-cached discovery doc (with a
-    /// warning) rather than failing closed. If nothing is cached, surface
-    /// the original error.
+    /// warning) rather than failing closed — but only while the cache is
+    /// within `discovery_max_staleness`. Beyond that we surface the
+    /// original error: an IdP that's been unreachable for many TTLs may
+    /// have rotated keys, and continuing to trust the cached doc would
+    /// keep accepting tokens signed by retired keys forever.
     fn fall_back_or_fail(&self, err: OidcError) -> Result<OidcDiscovery, OidcError> {
-        if let Some((doc, _)) = &self.discovery {
-            tracing::warn!(error = %err, "OIDC discovery refresh failed; using cached document");
-            Ok(doc.clone())
+        if let Some((doc, fetched_at)) = &self.discovery {
+            let age = fetched_at.elapsed();
+            if age < self.discovery_max_staleness {
+                tracing::warn!(
+                    error = %err,
+                    age_secs = age.as_secs(),
+                    "OIDC discovery refresh failed; using cached document"
+                );
+                Ok(doc.clone())
+            } else {
+                tracing::error!(
+                    error = %err,
+                    age_secs = age.as_secs(),
+                    max_staleness_secs = self.discovery_max_staleness.as_secs(),
+                    "OIDC discovery cache exceeded max-staleness cap; failing closed"
+                );
+                Err(err)
+            }
         } else {
             Err(err)
         }
@@ -824,5 +867,156 @@ mod tests {
         let client = OidcClient::new(cfg);
         let result = client.authorization_url("state-123");
         assert!(matches!(result, Err(OidcError::NotConfigured)));
+    }
+
+    // ─── Discovery cache / staleness tests ───────────────────────────────
+    //
+    // These tests stand up a tiny TCP listener that speaks just enough HTTP
+    // to answer `/.well-known/openid-configuration`. We avoid pulling in
+    // wiremock/hyper-server to stay within the LoC budget.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Response policy for the mock server. Each connection consumes one
+    /// entry; we wrap with a counter so tests can assert request counts.
+    #[derive(Clone, Copy)]
+    enum MockResp {
+        OkDoc,
+        Status503,
+    }
+
+    /// Spawn a mock OIDC discovery server on a random port. Returns the
+    /// `http://127.0.0.1:port` base URL plus a counter the caller can read
+    /// to verify request counts. Each entry in `script` is replayed in
+    /// order; once exhausted, the last entry repeats.
+    async fn spawn_mock_idp(script: Vec<MockResp>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_c = counter.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let idx = counter_c.fetch_add(1, Ordering::SeqCst);
+                let resp = script.get(idx).copied().unwrap_or_else(|| {
+                    *script.last().unwrap_or(&MockResp::Status503)
+                });
+                tokio::spawn(async move {
+                    // Drain the request just enough to know the client
+                    // sent something. We don't bother parsing it.
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = match resp {
+                        MockResp::OkDoc => serde_json::json!({
+                            "issuer": "http://idp.test",
+                            "authorization_endpoint": "http://idp.test/authorize",
+                            "token_endpoint": "http://idp.test/token",
+                            "jwks_uri": "http://idp.test/jwks",
+                            "response_types_supported": ["code"],
+                            "scopes_supported": ["openid"],
+                        })
+                        .to_string(),
+                        MockResp::Status503 => String::new(),
+                    };
+                    let (status_line, body_to_send) = match resp {
+                        MockResp::OkDoc => ("HTTP/1.1 200 OK", body.as_str()),
+                        MockResp::Status503 => ("HTTP/1.1 503 Service Unavailable", ""),
+                    };
+                    let response = format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body_to_send.len(),
+                        body_to_send
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), counter)
+    }
+
+    fn enabled_cfg(provider_url: String) -> OidcConfig {
+        OidcConfig {
+            enabled: true,
+            provider_url,
+            client_id: "test-client".into(),
+            client_secret: "test-secret".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_discover_caches_within_ttl() {
+        let (base, counter) = spawn_mock_idp(vec![MockResp::OkDoc, MockResp::OkDoc]).await;
+        let mut client = OidcClient::new(enabled_cfg(base))
+            .with_discovery_ttl(std::time::Duration::from_millis(500));
+        client.discover().await.expect("first fetch ok");
+        client.discover().await.expect("second fetch ok (cached)");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "second call must be served from cache");
+    }
+
+    #[tokio::test]
+    async fn test_discover_refetches_after_ttl() {
+        let (base, counter) =
+            spawn_mock_idp(vec![MockResp::OkDoc, MockResp::OkDoc, MockResp::OkDoc]).await;
+        let mut client = OidcClient::new(enabled_cfg(base))
+            .with_discovery_ttl(std::time::Duration::from_millis(50));
+        client.discover().await.expect("first fetch ok");
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        client.discover().await.expect("refetch ok");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "TTL expiry must trigger a re-fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_falls_back_on_5xx_after_first_success() {
+        let (base, counter) = spawn_mock_idp(vec![MockResp::OkDoc, MockResp::Status503]).await;
+        let mut client = OidcClient::new(enabled_cfg(base))
+            .with_discovery_ttl(std::time::Duration::from_millis(20))
+            // Generous staleness cap so the fallback is allowed.
+            .with_discovery_max_staleness(std::time::Duration::from_secs(60));
+        let first = client.discover().await.expect("first fetch ok");
+        assert_eq!(first.issuer, "http://idp.test");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Second fetch hits the 503; fall_back_or_fail should serve cache.
+        let second = client.discover().await.expect("must fall back to cache");
+        assert_eq!(second.issuer, "http://idp.test");
+        assert!(counter.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_discover_fails_closed_when_no_cache_and_5xx() {
+        let (base, _counter) = spawn_mock_idp(vec![MockResp::Status503]).await;
+        let mut client = OidcClient::new(enabled_cfg(base));
+        let result = client.discover().await;
+        assert!(
+            matches!(result, Err(OidcError::DiscoveryFailed(_))),
+            "must fail closed without a cached doc, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_max_staleness_cap() {
+        let (base, _counter) = spawn_mock_idp(vec![MockResp::OkDoc, MockResp::Status503]).await;
+        // TTL 10ms; staleness cap 30ms. After we sleep 100ms (well past
+        // cap) and the IdP returns 503, `discover` must Err.
+        let mut client = OidcClient::new(enabled_cfg(base))
+            .with_discovery_ttl(std::time::Duration::from_millis(10))
+            .with_discovery_max_staleness(std::time::Duration::from_millis(30));
+        client.discover().await.expect("first fetch primes the cache");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let result = client.discover().await;
+        assert!(
+            matches!(result, Err(OidcError::DiscoveryFailed(_))),
+            "staleness cap must fire and fail closed, got {result:?}"
+        );
     }
 }

@@ -524,7 +524,17 @@ cargo build --release --target aarch64-unknown-linux-gnu
 # 5. Docker
 docker build -t orp .
 docker run -p 9090:9090 orp start --template maritime
+
+# 5a. Distroless image (recommended for production)
+docker build -t orp:distroless --target distroless .
+docker run -p 9090:9090 orp:distroless --template maritime
 ```
+
+The `distroless` target is the **recommended production image**. It is built
+from `gcr.io/distroless/cc-debian12:nonroot`: smaller than the Debian-slim
+runtime, has no shell or package manager (so an attacker who lands a code
+execution can't `sh`, `apt`, `curl`, etc.), and always runs as the pre-baked
+`nonroot` user (uid/gid 65532) — `--user 0:0` is not allowed.
 
 ---
 
