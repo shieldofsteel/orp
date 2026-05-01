@@ -1,61 +1,88 @@
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+//! In-memory audit log backend.
+//!
+//! Used in tests and when the operator launches with `--in-memory`. Identical
+//! semantics to [`crate::PersistentAuditLog`] — same hash function, same
+//! pre-image format, same Ed25519 signature pipeline — so behavioural test
+//! suites written against one apply to the other.
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AuditEntry {
-    pub sequence_number: u64,
-    pub timestamp: DateTime<Utc>,
-    pub operation: String,
-    pub entity_type: Option<String>,
-    pub entity_id: Option<String>,
-    pub user_id: Option<String>,
-    pub details: serde_json::Value,
-    pub previous_hash: String,
-    pub content_hash: String,
+use crate::crypto::EventSigner;
+use crate::entry::{canonical_preimage, compute_content_hash, AuditEntry, GENESIS_PREV_HASH};
+use crate::traits::{AuditError, AuditLogger, AuditResult, VerifyKey};
+use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
+
+/// RAM-backed audit log. Vec-based; cheap for small ledgers and tests.
+///
+/// This struct used to be named `AuditLog` (pre-v0.3.0). The rename to
+/// `InMemoryAuditLog` reflects that we now have a peer persistent backend.
+pub struct InMemoryAuditLog {
+    inner: Mutex<Vec<AuditEntry>>,
+    signer: Arc<EventSigner>,
 }
 
-pub struct AuditLog {
-    entries: Vec<AuditEntry>,
-    counter: u64,
-}
-
-impl AuditLog {
+impl InMemoryAuditLog {
+    /// Create a new log with a fresh Ed25519 signer.
     pub fn new() -> Self {
+        Self::with_signer(Arc::new(EventSigner::new()))
+    }
+
+    /// Create a new log using a caller-provided signer (so multiple components
+    /// can share the same key material — e.g. AppState's `audit_signer`).
+    pub fn with_signer(signer: Arc<EventSigner>) -> Self {
         Self {
-            entries: Vec::new(),
-            counter: 0,
+            inner: Mutex::new(Vec::new()),
+            signer,
         }
     }
 
-    pub fn log(
-        &mut self,
+    pub fn signer(&self) -> &Arc<EventSigner> {
+        &self.signer
+    }
+}
+
+impl Default for InMemoryAuditLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl AuditLogger for InMemoryAuditLog {
+    async fn record(
+        &self,
         operation: &str,
         entity_type: Option<&str>,
         entity_id: Option<&str>,
         user_id: Option<&str>,
         details: serde_json::Value,
-    ) -> &AuditEntry {
-        self.counter += 1;
-        let timestamp = Utc::now();
+    ) -> AuditResult<AuditEntry> {
+        let mut entries = self
+            .inner
+            .lock()
+            .map_err(|e| AuditError::Database(format!("mutex poisoned: {}", e)))?;
 
-        let previous_hash = self
-            .entries
+        let seq = entries.len() as u64 + 1;
+        let timestamp = chrono::Utc::now();
+        let previous_hash = entries
             .last()
             .map(|e| e.content_hash.clone())
-            .unwrap_or_else(|| "genesis".to_string());
+            .unwrap_or_else(|| GENESIS_PREV_HASH.to_string());
 
-        let hash_input = format!(
-            "{}||{}||{}||{}",
-            self.counter,
+        let preimage = canonical_preimage(
+            seq,
+            &timestamp,
             operation,
-            timestamp.to_rfc3339(),
-            details
+            entity_type,
+            entity_id,
+            user_id,
+            &details,
         );
-        let content_hash = compute_sha256(&hash_input);
+        let content_hash = compute_content_hash(&previous_hash, &preimage);
+        let signature_bytes = self.signer.sign(content_hash.as_bytes());
+        let signature = hex::encode(signature_bytes);
 
         let entry = AuditEntry {
-            sequence_number: self.counter,
+            sequence_number: seq,
             timestamp,
             operation: operation.to_string(),
             entity_type: entity_type.map(String::from),
@@ -64,120 +91,165 @@ impl AuditLog {
             details,
             previous_hash,
             content_hash,
+            signature,
         };
-
-        self.entries.push(entry);
-        self.entries.last().unwrap()
+        entries.push(entry.clone());
+        Ok(entry)
     }
 
-    /// Verify the integrity of the hash chain
-    pub fn verify(&self) -> bool {
-        for (i, entry) in self.entries.iter().enumerate() {
-            // Check previous hash linkage
-            if i == 0 {
-                if entry.previous_hash != "genesis" {
-                    return false;
-                }
-            } else if entry.previous_hash != self.entries[i - 1].content_hash {
-                return false;
-            }
+    async fn replay(&self, limit: Option<usize>) -> AuditResult<Vec<AuditEntry>> {
+        let entries = self
+            .inner
+            .lock()
+            .map_err(|e| AuditError::Database(format!("mutex poisoned: {}", e)))?;
+        let take = limit.unwrap_or(entries.len());
+        Ok(entries.iter().take(take).cloned().collect())
+    }
 
-            // Verify content hash
-            let hash_input = format!(
-                "{}||{}||{}||{}",
+    async fn verify_chain(&self, verifier: &VerifyKey) -> AuditResult<()> {
+        let entries = self
+            .inner
+            .lock()
+            .map_err(|e| AuditError::Database(format!("mutex poisoned: {}", e)))?;
+
+        let mut prev = GENESIS_PREV_HASH.to_string();
+        for (i, entry) in entries.iter().enumerate() {
+            let expected_seq = (i as u64) + 1;
+            if entry.sequence_number != expected_seq {
+                return Err(AuditError::ChainCorrupt {
+                    seq: entry.sequence_number,
+                    reason: format!(
+                        "out-of-order sequence: expected {}, got {}",
+                        expected_seq, entry.sequence_number
+                    ),
+                });
+            }
+            if entry.previous_hash != prev {
+                return Err(AuditError::ChainCorrupt {
+                    seq: entry.sequence_number,
+                    reason: format!(
+                        "previous_hash mismatch: expected {}, got {}",
+                        prev, entry.previous_hash
+                    ),
+                });
+            }
+            let preimage = canonical_preimage(
                 entry.sequence_number,
-                entry.operation,
-                entry.timestamp.to_rfc3339(),
-                entry.details
+                &entry.timestamp,
+                &entry.operation,
+                entry.entity_type.as_deref(),
+                entry.entity_id.as_deref(),
+                entry.user_id.as_deref(),
+                &entry.details,
             );
-            let expected_hash = compute_sha256(&hash_input);
-            if entry.content_hash != expected_hash {
-                return false;
+            let expected_hash = compute_content_hash(&entry.previous_hash, &preimage);
+            if expected_hash != entry.content_hash {
+                return Err(AuditError::ChainCorrupt {
+                    seq: entry.sequence_number,
+                    reason: format!(
+                        "content_hash mismatch: expected {}, got {}",
+                        expected_hash, entry.content_hash
+                    ),
+                });
             }
+            if !verifier.verify_signature(&entry.content_hash, &entry.signature) {
+                return Err(AuditError::BadSignature {
+                    seq: entry.sequence_number,
+                });
+            }
+            prev = entry.content_hash.clone();
         }
-        true
+        Ok(())
     }
 
-    pub fn entries(&self) -> &[AuditEntry] {
-        &self.entries
+    async fn len(&self) -> AuditResult<u64> {
+        let entries = self
+            .inner
+            .lock()
+            .map_err(|e| AuditError::Database(format!("mutex poisoned: {}", e)))?;
+        Ok(entries.len() as u64)
     }
 
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-impl Default for AuditLog {
-    fn default() -> Self {
-        Self::new()
+    async fn public_key_hex(&self) -> Option<String> {
+        Some(hex::encode(self.signer.public_key_bytes()))
     }
 }
 
-fn compute_sha256(data: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
+// ── Backwards-compatible alias ────────────────────────────────────────────────
+//
+// The pre-v0.3.0 type was `AuditLog`. Some downstream code (and the older
+// `compute_sha256` test harness) still references it under that name. We
+// re-export `InMemoryAuditLog` as `AuditLog` so existing call sites continue
+// to compile without changes.
+pub type AuditLog = InMemoryAuditLog;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_audit_log_chain() {
-        let mut log = AuditLog::new();
-
-        log.log(
-            "entity_created",
-            Some("ship"),
-            Some("mmsi:123456"),
-            Some("system"),
-            serde_json::json!({"name": "Test Ship"}),
-        );
-
-        log.log(
-            "property_updated",
-            Some("ship"),
-            Some("mmsi:123456"),
-            Some("ais-connector"),
-            serde_json::json!({"speed": 12.5}),
-        );
-
-        assert_eq!(log.len(), 2);
-        assert!(log.verify(), "Hash chain should be valid");
+    fn vk_for(log: &InMemoryAuditLog) -> VerifyKey {
+        VerifyKey::from_bytes(&log.signer().public_key_bytes()).unwrap()
     }
 
-    #[test]
-    fn test_audit_log_tamper_detection() {
-        let mut log = AuditLog::new();
-
-        log.log(
+    #[tokio::test]
+    async fn append_and_verify() {
+        let log = InMemoryAuditLog::new();
+        log.record(
             "entity_created",
             Some("ship"),
             Some("mmsi:123"),
-            None,
-            serde_json::json!({}),
-        );
-
-        log.log(
-            "entity_updated",
+            Some("system"),
+            serde_json::json!({"name": "Foo"}),
+        )
+        .await
+        .unwrap();
+        log.record(
+            "property_updated",
             Some("ship"),
             Some("mmsi:123"),
+            Some("ais"),
+            serde_json::json!({"speed": 12.5}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(log.len().await.unwrap(), 2);
+        let vk = vk_for(&log);
+        log.verify_chain(&vk).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn detect_tamper() {
+        let log = InMemoryAuditLog::new();
+        log.record(
+            "entity_created",
+            Some("ship"),
+            Some("mmsi:1"),
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        log.record(
+            "entity_updated",
+            Some("ship"),
+            Some("mmsi:1"),
             None,
             serde_json::json!({"speed": 10}),
-        );
+        )
+        .await
+        .unwrap();
+        let vk = vk_for(&log);
+        log.verify_chain(&vk).await.unwrap();
 
-        assert!(log.verify());
-
-        // Tamper with an entry
-        if let Some(entry) = log.entries.first_mut() {
-            entry.operation = "tampered".to_string();
+        // Tamper with the operation field of the first row, which is part of
+        // the hash pre-image — verify_chain must catch it.
+        {
+            let mut entries = log.inner.lock().unwrap();
+            entries[0].operation = "tampered".to_string();
         }
-
-        assert!(!log.verify(), "Tampered log should fail verification");
+        match log.verify_chain(&vk).await {
+            Err(AuditError::ChainCorrupt { seq, .. }) => assert_eq!(seq, 1),
+            other => panic!("expected ChainCorrupt, got {:?}", other),
+        }
     }
 }

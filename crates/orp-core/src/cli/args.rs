@@ -271,6 +271,20 @@ pub enum Commands {
         https_url: Option<String>,
     },
 
+    /// Inspect, verify, and export the persistent audit log.
+    ///
+    /// Reads directly from the DuckDB audit_log table — does not require a
+    /// running ORP server. Useful for compliance audits where an external
+    /// reviewer needs cryptographic proof the log was not tampered with.
+    ///
+    /// Examples:
+    ///   orp audit verify --db ~/.local/share/orp/orp.duckdb --public-key <hex>
+    ///   orp audit export --db ~/.local/share/orp/orp.duckdb --out audit.jsonl
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
+
     /// Show version and build information
     Version,
 
@@ -418,6 +432,45 @@ pub enum MonitorAction {
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AuditAction {
+    /// Re-derive every audit row's hash, walk the prev-hash chain, and verify
+    /// each Ed25519 signature with the supplied public key. Exits non-zero
+    /// (and prints the offending sequence number) on any mismatch.
+    Verify {
+        /// Path to the DuckDB file containing `audit_log`.
+        #[arg(long, value_name = "PATH")]
+        db: String,
+
+        /// Hex-encoded Ed25519 public key (32 bytes / 64 hex chars). Falls
+        /// back to `ORP_AUDIT_PUBKEY` when omitted.
+        #[arg(long = "public-key", env = "ORP_AUDIT_PUBKEY")]
+        public_key: String,
+    },
+
+    /// Stream every audit row to a JSONL file. Each line carries `prev_hash`,
+    /// `hash`, `signature`, and a per-row `verified` boolean (true iff both
+    /// the chain hash and the signature check pass). External auditors can
+    /// then re-verify lines independently with `--public-key`.
+    Export {
+        /// Path to the DuckDB file containing `audit_log`.
+        #[arg(long, value_name = "PATH")]
+        db: String,
+
+        /// Output JSONL path. Use `-` for stdout. (`--out` rather than
+        /// `--output` to avoid conflicting with the global `-o/--output`
+        /// format flag.)
+        #[arg(long = "out", short = 'O', value_name = "PATH", default_value = "-")]
+        out: String,
+
+        /// Hex-encoded Ed25519 public key. When omitted (and `ORP_AUDIT_PUBKEY`
+        /// is unset), `verified` is reported as `false` for every row — the
+        /// chain hash is still recomputed but signatures cannot be checked.
+        #[arg(long = "public-key", env = "ORP_AUDIT_PUBKEY")]
+        public_key: Option<String>,
     },
 }
 

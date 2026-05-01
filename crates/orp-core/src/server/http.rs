@@ -13,6 +13,7 @@ use axum::{
     Router,
 };
 use orp_audit::crypto::EventSigner;
+use orp_audit::AuditLogger;
 use orp_connector::Connector;
 use orp_query::QueryExecutor;
 use orp_security::{AbacEngine, ApiKeyService, AuthState};
@@ -34,8 +35,18 @@ pub struct AppState {
     pub auth_state: Arc<AuthState>,
     pub abac_engine: Arc<AbacEngine>,
     pub api_key_service: Arc<ApiKeyService>,
-    /// Ed25519 signer for audit log cryptographic integrity.
+    /// Ed25519 signer for audit log cryptographic integrity. Retained on the
+    /// state so out-of-band consumers (notification signing, federation
+    /// outbox proofs) can borrow the same key the audit log signs with.
+    /// Currently no in-tree consumer reads it directly; the field is part of
+    /// the v0.2.0 public surface and removing it would be a breaking change.
+    #[allow(dead_code)]
     pub audit_signer: Arc<EventSigner>,
+    /// Persistent (or in-memory) audit log. Production code uses
+    /// [`PersistentAuditLog`]; tests and `--in-memory` use
+    /// [`InMemoryAuditLog`]. Both implement [`AuditLogger`] so handlers
+    /// only see the trait.
+    pub audit_log: Arc<dyn AuditLogger>,
     pub broadcast_tx: broadcast::Sender<websocket::BroadcastEvent>,
     pub started_at: std::time::Instant,
     /// Layer registry for intelligence overlays (optional — None if DB unavailable).
@@ -216,6 +227,10 @@ pub struct ServerConfig {
     pub api_key_service: Arc<ApiKeyService>,
     /// Optional Ed25519 signer; a fresh one is generated if None.
     pub audit_signer: Option<Arc<EventSigner>>,
+    /// Optional pre-built audit logger. If `None` an [`InMemoryAuditLog`]
+    /// using `audit_signer` is created — that's the path the v0.2.0 test
+    /// harness relies on. `run_start` always passes a `PersistentAuditLog`.
+    pub audit_log: Option<Arc<dyn AuditLogger>>,
     /// Optional layer registry for intelligence overlays.
     pub layer_registry: Option<Arc<layers::LayerRegistry>>,
     /// Optional federation peer registry. Pass `Some(PeerRegistry::new())` to enable federation.
@@ -233,6 +248,15 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
     let audit_signer = config
         .audit_signer
         .unwrap_or_else(|| Arc::new(EventSigner::new()));
+
+    // Default to an in-memory backend when the caller hasn't wired one up —
+    // tests get a working logger without pulling in DuckDB; production code
+    // (`run_start`) always supplies the persistent backend.
+    let audit_log: Arc<dyn AuditLogger> = config.audit_log.unwrap_or_else(|| {
+        Arc::new(orp_audit::InMemoryAuditLog::with_signer(
+            audit_signer.clone(),
+        ))
+    });
 
     // Open the federation outbox if federation is enabled. The path is
     // `ORP_FED_OUTBOX_PATH` or `~/.local/share/orp/federation-outbox` by
@@ -275,6 +299,7 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         abac_engine: config.abac_engine,
         api_key_service: config.api_key_service,
         audit_signer,
+        audit_log,
         broadcast_tx,
         started_at: std::time::Instant::now(),
         layer_registry: config.layer_registry,

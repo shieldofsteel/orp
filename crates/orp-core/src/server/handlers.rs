@@ -5,7 +5,6 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json},
 };
-use orp_audit::crypto::compute_hash;
 use orp_proto::{Entity, GeoPoint, Relationship};
 use orp_security::middleware::AuthContext;
 use orp_security::{AbacEngine, EvaluationContext, EvaluationResult, Resource, Subject};
@@ -92,11 +91,13 @@ fn check_abac(
 
 // ---- Audit helper ----
 
-/// Write an audit entry and sign the content hash with the server's Ed25519 key.
+/// Append an entry to the immutable, hash-chained audit log.
 ///
-/// The `signature` column in `audit_log` receives the hex-encoded Ed25519
-/// signature over the `content_hash`, giving cryptographic integrity to the
-/// append-only audit trail.
+/// Routes through `state.audit_log` (a [`PersistentAuditLog`] in production,
+/// [`InMemoryAuditLog`] in tests / `--in-memory`). The trait object computes
+/// the content hash and Ed25519 signature over the exact persisted bytes,
+/// replacing the v0.2.0 path that signed a pre-image with a `?` placeholder
+/// for the sequence number — that signature was never verifiable.
 async fn audit_log(
     state: &AppState,
     operation: &str,
@@ -105,49 +106,9 @@ async fn audit_log(
     user_id: &str,
     details: serde_json::Value,
 ) {
-    // Compute the content hash the same way DuckDbStorage does, so we can
-    // sign the exact value that will be stored.
-    let now = chrono::Utc::now().to_rfc3339();
-    let hash_input = format!(
-        "{}{}{}{}{}{}",
-        "?", // sequence number is assigned by the DB; we sign a pre-image here
-        operation,
-        entity_type.unwrap_or(""),
-        entity_id.unwrap_or(""),
-        now,
-        details,
-    );
-    let content_hash = compute_hash(&hash_input);
-    let signature_bytes = state.audit_signer.sign(content_hash.as_bytes());
-    let signature_hex: String = signature_bytes
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
-
-    // Inject the signature into the details so it is persisted alongside the entry.
-    let enriched_details = match details {
-        serde_json::Value::Object(mut m) => {
-            m.insert(
-                "_audit_signature".to_string(),
-                serde_json::Value::String(signature_hex),
-            );
-            serde_json::Value::Object(m)
-        }
-        other => serde_json::json!({
-            "data": other,
-            "_audit_signature": signature_hex,
-        }),
-    };
-
     if let Err(e) = state
-        .storage
-        .log_audit(
-            operation,
-            entity_type,
-            entity_id,
-            Some(user_id),
-            enriched_details,
-        )
+        .audit_log
+        .record(operation, entity_type, entity_id, Some(user_id), details)
         .await
     {
         tracing::warn!("Audit log write failed: {}", e);
@@ -1973,6 +1934,9 @@ mod tests {
         let abac_engine = Arc::new(AbacEngine::default_permissive());
         let api_key_service = Arc::new(ApiKeyService::new());
         let audit_signer = Arc::new(EventSigner::new());
+        let audit_log: Arc<dyn orp_audit::AuditLogger> = Arc::new(
+            orp_audit::InMemoryAuditLog::with_signer(audit_signer.clone()),
+        );
         let (broadcast_tx, _) = broadcast::channel::<BroadcastEvent>(256);
 
         Arc::new(AppState {
@@ -1984,6 +1948,7 @@ mod tests {
             abac_engine,
             api_key_service,
             audit_signer,
+            audit_log,
             broadcast_tx,
             started_at: std::time::Instant::now(),
             layer_registry: None,
