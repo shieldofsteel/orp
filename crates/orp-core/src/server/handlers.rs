@@ -1258,6 +1258,12 @@ pub async fn graph_query(
             }))
             .into_response()
         }
+        // QueryError = unsupported / malformed cypher (caller's fault, 400).
+        // Anything else is a backend failure (500).
+        Err(e @ orp_storage::StorageError::QueryError(_)) => {
+            error_response("INVALID_QUERY", StatusCode::BAD_REQUEST, &e.to_string())
+                .into_response()
+        }
         Err(e) => error_response(
             "INTERNAL_ERROR",
             StatusCode::INTERNAL_SERVER_ERROR,
