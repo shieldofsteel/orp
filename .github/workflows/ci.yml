@@ -41,11 +41,15 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       # Install protoc so prost-build can compile .proto files
-      - name: Install protoc (Ubuntu)
+      # libcurl4-openssl-dev is required because clippy --all-features pulls
+      # the optional `kafka` adapter, which compiles rdkafka-sys → librdkafka
+      # 2.12.1, whose rdkafka_conf.c always #includes <curl/curl.h> even when
+      # configured with WITH_CURL=0.
+      - name: Install protoc + libcurl-dev (Ubuntu)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'

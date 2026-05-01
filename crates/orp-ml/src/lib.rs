@@ -538,7 +538,7 @@ fn avg_path_length(n: f32) -> f32 {
     if n <= 1.0 {
         return 0.0;
     }
-    let h = (n - 1.0).ln() + 0.5772156649; // Euler–Mascheroni constant
+    let h = (n - 1.0).ln() + 0.577_215_7; // Euler–Mascheroni constant (f32 precision)
     2.0 * h - 2.0 * (n - 1.0) / n
 }
 
