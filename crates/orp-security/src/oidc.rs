@@ -16,10 +16,17 @@ use axum::{
     Json, Router,
 };
 use chrono::{Duration, Utc};
+use jsonwebtoken::{
+    decode, decode_header,
+    jwk::{AlgorithmParameters, Jwk, JwkSet},
+    Algorithm, DecodingKey, Validation,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 use crate::jwt::{Claims, JwtService};
 
@@ -29,6 +36,10 @@ use crate::jwt::{Claims, JwtService};
 pub enum OidcError {
     #[error("OIDC discovery failed: {0}")]
     DiscoveryFailed(String),
+    #[error("JWKS fetch failed: {0}")]
+    JwksFetchFailed(String),
+    #[error("JWKS missing kid={0}")]
+    JwksMissingKid(String),
     #[error("Token exchange failed: {0}")]
     TokenExchangeFailed(String),
     #[error("Token refresh failed: {0}")]
@@ -41,6 +52,8 @@ pub enum OidcError {
     Http(#[from] reqwest::Error),
     #[error("JWT error: {0}")]
     Jwt(#[from] crate::jwt::JwtError),
+    #[error("Token validation failed: {0}")]
+    TokenValidationFailed(String),
     #[error("State mismatch — possible CSRF attack")]
     StateMismatch,
 }
@@ -120,6 +133,89 @@ pub struct OidcDiscovery {
     pub scopes_supported: Vec<String>,
 }
 
+// ─── External IdP claim shape ─────────────────────────────────────────────────
+
+/// Claims as they may appear in a JWT issued by an external IdP.
+///
+/// Differences from the internal [`Claims`] type:
+/// - `aud` may be a single string or an array (RFC 7519 §4.1.3)
+/// - `iat` is optional (Auth0 / Azure include it; some custom IdPs don't)
+/// - `nbf` is optional (most external IdPs omit it)
+/// - `permissions` may live under different keys (`permissions`,
+///   `roles`, `scope`) depending on the provider
+///
+/// We accept this loose shape and project into a strict [`Claims`] for
+/// downstream code via [`Self::into_internal_claims`].
+#[derive(Clone, Debug, Deserialize)]
+struct IdpClaims {
+    sub: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    iat: Option<i64>,
+    exp: i64,
+    #[serde(default)]
+    nbf: Option<i64>,
+    iss: String,
+    aud: AudClaim,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    org_id: Option<String>,
+    /// Provider-specific permissions claim. Auth0 emits `permissions: []`
+    /// when RBAC is on; Keycloak puts roles under `realm_access.roles`
+    /// (out of scope here — operators wanting Keycloak roles should map
+    /// them via a custom token mapper into a top-level `permissions`).
+    #[serde(default)]
+    permissions: Vec<String>,
+}
+
+/// Either a single audience string or an array — RFC 7519 §4.1.3.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum AudClaim {
+    Single(String),
+    Multi(Vec<String>),
+}
+
+impl IdpClaims {
+    fn into_internal_claims(self) -> Claims {
+        let aud = match self.aud {
+            AudClaim::Single(s) => s,
+            // Pick the first audience entry — `Validation::set_audience`
+            // already verified our configured `client_id` is among them.
+            AudClaim::Multi(v) => v.into_iter().next().unwrap_or_default(),
+        };
+        let iat = self.iat.unwrap_or(self.exp);
+        let scope_str = self.scope.unwrap_or_default();
+
+        // If the IdP didn't emit a top-level `permissions` claim, fall
+        // back to splitting `scope` into permission strings. This keeps
+        // RBAC working for IdPs (Okta, Azure AD) that only emit `scope`.
+        let permissions = if self.permissions.is_empty() && !scope_str.is_empty() {
+            scope_str.split_whitespace().map(String::from).collect()
+        } else {
+            self.permissions
+        };
+
+        Claims {
+            sub: self.sub,
+            email: self.email,
+            name: self.name,
+            iat,
+            nbf: self.nbf,
+            exp: self.exp,
+            iss: self.iss,
+            aud,
+            scope: scope_str,
+            org_id: self.org_id,
+            permissions,
+        }
+    }
+}
+
 // ─── Token Response ──────────────────────────────────────────────────────────
 
 /// Token endpoint response from the OIDC provider.
@@ -160,6 +256,17 @@ pub struct RefreshRequest {
 
 // ─── OIDC Client ─────────────────────────────────────────────────────────────
 
+/// JWKS cache — keyed by `kid`, with a single `last_refresh` timestamp.
+///
+/// Stored behind an `Arc<RwLock<_>>` on `OidcClient` so the validation
+/// fast-path (a sync `read()` of the kid→Jwk map) can be lock-light while
+/// refreshes (rare, async, fetch JWKS over HTTP) take a brief write lock.
+#[derive(Clone, Debug, Default)]
+struct JwksCache {
+    keys: HashMap<String, Jwk>,
+    last_refresh: Option<std::time::Instant>,
+}
+
 /// Real OIDC client with discovery, authorization code flow, and token exchange.
 #[derive(Clone, Debug)]
 pub struct OidcClient {
@@ -177,6 +284,10 @@ pub struct OidcClient {
     /// `discovery_ttl * 24`; configurable via
     /// `ORP_OIDC_DISCOVERY_MAX_STALENESS_SECS`.
     discovery_max_staleness: std::time::Duration,
+    /// Cached JWKS keys by `kid`. Populated lazily after the first
+    /// `validate_external_token` call (or eagerly via `refresh_jwks`).
+    /// Refreshed on `kid`-not-found or every `discovery_ttl`.
+    jwks: Arc<RwLock<JwksCache>>,
     /// Optional local JWT service — if set, we issue our own JWTs wrapping provider claims
     jwt_service: Option<Arc<JwtService>>,
 }
@@ -205,6 +316,7 @@ impl OidcClient {
             discovery: None,
             discovery_ttl,
             discovery_max_staleness,
+            jwks: Arc::new(RwLock::new(JwksCache::default())),
             jwt_service: None,
         }
     }
@@ -298,6 +410,176 @@ impl OidcClient {
         } else {
             Err(err)
         }
+    }
+
+    /// Fetch the JWKS document from the discovered `jwks_uri` and replace
+    /// the in-memory key cache. Refresh is gated so two concurrent refreshes
+    /// can't both hammer the IdP — the second waits on the write-lock and
+    /// then sees a fresh cache.
+    pub async fn refresh_jwks(&self) -> Result<(), OidcError> {
+        let jwks_uri = self
+            .discovery
+            .as_ref()
+            .map(|(d, _)| d.jwks_uri.clone())
+            .ok_or_else(|| OidcError::JwksFetchFailed("Discovery not loaded".into()))?;
+
+        let resp = self
+            .http
+            .get(&jwks_uri)
+            .send()
+            .await
+            .map_err(|e| OidcError::JwksFetchFailed(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(OidcError::JwksFetchFailed(format!(
+                "JWKS endpoint returned status {}",
+                resp.status()
+            )));
+        }
+        let set: JwkSet = resp
+            .json()
+            .await
+            .map_err(|e| OidcError::JwksFetchFailed(e.to_string()))?;
+
+        let mut keys = HashMap::with_capacity(set.keys.len());
+        for jwk in set.keys {
+            // Skip JWKs without a `kid` — we can't route to them in
+            // multi-key environments. Most well-behaved IdPs include `kid`.
+            let kid = match jwk.common.key_id.clone() {
+                Some(k) => k,
+                None => {
+                    tracing::warn!("JWKS entry skipped: no `kid` field");
+                    continue;
+                }
+            };
+            keys.insert(kid, jwk);
+        }
+
+        let mut guard = self.jwks.write().await;
+        guard.keys = keys;
+        guard.last_refresh = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    /// Look up a JWK by `kid` from the cache (read-only). Returns `None`
+    /// if the cache is empty or the kid isn't present.
+    async fn jwks_get(&self, kid: &str) -> Option<Jwk> {
+        let guard = self.jwks.read().await;
+        guard.keys.get(kid).cloned()
+    }
+
+    /// True if the JWKS cache has been refreshed within `discovery_ttl`.
+    /// Used by callers (and tests) that need to gate work on whether the
+    /// in-memory key set is still considered authoritative.
+    pub async fn jwks_is_fresh(&self) -> bool {
+        let guard = self.jwks.read().await;
+        guard
+            .last_refresh
+            .map(|t| t.elapsed() < self.discovery_ttl)
+            .unwrap_or(false)
+    }
+
+    /// Validate an external IdP-issued JWT against the cached JWKS.
+    ///
+    /// Steps:
+    /// 1. Decode the JWT header to extract `alg` + `kid`.
+    /// 2. Reject `alg = none` (also impossible because jsonwebtoken would
+    ///    parse it as `Algorithm` and we never include `none` in the pin
+    ///    set — but we make the rejection explicit via header check).
+    /// 3. Look up the `kid` in the JWKS cache. On miss, refresh JWKS once
+    ///    and retry; still missing → `JwksMissingKid`.
+    /// 4. Verify alg in the header matches the alg associated with the
+    ///    JWK's parameters (RSA → RS256, EC → ES256). This blocks
+    ///    alg-confusion (signing an RSA key with HMAC).
+    /// 5. `jsonwebtoken::decode` with the right `Validation` profile,
+    ///    enforcing `iss` (= discovery `issuer`), `aud` (= configured
+    ///    `client_id`), `exp`, `nbf`, and `sub`.
+    pub async fn validate_external_token(&self, token: &str) -> Result<Claims, OidcError> {
+        if !self.config.enabled {
+            return Err(OidcError::NotConfigured);
+        }
+
+        // Discovery must be primed so we know the issuer + jwks_uri.
+        let discovery = self
+            .discovery
+            .as_ref()
+            .map(|(d, _)| d.clone())
+            .ok_or_else(|| OidcError::DiscoveryFailed("Discovery not loaded".into()))?;
+
+        // 1. Header.
+        let header = decode_header(token)
+            .map_err(|e| OidcError::TokenValidationFailed(format!("header decode: {e}")))?;
+
+        // 2. Pin algorithm. Only RS256 / ES256 / EdDSA accepted from
+        // external IdPs. Explicitly reject HS256 from this path — HS256
+        // belongs to the local-JWT path; accepting it here would let an
+        // attacker swap a real RSA-signed token for an HMAC one keyed by
+        // the public RSA modulus.
+        let algo_ok = matches!(
+            header.alg,
+            Algorithm::RS256 | Algorithm::ES256 | Algorithm::EdDSA
+        );
+        if !algo_ok {
+            return Err(OidcError::TokenValidationFailed(format!(
+                "alg {:?} not permitted on the OIDC validation path",
+                header.alg
+            )));
+        }
+
+        let kid = header
+            .kid
+            .clone()
+            .ok_or_else(|| OidcError::TokenValidationFailed("missing kid in header".into()))?;
+
+        // 3. Cache lookup with single-shot refresh on miss.
+        let jwk = match self.jwks_get(&kid).await {
+            Some(j) => j,
+            None => {
+                self.refresh_jwks().await?;
+                self.jwks_get(&kid)
+                    .await
+                    .ok_or_else(|| OidcError::JwksMissingKid(kid.clone()))?
+            }
+        };
+
+        // 4. Cross-check the JWK's algorithm family against the header alg.
+        let jwk_alg_ok = matches!(
+            (&jwk.algorithm, header.alg),
+            (AlgorithmParameters::RSA(_), Algorithm::RS256)
+                | (AlgorithmParameters::EllipticCurve(_), Algorithm::ES256)
+                | (AlgorithmParameters::OctetKeyPair(_), Algorithm::EdDSA)
+        );
+        if !jwk_alg_ok {
+            return Err(OidcError::TokenValidationFailed(format!(
+                "JWK alg family does not match header alg {:?}",
+                header.alg
+            )));
+        }
+
+        let key = DecodingKey::from_jwk(&jwk).map_err(|e| {
+            OidcError::TokenValidationFailed(format!("could not build DecodingKey: {e}"))
+        })?;
+
+        // 5. Decode + validate. Pin alg from the header (now known to be
+        // RS256/ES256/EdDSA and matched to the JWK), enforce iss=
+        // discovery.issuer, aud=client_id, require exp/nbf/sub.
+        let mut validation = Validation::new(header.alg);
+        validation.set_issuer(&[&discovery.issuer]);
+        validation.set_audience(&[&self.config.client_id]);
+        validation.validate_exp = true;
+        validation.validate_nbf = true;
+        // Most external IdPs DON'T issue `nbf` — Auth0 in particular
+        // never sets it. We require `exp`, `iss`, `aud`, `sub` and let
+        // `nbf` be optional. (The local JWT path is stricter.)
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        validation.leeway = 60;
+
+        // External IdPs often emit `aud` as an array, omit `iat`, and put
+        // permissions/roles under provider-specific names. Decode against
+        // a tolerant intermediate struct, then project into our internal
+        // `Claims` shape.
+        let data = decode::<IdpClaims>(token, &key, &validation)
+            .map_err(|e| OidcError::TokenValidationFailed(e.to_string()))?;
+        Ok(data.claims.into_internal_claims())
     }
 
     /// Get the authorization redirect URL to send the browser to.
@@ -461,6 +743,158 @@ impl OidcClient {
             self.config.cookie_name
         )
     }
+}
+
+// ─── Multi-IdP Validator ──────────────────────────────────────────────────────
+
+/// Multi-issuer validator. Routes inbound JWTs to:
+///
+/// 1. The matching `OidcClient` (when `iss` matches a configured provider's
+///    discovered `issuer`) — verified against the IdP's JWKS.
+/// 2. The fallback local [`JwtService`] — for legacy HS256 "API token"
+///    use-cases issued by ORP itself (or for federation peers that share
+///    the local secret).
+///
+/// The router is cheap: each token costs one `decode_header` for `alg` and
+/// one base64-decode of the payload for `iss`, both purely in-process. The
+/// JWKS cache is touched only after that lookup picks a provider.
+#[derive(Clone)]
+pub struct OidcValidator {
+    /// Configured external IdPs. Read-locked on the validation hot-path
+    /// (the cache lookup is read-only); write-locked only during JWKS
+    /// or discovery refresh.
+    providers: Vec<Arc<RwLock<OidcClient>>>,
+    /// Fallback validator for tokens that don't match any external IdP.
+    /// Typically an HS256 [`JwtService`] for API-key-style internal tokens.
+    legacy_jwt: Option<Arc<JwtService>>,
+}
+
+impl std::fmt::Debug for OidcValidator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcValidator")
+            .field("providers", &self.providers.len())
+            .field("legacy_jwt", &self.legacy_jwt.is_some())
+            .finish()
+    }
+}
+
+impl OidcValidator {
+    /// Build a validator with no providers and no legacy fallback. Used as
+    /// a starting point — chain `.with_provider()` / `.with_legacy_jwt()`.
+    pub fn new() -> Self {
+        Self {
+            providers: Vec::new(),
+            legacy_jwt: None,
+        }
+    }
+
+    /// Attach an OIDC provider. The client should already have had
+    /// `discover()` called once so `validate_external_token` can look up
+    /// the JWKS by issuer.
+    pub fn with_provider(mut self, client: Arc<RwLock<OidcClient>>) -> Self {
+        self.providers.push(client);
+        self
+    }
+
+    /// Attach a fallback HS256 [`JwtService`]. Tokens that don't match any
+    /// configured IdP issuer (or that are HS256-signed) fall through here.
+    pub fn with_legacy_jwt(mut self, jwt: Arc<JwtService>) -> Self {
+        self.legacy_jwt = Some(jwt);
+        self
+    }
+
+    /// Number of attached external IdPs.
+    pub fn provider_count(&self) -> usize {
+        self.providers.len()
+    }
+
+    /// True if a legacy HS256 fallback is attached.
+    pub fn has_legacy_jwt(&self) -> bool {
+        self.legacy_jwt.is_some()
+    }
+
+    /// Validate `token` against the configured providers, falling back to
+    /// the legacy HS256 service if no IdP matches.
+    pub async fn validate(&self, token: &str) -> Result<Claims, OidcError> {
+        // Fast bail-out for the obviously-broken case: no providers, no
+        // legacy. We surface a `NotConfigured` so callers can map to 500.
+        if self.providers.is_empty() && self.legacy_jwt.is_none() {
+            return Err(OidcError::NotConfigured);
+        }
+
+        // Step 1: peek at the algorithm — HS256 always routes to the
+        // legacy fallback (provider keys are RSA/EC). This also blocks
+        // alg-confusion: a malicious caller can't smuggle an HS256 token
+        // through the OIDC path.
+        let header = decode_header(token)
+            .map_err(|e| OidcError::TokenValidationFailed(format!("header decode: {e}")))?;
+
+        if matches!(header.alg, Algorithm::HS256) {
+            return self.validate_legacy(token);
+        }
+
+        // Step 2: peek at `iss` (without signature verification — purely
+        // for routing). Then dispatch to the matching provider.
+        let unverified_iss = peek_issuer(token).ok_or_else(|| {
+            OidcError::TokenValidationFailed("could not read iss claim from token".into())
+        })?;
+
+        for client_lock in &self.providers {
+            // Acquire read lock first to check if this provider matches.
+            let client = client_lock.read().await;
+            let provider_iss = client.discovery.as_ref().map(|(d, _)| d.issuer.clone());
+            drop(client);
+
+            if let Some(iss) = provider_iss {
+                if iss == unverified_iss {
+                    let client = client_lock.read().await;
+                    return client.validate_external_token(token).await;
+                }
+            }
+        }
+
+        // Step 3: no provider matched. We do NOT silently fall back to
+        // legacy here — a token claiming `iss = https://attacker.example`
+        // must not be accepted just because `legacy_jwt` exists. Legacy
+        // tokens are HS256-only and were filtered in step 1.
+        Err(OidcError::TokenValidationFailed(format!(
+            "no configured OIDC provider matches iss={unverified_iss}"
+        )))
+    }
+
+    fn validate_legacy(&self, token: &str) -> Result<Claims, OidcError> {
+        let jwt = self
+            .legacy_jwt
+            .as_ref()
+            .ok_or_else(|| OidcError::NotConfigured)?;
+        jwt.validate_token(token).map_err(OidcError::Jwt)
+    }
+}
+
+impl Default for OidcValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Read the `iss` claim from a JWT WITHOUT signature verification.
+///
+/// This is solely a routing hint — we use it to pick which provider's
+/// JWKS to validate against. The signature is then verified in
+/// `validate_external_token`. NEVER trust the value beyond routing.
+fn peek_issuer(token: &str) -> Option<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    #[derive(Deserialize)]
+    struct OnlyIss {
+        iss: Option<String>,
+    }
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let payload = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let claims: OnlyIss = serde_json::from_slice(&payload).ok()?;
+    claims.iss
 }
 
 // ─── Axum Route Handlers ──────────────────────────────────────────────────────
@@ -1024,6 +1458,480 @@ mod tests {
         assert!(
             matches!(result, Err(OidcError::DiscoveryFailed(_))),
             "staleness cap must fire and fail closed, got {result:?}"
+        );
+    }
+
+    // ─── JWKS verification tests ─────────────────────────────────────────
+    //
+    // These tests stand up a single mock IdP that serves both
+    // `/.well-known/openid-configuration` and `/jwks`. Tokens are signed
+    // with a fixed RSA keypair (PKCS8 PEM + matching JWK n/e — copied
+    // from the jsonwebtoken 9.3.1 test fixtures, public values only).
+
+    use jsonwebtoken::{encode as jwt_encode, EncodingKey, Header as JwtHeader};
+
+    /// Fixed RSA private key used to sign every test token. Public values
+    /// are reproducible from the modulus below.
+    const TEST_RSA_PRIV_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDJETqse41HRBsc
+7cfcq3ak4oZWFCoZlcic525A3FfO4qW9BMtRO/iXiyCCHn8JhiL9y8j5JdVP2Q9Z
+IpfElcFd3/guS9w+5RqQGgCR+H56IVUyHZWtTJbKPcwWXQdNUX0rBFcsBzCRESJL
+eelOEdHIjG7LRkx5l/FUvlqsyHDVJEQsHwegZ8b8C0fz0EgT2MMEdn10t6Ur1rXz
+jMB/wvCg8vG8lvciXmedyo9xJ8oMOh0wUEgxziVDMMovmC+aJctcHUAYubwoGN8T
+yzcvnGqL7JSh36Pwy28iPzXZ2RLhAyJFU39vLaHdljwthUaupldlNyCfa6Ofy4qN
+ctlUPlN1AgMBAAECggEAdESTQjQ70O8QIp1ZSkCYXeZjuhj081CK7jhhp/4ChK7J
+GlFQZMwiBze7d6K84TwAtfQGZhQ7km25E1kOm+3hIDCoKdVSKch/oL54f/BK6sKl
+qlIzQEAenho4DuKCm3I4yAw9gEc0DV70DuMTR0LEpYyXcNJY3KNBOTjN5EYQAR9s
+2MeurpgK2MdJlIuZaIbzSGd+diiz2E6vkmcufJLtmYUT/k/ddWvEtz+1DnO6bRHh
+xuuDMeJA/lGB/EYloSLtdyCF6sII6C6slJJtgfb0bPy7l8VtL5iDyz46IKyzdyzW
+tKAn394dm7MYR1RlUBEfqFUyNK7C+pVMVoTwCC2V4QKBgQD64syfiQ2oeUlLYDm4
+CcKSP3RnES02bcTyEDFSuGyyS1jldI4A8GXHJ/lG5EYgiYa1RUivge4lJrlNfjyf
+dV230xgKms7+JiXqag1FI+3mqjAgg4mYiNjaao8N8O3/PD59wMPeWYImsWXNyeHS
+55rUKiHERtCcvdzKl4u35ZtTqQKBgQDNKnX2bVqOJ4WSqCgHRhOm386ugPHfy+8j
+m6cicmUR46ND6ggBB03bCnEG9OtGisxTo/TuYVRu3WP4KjoJs2LD5fwdwJqpgtHl
+yVsk45Y1Hfo+7M6lAuR8rzCi6kHHNb0HyBmZjysHWZsn79ZM+sQnLpgaYgQGRbKV
+DZWlbw7g7QKBgQCl1u+98UGXAP1jFutwbPsx40IVszP4y5ypCe0gqgon3UiY/G+1
+zTLp79GGe/SjI2VpQ7AlW7TI2A0bXXvDSDi3/5Dfya9ULnFXv9yfvH1QwWToySpW
+Kvd1gYSoiX84/WCtjZOr0e0HmLIb0vw0hqZA4szJSqoxQgvF22EfIWaIaQKBgQCf
+34+OmMYw8fEvSCPxDxVvOwW2i7pvV14hFEDYIeZKW2W1HWBhVMzBfFB5SE8yaCQy
+pRfOzj9aKOCm2FjjiErVNpkQoi6jGtLvScnhZAt/lr2TXTrl8OwVkPrIaN0bG/AS
+aUYxmBPCpXu3UjhfQiWqFq/mFyzlqlgvuCc9g95HPQKBgAscKP8mLxdKwOgX8yFW
+GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
+2pOhmquJQVDPDLuZHdrIiKiDM20dy9sMfHygWcZjQ4WSxf/J7T9canLZIXFhHAZT
+3wc9h4G8BBCtWN2TN/LsGZdB
+-----END PRIVATE KEY-----"#;
+
+    /// Modulus (`n`) and exponent (`e`) matching `TEST_RSA_PRIV_PEM`.
+    /// Base64-url-encoded per RFC 7518.
+    const TEST_RSA_N: &str = "yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5_CYYi_cvI-SXVT9kPWSKXxJXBXd_4LkvcPuUakBoAkfh-eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG_AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi-yUod-j8MtvIj812dkS4QMiRVN_by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQ";
+    const TEST_RSA_E: &str = "AQAB";
+
+    /// Build a JWKS document containing one entry under `kid`. Optionally
+    /// pin a specific `n` so we can serve a JWKS that does NOT match the
+    /// signing key (used to test signature failure).
+    fn build_jwks_json(kid: &str, n: &str) -> serde_json::Value {
+        serde_json::json!({
+            "keys": [
+                {
+                    "kty": "RSA",
+                    "use": "sig",
+                    "alg": "RS256",
+                    "kid": kid,
+                    "n": n,
+                    "e": TEST_RSA_E,
+                }
+            ]
+        })
+    }
+
+    /// Sign a JWT with `TEST_RSA_PRIV_PEM` for the given `kid`, `iss`,
+    /// `aud`, and `exp`-offset. `extra` lets a test override fields like
+    /// `nbf` or omit `sub`.
+    fn sign_test_jwt(kid: Option<&str>, alg: Algorithm, claims: serde_json::Value) -> String {
+        let mut header = JwtHeader::new(alg);
+        header.kid = kid.map(String::from);
+        let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIV_PEM.as_bytes()).unwrap();
+        jwt_encode(&header, &claims, &key).unwrap()
+    }
+
+    /// Standard claims with given iss/aud and a 1-hour expiry.
+    fn standard_claims(iss: &str, aud: &str, sub: &str) -> serde_json::Value {
+        let now = Utc::now().timestamp();
+        serde_json::json!({
+            "sub": sub,
+            "iss": iss,
+            "aud": aud,
+            "iat": now,
+            "exp": now + 3600,
+        })
+    }
+
+    /// Mock IdP: serves discovery, JWKS, and lets the caller swap the
+    /// JWKS body (to test `kid` rotation) and count requests.
+    #[derive(Clone)]
+    struct MockIdp {
+        base: String,
+        jwks_body: Arc<RwLock<serde_json::Value>>,
+        jwks_hits: Arc<AtomicUsize>,
+    }
+
+    /// Spawn a mock IdP. Initial JWKS contains one key with `kid="key1"`
+    /// matching `TEST_RSA_PRIV_PEM`. Returns the handle for assertions.
+    async fn spawn_mock_idp_full() -> MockIdp {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let jwks_body = Arc::new(RwLock::new(build_jwks_json("key1", TEST_RSA_N)));
+        let jwks_hits = Arc::new(AtomicUsize::new(0));
+
+        let jb = jwks_body.clone();
+        let jh = jwks_hits.clone();
+        let base_for_resp = base.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let jb = jb.clone();
+                let jh = jh.clone();
+                let base = base_for_resp.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+
+                    let body_str = if path.starts_with("/.well-known") {
+                        serde_json::json!({
+                            "issuer": base,
+                            "authorization_endpoint": format!("{base}/authorize"),
+                            "token_endpoint": format!("{base}/token"),
+                            "jwks_uri": format!("{base}/jwks"),
+                            "response_types_supported": ["code"],
+                            "scopes_supported": ["openid"],
+                        })
+                        .to_string()
+                    } else if path.starts_with("/jwks") {
+                        jh.fetch_add(1, Ordering::SeqCst);
+                        jb.read().await.to_string()
+                    } else {
+                        "{}".to_string()
+                    };
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body_str.len(),
+                        body_str
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        MockIdp {
+            base,
+            jwks_body,
+            jwks_hits,
+        }
+    }
+
+    impl MockIdp {
+        async fn rotate_keys(&self, new_kid: &str) {
+            let mut g = self.jwks_body.write().await;
+            *g = build_jwks_json(new_kid, TEST_RSA_N);
+        }
+    }
+
+    /// Build an OidcClient pointed at the mock IdP, primed via discovery.
+    async fn primed_client(idp: &MockIdp, client_id: &str) -> OidcClient {
+        let cfg = OidcConfig {
+            enabled: true,
+            provider_url: idp.base.clone(),
+            client_id: client_id.into(),
+            client_secret: "shh".into(),
+            ..Default::default()
+        };
+        let mut client = OidcClient::new(cfg);
+        client.discover().await.expect("discovery primes ok");
+        client
+    }
+
+    #[tokio::test]
+    async fn test_oidc_validates_real_jwt() {
+        let idp = spawn_mock_idp_full().await;
+        let client = primed_client(&idp, "test-client").await;
+
+        let token = sign_test_jwt(
+            Some("key1"),
+            Algorithm::RS256,
+            standard_claims(&idp.base, "test-client", "user-42"),
+        );
+
+        let claims = client
+            .validate_external_token(&token)
+            .await
+            .expect("valid JWT signed by RSA key in JWKS must be accepted");
+        assert_eq!(claims.sub, "user-42");
+        assert_eq!(claims.iss, idp.base);
+        // First validation should have triggered exactly one JWKS fetch.
+        assert_eq!(idp.jwks_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_oidc_rejects_kid_not_in_jwks() {
+        let idp = spawn_mock_idp_full().await;
+        let client = primed_client(&idp, "test-client").await;
+
+        // Sign with the same RSA key but use an unknown `kid` in the
+        // header — JWKS lookup must miss and refresh once and still miss.
+        let token = sign_test_jwt(
+            Some("nonexistent-kid"),
+            Algorithm::RS256,
+            standard_claims(&idp.base, "test-client", "u"),
+        );
+        let result = client.validate_external_token(&token).await;
+        assert!(
+            matches!(result, Err(OidcError::JwksMissingKid(ref k)) if k == "nonexistent-kid"),
+            "expected JwksMissingKid, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_rejects_alg_mismatch() {
+        // Token says `alg=HS256` in the header — must be rejected on the
+        // OIDC validation path even though the rest of the claim shape
+        // looks valid.
+        let idp = spawn_mock_idp_full().await;
+        let client = primed_client(&idp, "test-client").await;
+
+        // Build an HS256-signed token. Use any HMAC secret — it's
+        // rejected before the signature is checked.
+        let mut header = JwtHeader::new(Algorithm::HS256);
+        header.kid = Some("key1".into());
+        let key = EncodingKey::from_secret(b"any-hmac-secret");
+        let token = jwt_encode(
+            &header,
+            &standard_claims(&idp.base, "test-client", "u"),
+            &key,
+        )
+        .unwrap();
+
+        let result = client.validate_external_token(&token).await;
+        assert!(
+            matches!(result, Err(OidcError::TokenValidationFailed(ref m)) if m.contains("alg")),
+            "expected alg-not-permitted error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_rejects_alg_none() {
+        // jsonwebtoken refuses to encode `alg=none` directly via the
+        // public Header API (it's not in the Algorithm enum), so we
+        // hand-craft the token: header `{"alg":"none","typ":"JWT"}` +
+        // base64(payload) + empty signature.
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let idp = spawn_mock_idp_full().await;
+        let client = primed_client(&idp, "test-client").await;
+
+        let header_json = r#"{"alg":"none","typ":"JWT","kid":"key1"}"#;
+        let payload_json = standard_claims(&idp.base, "test-client", "u").to_string();
+        let token = format!(
+            "{}.{}.",
+            URL_SAFE_NO_PAD.encode(header_json),
+            URL_SAFE_NO_PAD.encode(&payload_json),
+        );
+        let result = client.validate_external_token(&token).await;
+        assert!(
+            matches!(result, Err(OidcError::TokenValidationFailed(_))),
+            "alg=none must be rejected at header decode (jsonwebtoken rejects \
+             unknown alg in decode_header), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_jwks_refresh_on_kid_miss() {
+        let idp = spawn_mock_idp_full().await;
+        let client = primed_client(&idp, "test-client").await;
+
+        // First validation primes the JWKS cache via key1.
+        let t1 = sign_test_jwt(
+            Some("key1"),
+            Algorithm::RS256,
+            standard_claims(&idp.base, "test-client", "u"),
+        );
+        client.validate_external_token(&t1).await.unwrap();
+        assert_eq!(idp.jwks_hits.load(Ordering::SeqCst), 1);
+
+        // Rotate the IdP's keys (same modulus, new `kid="key2"`). Then
+        // present a token signed with the new kid — cache miss must
+        // trigger a refresh.
+        idp.rotate_keys("key2").await;
+        let t2 = sign_test_jwt(
+            Some("key2"),
+            Algorithm::RS256,
+            standard_claims(&idp.base, "test-client", "u"),
+        );
+        let claims = client
+            .validate_external_token(&t2)
+            .await
+            .expect("rotated kid must be honoured after refresh");
+        assert_eq!(claims.sub, "u");
+        assert_eq!(
+            idp.jwks_hits.load(Ordering::SeqCst),
+            2,
+            "kid miss must trigger exactly one extra JWKS fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_jwks_ttl() {
+        // Validate that the cache *is* used (no extra JWKS fetch on
+        // repeated valid tokens with the same kid).
+        let idp = spawn_mock_idp_full().await;
+        let client = primed_client(&idp, "test-client").await;
+
+        for _ in 0..3 {
+            let t = sign_test_jwt(
+                Some("key1"),
+                Algorithm::RS256,
+                standard_claims(&idp.base, "test-client", "u"),
+            );
+            client.validate_external_token(&t).await.unwrap();
+        }
+        assert_eq!(
+            idp.jwks_hits.load(Ordering::SeqCst),
+            1,
+            "subsequent same-kid validations must reuse the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_iss_aud_validation() {
+        let idp = spawn_mock_idp_full().await;
+        let client = primed_client(&idp, "test-client").await;
+
+        // Wrong issuer.
+        let bad_iss = sign_test_jwt(
+            Some("key1"),
+            Algorithm::RS256,
+            standard_claims("https://attacker.example", "test-client", "u"),
+        );
+        let r = client.validate_external_token(&bad_iss).await;
+        assert!(
+            matches!(r, Err(OidcError::TokenValidationFailed(_))),
+            "wrong iss must be rejected, got {r:?}"
+        );
+
+        // Wrong audience.
+        let bad_aud = sign_test_jwt(
+            Some("key1"),
+            Algorithm::RS256,
+            standard_claims(&idp.base, "other-client", "u"),
+        );
+        let r = client.validate_external_token(&bad_aud).await;
+        assert!(
+            matches!(r, Err(OidcError::TokenValidationFailed(_))),
+            "wrong aud must be rejected, got {r:?}"
+        );
+    }
+
+    // ─── OidcValidator multi-IdP / legacy fallback tests ────────────────
+
+    #[tokio::test]
+    async fn test_validator_routes_by_issuer() {
+        // Two IdPs. Each issues a token; the validator must accept both
+        // by routing to the matching provider's JWKS.
+        let idp_a = spawn_mock_idp_full().await;
+        let idp_b = spawn_mock_idp_full().await;
+        let ca = Arc::new(RwLock::new(primed_client(&idp_a, "client-a").await));
+        let cb = Arc::new(RwLock::new(primed_client(&idp_b, "client-b").await));
+        let validator = OidcValidator::new().with_provider(ca).with_provider(cb);
+
+        let tok_a = sign_test_jwt(
+            Some("key1"),
+            Algorithm::RS256,
+            standard_claims(&idp_a.base, "client-a", "alice"),
+        );
+        let tok_b = sign_test_jwt(
+            Some("key1"),
+            Algorithm::RS256,
+            standard_claims(&idp_b.base, "client-b", "bob"),
+        );
+
+        let claims_a = validator.validate(&tok_a).await.expect("idp_a token ok");
+        assert_eq!(claims_a.sub, "alice");
+
+        let claims_b = validator.validate(&tok_b).await.expect("idp_b token ok");
+        assert_eq!(claims_b.sub, "bob");
+    }
+
+    #[tokio::test]
+    async fn test_validator_rejects_unknown_issuer() {
+        let idp = spawn_mock_idp_full().await;
+        let c = Arc::new(RwLock::new(primed_client(&idp, "client-a").await));
+        let validator = OidcValidator::new().with_provider(c);
+
+        let token = sign_test_jwt(
+            Some("key1"),
+            Algorithm::RS256,
+            standard_claims("https://other.example", "client-a", "u"),
+        );
+        let r = validator.validate(&token).await;
+        assert!(
+            matches!(r, Err(OidcError::TokenValidationFailed(ref m)) if m.contains("iss")),
+            "unknown iss must be rejected, got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validator_legacy_hs256_fallback() {
+        use crate::jwt::{JwtConfig, JwtService};
+        let idp = spawn_mock_idp_full().await;
+        let c = Arc::new(RwLock::new(primed_client(&idp, "client-a").await));
+        let jwt_svc = Arc::new(
+            JwtService::new(JwtConfig {
+                hs256_secret: Some(b"a-test-only-shared-hmac-secret-32b!".to_vec()),
+                ..JwtConfig::default()
+            })
+            .unwrap(),
+        );
+        let validator = OidcValidator::new()
+            .with_provider(c)
+            .with_legacy_jwt(jwt_svc.clone());
+
+        // HS256 token from the local service must be accepted via the
+        // legacy fallback.
+        let local_token = jwt_svc
+            .issue_token(
+                "internal-svc",
+                None,
+                None,
+                None,
+                vec!["entities:read".into()],
+            )
+            .unwrap();
+        let claims = validator
+            .validate(&local_token)
+            .await
+            .expect("local HS256 must validate via legacy fallback");
+        assert_eq!(claims.sub, "internal-svc");
+
+        // A foreign-IdP token with unknown iss must still be rejected
+        // (no silent fallback to legacy).
+        let foreign = sign_test_jwt(
+            Some("key1"),
+            Algorithm::RS256,
+            standard_claims("https://attacker.example", "client-a", "u"),
+        );
+        let r = validator.validate(&foreign).await;
+        assert!(
+            r.is_err(),
+            "foreign iss must NOT silently fall back to HS256"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validator_rejects_hs256_when_no_legacy() {
+        let idp = spawn_mock_idp_full().await;
+        let c = Arc::new(RwLock::new(primed_client(&idp, "client-a").await));
+        let validator = OidcValidator::new().with_provider(c);
+
+        // HS256-signed token, no legacy fallback. Must error with
+        // NotConfigured (HS256 routes to legacy and there isn't one).
+        let header = JwtHeader::new(Algorithm::HS256);
+        let key = EncodingKey::from_secret(b"any");
+        let token =
+            jwt_encode(&header, &standard_claims(&idp.base, "client-a", "u"), &key).unwrap();
+        let r = validator.validate(&token).await;
+        assert!(
+            matches!(r, Err(OidcError::NotConfigured)),
+            "HS256 with no legacy must error NotConfigured, got {r:?}"
         );
     }
 }

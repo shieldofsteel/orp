@@ -17,6 +17,7 @@ use std::sync::Arc;
 use crate::{
     api_keys::{ApiKeyService, ApiKeyValidationResult},
     jwt::{Claims, JwtService},
+    oidc::OidcValidator,
 };
 
 /// Authenticated request context injected into Axum extensions and extractors.
@@ -132,6 +133,11 @@ pub struct AuthState {
     pub jwt_service: Option<Arc<JwtService>>,
     /// API key service — `None` means API keys are disabled
     pub api_key_service: Option<Arc<ApiKeyService>>,
+    /// External OIDC validator. If set, Bearer tokens are first routed
+    /// through this validator (which verifies against the IdP's JWKS).
+    /// `None` means OIDC is disabled and only the local `jwt_service`
+    /// (HS256 legacy) is used.
+    pub oidc_validator: Option<Arc<OidcValidator>>,
     /// When true, missing/invalid tokens fall through to anonymous context.
     /// Set to false in production.
     pub permissive_mode: bool,
@@ -143,6 +149,19 @@ impl AuthState {
         Self {
             jwt_service: Some(jwt),
             api_key_service: Some(api_keys),
+            oidc_validator: None,
+            permissive_mode: false,
+        }
+    }
+
+    /// Production configuration with an external OIDC validator. Bearer
+    /// tokens are routed first through `oidc_validator`, then through
+    /// the legacy HS256 [`JwtService`] inside the validator (if any).
+    pub fn production_with_oidc(oidc: Arc<OidcValidator>, api_keys: Arc<ApiKeyService>) -> Self {
+        Self {
+            jwt_service: None,
+            api_key_service: Some(api_keys),
+            oidc_validator: Some(oidc),
             permissive_mode: false,
         }
     }
@@ -192,6 +211,7 @@ impl AuthState {
         Ok(Self {
             jwt_service: None,
             api_key_service: None,
+            oidc_validator: None,
             permissive_mode: permissive,
         })
     }
@@ -205,6 +225,7 @@ impl AuthState {
         Self::dev().unwrap_or(Self {
             jwt_service: None,
             api_key_service: None,
+            oidc_validator: None,
             permissive_mode: false,
         })
     }
@@ -326,6 +347,29 @@ async fn extract_auth(parts: &mut Parts, auth_state: &AuthState) -> Result<AuthC
 }
 
 async fn validate_jwt(token: &str, state: &AuthState) -> Result<AuthContext, AuthError> {
+    // Prefer OIDC validator if configured — it handles both external IdP
+    // tokens (verified against JWKS) and the legacy HS256 fallback when
+    // the validator was built with `with_legacy_jwt`.
+    if let Some(oidc) = &state.oidc_validator {
+        return match oidc.validate(token).await {
+            Ok(claims) => Ok(AuthContext::from_jwt_claims(claims)),
+            Err(crate::oidc::OidcError::Jwt(crate::jwt::JwtError::TokenExpired)) => {
+                Err(AuthError {
+                    status: StatusCode::UNAUTHORIZED,
+                    code: "UNAUTHORIZED",
+                    message: "Token has expired".to_string(),
+                })
+            }
+            Err(e) => Err(AuthError {
+                status: StatusCode::UNAUTHORIZED,
+                code: "UNAUTHORIZED",
+                message: format!("Invalid token: {e}"),
+            }),
+        };
+    }
+
+    // Fall back to the legacy HS256 service when no OIDC validator is
+    // configured. Preserves existing behaviour for older deployments.
     let svc = match &state.jwt_service {
         Some(s) => s.clone(),
         None if state.permissive_mode => return Ok(AuthContext::anonymous_dev()),
