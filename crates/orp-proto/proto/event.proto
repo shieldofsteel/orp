@@ -21,6 +21,30 @@ message OrpEvent {
   bytes signature = 12;
   AuditMetadata audit = 13;
   GeoPoint geo = 14;
+  // Optional classification label. CAPCO banner format on the wire so
+  // every consumer (CLI, UI, federation peer) renders the marking the
+  // same way without parsing extra fields. Empty = unclassified.
+  optional Classification classification = 15;
+}
+
+// Multi-domain classification label. Mirrors
+// `orp_security::classification::Classification`. Designed for IL5/IL6
+// + NATO COSMIC procurement so events carry their own marking and ABAC
+// can dominance-check at the receiver.
+message Classification {
+  // CAPCO short name: "UNCLASSIFIED", "CUI", "SECRET", "TOP SECRET",
+  // "COSMIC TOP SECRET", "NATO RESTRICTED", etc.
+  string level = 1;
+  // Sensitive Compartmented Information compartments: SI, TK, HCS, …
+  repeated string sci = 2;
+  // Dissemination controls: NOFORN, REL TO USA;GBR, ORCON, …
+  repeated string dissem = 3;
+  // NATO ATOMAL qualifier (parallel to SCI).
+  bool atomal = 4;
+  // Pre-rendered CAPCO banner ("TOP SECRET//SI/TK//NOFORN") for
+  // low-overhead UI display. Senders MUST recompute on level/sci/dissem
+  // change; receivers MAY validate by recomputing.
+  string banner = 5;
 }
 
 enum EventSeverity {
@@ -109,4 +133,6 @@ message Entity {
   GeoPoint geometry = 7;
   bool is_active = 8;
   map<string, string> properties = 9;
+  // Optional classification label — see Classification message.
+  optional Classification classification = 10;
 }

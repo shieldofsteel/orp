@@ -2,15 +2,16 @@
 
 # ORP — Open Reality Protocol
 
-### A single Rust binary that fuses 39+ protocols into one cryptographically-signed real-time picture.
+### A single Rust binary that fuses 40+ protocols into one cryptographically-signed real-time picture.
 
-[![Tests](https://img.shields.io/badge/tests-1383%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
+[![Tests](https://img.shields.io/badge/tests-1500%2B%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
 [![Binary Size](https://img.shields.io/badge/binary-45MB-blue?style=flat-square)](https://github.com/shieldofsteel/orp/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square)](https://www.rust-lang.org)
-[![Crates](https://img.shields.io/badge/crates-13%20workspace%20crates-red?style=flat-square)](crates/)
-[![Adapters](https://img.shields.io/badge/adapters-39-purple?style=flat-square)](crates/orp-connector/src/adapters/)
-[![Security](https://img.shields.io/badge/security-mTLS%20%7C%20OIDC%20%7C%20Argon2id-darkgreen?style=flat-square)](docs/SECURITY.md)
+[![Crates](https://img.shields.io/badge/crates-14%20workspace%20crates-red?style=flat-square)](crates/)
+[![Adapters](https://img.shields.io/badge/adapters-40%20%2B%20TAK%20Protocol%20v1-purple?style=flat-square)](crates/orp-connector/src/adapters/)
+[![Security](https://img.shields.io/badge/security-mTLS%20%7C%20OIDC%20%7C%20Argon2id%20%7C%20AES--256--GCM-darkgreen?style=flat-square)](docs/SECURITY.md)
+[![SBOM](https://img.shields.io/badge/release-CycloneDX%201.5%20%2B%20cosign-blue?style=flat-square)](.github/workflows/release.yml)
 
 </div>
 
@@ -120,7 +121,7 @@ For copy-paste recipes (AIS, ADS-B, MAVLink, Modbus, Zeek, audit-log export, fed
 
 ---
 
-## Security Posture (v0.3.0)
+## Security Posture (v0.3.2)
 
 ORP ships with the cryptographic primitives a defense / federal procurement reviewer expects, all in the single binary, all configurable via flags or env vars:
 
@@ -140,7 +141,13 @@ ORP ships with the cryptographic primitives a defense / federal procurement revi
 | **SSRF defence** | Outbound HTTP from notification webhooks (Webhook/Slack/Telegram), HTTP poller, and OIDC discovery is gated by a validate-then-pin client (rejects loopback / RFC1918 / cloud-metadata addresses unless explicitly opted in). | Automatic; `allow_private_targets: true` per channel for legitimate localhost integrations. |
 | **WebSocket identity propagation** | JWT `sub` / `permissions` / `org_id` flow through every broadcast event; ABAC sees the real caller (no hardcoded `"ws-client"+["admin"]`). | Automatic when JWT or API-key auth is configured. |
 | **Notification circuit breaker** | Per-channel breaker after 5 consecutive failures (5 min cooldown) + ±25% retry jitter via `OsRng`. | Automatic; configurable per channel. |
-| **CSRF cookie** | OIDC CSRF state generated via `OsRng::fill_bytes(32)` → URL-safe base64 (~256 bits of entropy). | Active when OIDC is configured. |
+| **CSRF cookie** | OIDC CSRF state generated via `OsRng::fill_bytes(32)` → URL-safe base64 (~256 bits of entropy). State cookie is **HMAC-SHA256** signed (closed length-extension forgery) and verified with **constant-time** `hmac::Mac::verify_slice`. Refuses to issue/verify when `enabled=true` + `client_secret` empty (no silent dev-key fallback in production). | Active when OIDC is configured. |
+| **Persistent audit signing key** | Ed25519 secret + public sidecar at `${XDG_DATA_HOME}/orp/audit-key.{ed25519,pub.ed25519}` (mode 0600 / 0644). Atomic publish; sidecar self-heals if the previous run was killed mid-write. Signatures emitted before a restart are verifiable after one. | Automatic for persistent mode; ephemeral on `--in-memory`. |
+| **At-rest envelope encryption** | AES-256-GCM seal of the audit-log `details` column. Wire format `{"orpaead1": "<base64>"}` — keeps the JSON column type contract, supports mixed-mode (legacy plaintext rows still read). Captured DB file → ciphertext, not PII. | Set `ORP_AT_REST_KEY_PATH` or pre-create `${XDG_DATA_HOME}/orp/at-rest.key` (32 raw bytes, 0600). |
+| **SMTP STARTTLS / TLS-465** | `lettre 0.11` with rustls + ring + webpki-roots. Implicit TLS on 465, STARTTLS upgrade on every other port. AUTH LOGIN now runs over the encrypted channel (no more cleartext credentials). | Automatic per `smtp_port` selection. |
+| **Sanctions list signature verification** | Detached Ed25519 sig (`<path>.sig`, 64 raw bytes) verified before parsing. Pinned pubkey is enforced on **every reload** so a disk-writeable attacker cannot swap the file post-load. | `SanctionsDatabase::load_signed(path, &pubkey)`. |
+| **CycloneDX 1.5 SBOM + cosign** | Release CI emits `bom.cdx.json` and signs every artifact (binaries, SBOM, checksums) with sigstore cosign keyless OIDC (Fulcio + Rekor). Satisfies SLSA-3 provenance for federal RFPs. | Automatic on tag push (`.github/workflows/release.yml`). |
+| **Multi-domain classification labels** | `orp_security::Classification` (`U / CUI / NR / C / NC / S / NS / TS / CTS` + SCI compartments + dissem controls + ATOMAL) with CAPCO `banner()` + `dominates()` ABAC predicate. **Wire-level `OrpEvent.classification` proto field** + optional **`X-Classification` HTTP response header** banner. | `ORP_CLASSIFICATION_BANNER="TOP SECRET//SI//NOFORN"` env var enables the header. |
 
 Closed in v0.3.0 (from the project's own audit reports):
 - ✅ Federation has TLS + payload integrity (was plain HTTP, no peer auth)
@@ -150,7 +157,33 @@ Closed in v0.3.0 (from the project's own audit reports):
 - ✅ WebSocket no longer hands every JWT holder admin events (was discarding claims)
 - ✅ API keys + passwords use Argon2id (was unsalted SHA-256)
 
-Pending v0.4 hardening: at-rest encryption opt-in for DuckDB / RocksDB, persistent Ed25519 audit signing key (currently regenerated per process), CSRF cookie HMAC (currently unbounded length-extension surface), SMTP STARTTLS, sanctions list signature verification, FIPS-mode build, SBOM in CI.
+Closed in v0.3.1 (media relay hardening + Wave 2 P-audit small):
+- ✅ Media relay DELETE cancels in-flight relays (CancellationToken)
+- ✅ Media relay slow-loris closed (process-wide Semaphore, 60s idle timeout, 4 GiB session cap)
+- ✅ Media relay IPv4-mapped IPv6 SSRF (`[::ffff:127.0.0.1]` rejected)
+- ✅ HLS rewriter covers every spec'd attribute-bearing tag (`EXT-X-{KEY,MAP,SESSION-KEY,MEDIA,PRELOAD-HINT,PART,RENDITION-REPORT}`)
+- ✅ HLS userinfo smuggling rejected; playlist body capped at 1 MiB; per-id handler `validate_id()` guards
+- ✅ Persistent audit signing key (F2)
+- ✅ Sanctions list signature verification (F8)
+- ✅ TLS backend unified on rustls (F9 — `orp-connector` flipped reqwest + tokio-tungstenite to rustls-tls)
+- ✅ CycloneDX 1.5 SBOM + cosign keyless signing
+- ✅ Multi-domain classification scaffolding (`U/CUI/NR/C/NC/S/NS/TS/CTS` + SCI + dissem + ATOMAL)
+- ✅ TAK Protocol v1 wire codec — first Rust crate (`orp-tak`)
+- ✅ Persistent audit chain Linux-CI fix (DuckDB ns→µs precision)
+- ✅ Resolver→AuditLogger plumbing (entity-match feedback in the signed chain)
+
+Closed in v0.3.2 (full integration + remaining Wave 2 P-audit + crypto-audit follow-ups):
+- ✅ CSRF HMAC + constant-time verify (F5)
+- ✅ SMTP STARTTLS via lettre — credentials no longer cleartext (F6)
+- ✅ At-rest envelope encryption for audit-log `details` (F7)
+- ✅ Sanctions reload re-verifies pinned pubkey — closes the F8 reload bypass
+- ✅ Audit-key public sidecar self-heals after partial-write crash
+- ✅ CSRF refuses to issue cookie when `enabled=true` + `client_secret` empty (no silent dev-key fallback)
+- ✅ `orp-tak` wired into `orp-connector::adapters::cot` — accepts both UDP mesh (`tak://`) and TCP stream (`tak-tcp://`) framings, falls through to plain `udp://` for legacy ATAK
+- ✅ `OrpEvent.classification` + `Entity.classification` proto fields
+- ✅ `X-Classification` response header middleware (env-driven)
+
+Pending v0.4 hardening: full DuckDB encryption-extension support (whole-file rather than per-column), RocksDB `EncryptedEnv` wrapping, FIPS-mode build, ABAC dominance enforcement on classification (currently advisory).
 
 Full audit history: [docs/SECURITY.md](docs/SECURITY.md) · [docs/TLS.md](docs/TLS.md) · [docs/OIDC.md](docs/OIDC.md) · [docs/FEDERATION_TLS.md](docs/FEDERATION_TLS.md)
 
@@ -164,7 +197,7 @@ ORP speaks the languages your sensors already use. **39 protocol adapters** acro
 - **Aviation** — ADS-B / Mode S, ASTERIX, GRIB (Section 7 unpacking incl. simple/grid/CCSDS), METAR
 - **Drone autonomy** — MAVLink v2 (heartbeat, global_position_int, attitude, status_text, battery, GPS_RAW)
 - **Space** — CCSDS + SGP4 (TLE-based orbit propagation)
-- **Military / tactical / ISR** — CoT (bidirectional, TAK Server compatible), STIX/TAXII, NFFI (STANAG 5527), CEF, MISB ST 0601 KLV (tags 1–25, video metadata)
+- **Military / tactical / ISR** — CoT (bidirectional, TAK Server compatible), **TAK Protocol v1 wire codec** (UDP mesh `0xBF/01/0xBF` + TCP stream length-prefixed — first Rust implementation; `tak://` and `tak-tcp://` URL schemes plug straight into the CoT adapter), STIX/TAXII, NFFI (STANAG 5527), CEF, MISB ST 0601 KLV (tags 1–25, video metadata)
 - **Real-time media relay** — in-binary HTTP/JPEG/MJPEG/HLS relay plus stream registration for RTSP, RTMP, WebRTC/WHEP, SRT, ONVIF, V4L2/USB, file, raw KLV, and KLV-in-MPEG-TS
 - **Industrial / IoT** — OPC-UA, Modbus TCP/RTU, MQTT, SparkplugB, DNP3, CAN/J1939, BACnet, LoRaWAN
 - **Cyber / network** — Syslog (RFC 3164/5424), PCAP, Zeek, NetFlow / IPFIX

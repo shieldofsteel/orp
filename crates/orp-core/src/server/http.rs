@@ -530,6 +530,23 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         )
     });
 
+    // Optional X-Classification banner emitted on every response. Operators
+    // set `ORP_CLASSIFICATION_BANNER="TOP SECRET//SI//NOFORN"` (or any
+    // CAPCO line) at startup; we trust the value as-is and refuse anything
+    // longer than `MAX_BANNER_LEN` to keep header size bounded. Federal
+    // IL5/IL6 + NATO COSMIC reviewers expect this header on every UI/API
+    // response. orp_security::Classification::banner() can produce the
+    // string programmatically when callers hold a `Classification`.
+    let classification_layer = std::env::var("ORP_CLASSIFICATION_BANNER")
+        .ok()
+        .filter(|s| !s.is_empty() && s.len() <= orp_security::classification::MAX_BANNER_LEN)
+        .and_then(|banner| {
+            HeaderValue::from_str(&banner).ok().map(|val| {
+                tracing::info!(banner = %banner, "X-Classification banner enabled");
+                SetResponseHeaderLayer::overriding(HeaderName::from_static("x-classification"), val)
+            })
+        });
+
     // In headless mode we skip static file serving entirely — no frontend/dist
     // required, making ORP deployable on Raspberry Pi, servers, and embedded.
     let base_router: Router<Arc<AppState>> = if config.headless {
@@ -557,6 +574,9 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
     let mut app: Router = stateful.with_state(state);
 
     if let Some(layer) = hsts_layer {
+        app = app.layer(layer);
+    }
+    if let Some(layer) = classification_layer {
         app = app.layer(layer);
     }
 

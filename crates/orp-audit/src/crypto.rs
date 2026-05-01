@@ -76,9 +76,32 @@ impl EventSigner {
             }
             let mut sk = [0u8; 32];
             sk.copy_from_slice(&bytes);
-            return Ok(Self {
-                signing_key: SigningKey::from_bytes(&sk),
-            });
+            let signing_key = SigningKey::from_bytes(&sk);
+            // Self-heal the public-key sidecar. If the previous run was
+            // killed between the secret-rename and the .pub-write, the
+            // sidecar is missing — recreate it now so external verifiers
+            // pinning the .pub file work without manual recovery.
+            let pub_path = pub_path_for(secret_path);
+            if !pub_path.exists() {
+                let pub_bytes = signing_key.verifying_key().to_bytes();
+                if let Err(e) = std::fs::write(&pub_path, pub_bytes.as_ref()) {
+                    tracing::warn!(
+                        path = %pub_path.display(),
+                        error = %e,
+                        "could not heal missing audit-key public sidecar"
+                    );
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&pub_path) {
+                        let mut perms = meta.permissions();
+                        perms.set_mode(0o644);
+                        let _ = std::fs::set_permissions(&pub_path, perms);
+                    }
+                }
+            }
+            return Ok(Self { signing_key });
         }
         let mut csprng = OsRng;
         let mut sk = [0u8; 32];
@@ -285,6 +308,34 @@ mod tests {
         let _ = EventSigner::load_or_generate(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "secret key must be 0600, got {:o}", mode);
+    }
+
+    #[test]
+    fn load_or_generate_self_heals_missing_pub_sidecar() {
+        // Crypto-audit concern: if a previous run was killed between
+        // secret-rename and pubkey-write, the sidecar is missing on the
+        // next start. load_or_generate now self-heals — without that, an
+        // external verifier pinning .pub.ed25519 stays broken until manual
+        // recovery.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit-key.ed25519");
+        let pub_path = path.with_file_name("audit-key.pub.ed25519");
+
+        let s1 = EventSigner::load_or_generate(&path).unwrap();
+        assert!(pub_path.exists());
+        // Simulate the crash: delete the sidecar.
+        std::fs::remove_file(&pub_path).unwrap();
+        assert!(!pub_path.exists());
+
+        let s2 = EventSigner::load_or_generate(&path).unwrap();
+        // Sidecar is back.
+        assert!(pub_path.exists(), "load_or_generate must self-heal sidecar");
+        // And it matches the secret-derived public key.
+        let expected = s2.public_key_bytes();
+        let actual = std::fs::read(&pub_path).unwrap();
+        assert_eq!(actual, expected);
+        // Same signer key.
+        assert_eq!(s1.public_key_bytes(), s2.public_key_bytes());
     }
 
     #[test]

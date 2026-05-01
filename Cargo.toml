@@ -56,6 +56,11 @@ tempfile = "3"
 # versions unmaintained; we suppress it via audit.toml with an exit ramp
 # (postcard / bitcode / rkyv evaluation queued for v0.4).
 bincode = { version = "2", features = ["serde"] }
+# AES-256-GCM (AEAD) for at-rest envelope encryption of sensitive columns
+# (audit log `details`, federation outbox payloads, DLQ rows). RustCrypto-
+# pure, no system libcrypt link, FIPS-evaluatable when paired with
+# AES-NI / ARMv8 Crypto Extensions.
+aes-gcm = "0.10"
 
 [profile.release]
 opt-level = 3

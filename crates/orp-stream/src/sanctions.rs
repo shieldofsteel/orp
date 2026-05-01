@@ -218,6 +218,13 @@ pub struct SanctionsDatabase {
     inner: Arc<RwLock<SanctionsIndex>>,
     /// Path to the source file (for auto-reload).
     source_path: Option<PathBuf>,
+    /// Verifying key pinned at signed-load time. When `Some`, every reload
+    /// must also pass [`verify_detached_signature`] against this key —
+    /// otherwise an attacker who can write the data file post-load could
+    /// silently substitute a sanctioned-vessel-removed copy on the next
+    /// 24-hour tick (closes the BLOCKER from the v0.3.1 crypto audit:
+    /// F8 reload bypass).
+    signed_pubkey: Option<ed25519_dalek::VerifyingKey>,
     /// Minimum fuzzy score (0–100) to report a name match.
     pub name_match_threshold: u8,
 }
@@ -231,6 +238,7 @@ impl SanctionsDatabase {
         Self {
             inner: Arc::new(RwLock::new(index)),
             source_path: None,
+            signed_pubkey: None,
             name_match_threshold: 75,
         }
     }
@@ -260,6 +268,7 @@ impl SanctionsDatabase {
         let db = Self {
             inner: Arc::new(RwLock::new(index)),
             source_path: Some(path),
+            signed_pubkey: None,
             name_match_threshold: 75,
         };
         Ok(db)
@@ -284,6 +293,7 @@ impl SanctionsDatabase {
         let db = Self {
             inner: Arc::new(RwLock::new(index)),
             source_path: Some(path),
+            signed_pubkey: None,
             name_match_threshold: 75,
         };
         Ok(db)
@@ -295,6 +305,7 @@ impl SanctionsDatabase {
         Self {
             inner: Arc::new(RwLock::new(index)),
             source_path: None,
+            signed_pubkey: None,
             name_match_threshold: 75,
         }
     }
@@ -341,6 +352,10 @@ impl SanctionsDatabase {
         Ok(Self {
             inner: Arc::new(RwLock::new(index)),
             source_path: Some(path),
+            // Pin the verifying key so reload_if_changed can re-verify the
+            // signature on every refresh — closes the BLOCKER finding from
+            // the v0.3.1 crypto audit (F8 reload bypass).
+            signed_pubkey: Some(*public_key),
             name_match_threshold: 75,
         })
     }
@@ -350,6 +365,13 @@ impl SanctionsDatabase {
     /// Reload from source file if the file has changed since last load.
     ///
     /// I/O and parsing are off-runtime (see [`Self::load_from_csv`]).
+    ///
+    /// **Signature handling**: if this database was originally built via
+    /// [`Self::load_signed`] the pinned `signed_pubkey` is enforced on
+    /// every reload — the new file AND its `<path>.sig` must verify
+    /// against the same key, otherwise reload fails-closed and the in-
+    /// memory index is left untouched. Closes the BLOCKER finding from
+    /// the v0.3.1 crypto audit (F8 reload bypass).
     pub async fn reload_if_changed(&self) -> anyhow::Result<bool> {
         let path = match &self.source_path {
             Some(p) => p.clone(),
@@ -363,9 +385,24 @@ impl SanctionsDatabase {
             return Ok(false);
         }
 
-        let text = tokio::fs::read_to_string(&path)
+        let bytes = tokio::fs::read(&path)
             .await
             .map_err(|e| anyhow::anyhow!("sanctions: failed to read {}: {e}", path.display()))?;
+
+        // If the original load was signed, every reload re-verifies. A
+        // disk-writeable attacker can swap the file post-load but cannot
+        // forge a valid Ed25519 signature without the signing key.
+        if let Some(pubkey) = &self.signed_pubkey {
+            let sig_path = sig_path_for(&path);
+            verify_detached_signature(&bytes, &sig_path, pubkey).await?;
+        }
+
+        let text = String::from_utf8(bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "sanctions: file {} is not valid UTF-8 on reload",
+                path.display()
+            )
+        })?;
         let is_csv = path.extension().and_then(|e| e.to_str()) == Some("csv");
         let entries = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<SdnEntry>> {
             if is_csv {
@@ -1418,6 +1455,68 @@ mod tests {
         if let Ok(_db) = SanctionsDatabase::load_signed(&csv_path, &public_key).await {
             panic!("missing sig file must fail-closed");
         }
+    }
+
+    #[tokio::test]
+    async fn signed_load_pins_pubkey_and_reload_re_verifies() {
+        // BLOCKER fix from the v0.3.1 crypto audit: reload_if_changed must
+        // re-verify the signature against the pinned pubkey. Otherwise a
+        // disk-writeable attacker could swap the file post-load and the
+        // next 24h reload would silently accept the tampered version.
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::{rngs::OsRng, RngCore};
+
+        let mut sk = [0u8; 32];
+        OsRng.fill_bytes(&mut sk);
+        let signing_key = SigningKey::from_bytes(&sk);
+        let public_key = signing_key.verifying_key();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let csv_path = tmp.path().join("sdn.csv");
+        let original = fixture_csv();
+        std::fs::write(&csv_path, original).unwrap();
+        let signature = signing_key.sign(original.as_bytes());
+        std::fs::write(sig_path_for(&csv_path), signature.to_bytes()).unwrap();
+
+        let db = SanctionsDatabase::load_signed(&csv_path, &public_key)
+            .await
+            .expect("initial signed load");
+        assert!(db.signed_pubkey.is_some(), "pubkey must be pinned");
+
+        // Bump mtime + tamper with the data, but leave the original sig.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&csv_path, "name,type\nDIFFERENT,Vessel\n").unwrap();
+
+        match db.reload_if_changed().await {
+            Ok(_) => panic!("reload must reject tampered file under pinned pubkey"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("signature") || msg.contains("verification"),
+                    "expected signature failure on reload, got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unsigned_load_reload_does_not_require_signature() {
+        // Ensure the new pin is opt-in. Unsigned-loaded DBs should still
+        // reload normally — F8 only enforces verification when caller
+        // opted into signed mode.
+        let tmp = tempfile::tempdir().unwrap();
+        let csv_path = tmp.path().join("sdn.csv");
+        std::fs::write(&csv_path, fixture_csv()).unwrap();
+
+        let db = SanctionsDatabase::load_from_csv(&csv_path)
+            .await
+            .expect("unsigned load");
+        assert!(db.signed_pubkey.is_none());
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&csv_path, fixture_csv()).unwrap();
+        // No sig file on disk, but reload still succeeds.
+        let _ = db.reload_if_changed().await.expect("unsigned reload ok");
     }
 
     #[tokio::test]

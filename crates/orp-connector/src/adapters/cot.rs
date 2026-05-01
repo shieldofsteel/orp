@@ -190,6 +190,31 @@ impl CotEvent {
 /// Parse a CoT XML string into a `CotEvent`.
 ///
 /// Expects the standard `<event>` root element with `<point>` and optional `<detail>`.
+/// Shared CoT XML handler used by every transport variant (plain UDP,
+/// TAK mesh, TAK stream). Parses the XML, converts to a `SourceEvent`,
+/// pushes to the channel, and bumps the per-connector counters.
+async fn handle_cot_xml(
+    xml: &str,
+    tx: &tokio::sync::mpsc::Sender<crate::SourceEvent>,
+    connector_id: &str,
+    events_count: &Arc<AtomicU64>,
+    errors_count: &Arc<AtomicU64>,
+) {
+    match parse_cot_xml(xml) {
+        Ok(cot) => {
+            let event = cot.to_source_event(connector_id);
+            if tx.send(event).await.is_err() {
+                return;
+            }
+            events_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            tracing::warn!("CoT parse error: {}", e);
+            errors_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 pub fn parse_cot_xml(xml: &str) -> Result<CotEvent, ConnectorError> {
     let mut reader = Reader::from_str(xml);
 
@@ -616,30 +641,156 @@ impl Connector for CotConnector {
         let url = self.config.url.clone();
 
         tokio::spawn(async move {
-            // If a UDP url is configured, try real connection
+            // URL scheme dispatch:
+            //   udp://host:port   plain CoT XML datagrams (legacy ATAK)
+            //   tak://host:port   TAK Protocol v1 mesh frames (binary, 0xBF/01/0xBF)
+            //   tak-tcp://host:port  TAK Protocol v1 stream frames over TCP
+            // Anything else falls through to demo mode.
             if let Some(ref url_str) = url {
+                // ── TAK Protocol v1 mesh: UDP, binary-framed CoT ─────────
+                if let Some(addr) = url_str.strip_prefix("tak://") {
+                    match tokio::net::UdpSocket::bind(addr).await {
+                        Ok(socket) => {
+                            tracing::info!("CoT listening on TAK-mesh UDP {}", addr);
+                            let mut buf = vec![0u8; 65535];
+                            while running.load(Ordering::SeqCst) {
+                                match socket.recv_from(&mut buf).await {
+                                    Ok((n, _src)) => match orp_tak::decode_mesh_frame(&buf[..n]) {
+                                        Ok(payload) => {
+                                            let xml = match std::str::from_utf8(payload) {
+                                                Ok(s) => s,
+                                                Err(_) => {
+                                                    errors_count.fetch_add(1, Ordering::Relaxed);
+                                                    continue;
+                                                }
+                                            };
+                                            handle_cot_xml(
+                                                xml,
+                                                &tx,
+                                                &connector_id,
+                                                &events_count,
+                                                &errors_count,
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("TAK-mesh decode error: {}", e);
+                                            errors_count.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    },
+                                    Err(e) => {
+                                        tracing::warn!("CoT TAK-mesh recv error: {}", e);
+                                        errors_count.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Cannot bind TAK-mesh UDP {}: {}, using demo data",
+                                addr,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // ── TAK Protocol v1 stream: TCP, length-prefixed CoT ─────
+                if let Some(addr) = url_str.strip_prefix("tak-tcp://") {
+                    match tokio::net::TcpListener::bind(addr).await {
+                        Ok(listener) => {
+                            tracing::info!("CoT listening on TAK-stream TCP {}", addr);
+                            while running.load(Ordering::SeqCst) {
+                                let Ok((mut socket, peer)) = listener.accept().await else {
+                                    continue;
+                                };
+                                tracing::info!(peer = %peer, "TAK-stream peer connected");
+                                let tx_clone = tx.clone();
+                                let connector_id_clone = connector_id.clone();
+                                let events_count_clone = events_count.clone();
+                                let errors_count_clone = errors_count.clone();
+                                let running_clone = running.clone();
+                                tokio::spawn(async move {
+                                    use tokio::io::AsyncReadExt;
+                                    let mut accum: Vec<u8> = Vec::with_capacity(4096);
+                                    let mut chunk = [0u8; 4096];
+                                    while running_clone.load(Ordering::SeqCst) {
+                                        match socket.read(&mut chunk).await {
+                                            Ok(0) => break,
+                                            Ok(n) => {
+                                                accum.extend_from_slice(&chunk[..n]);
+                                                // Drain every complete frame.
+                                                loop {
+                                                    match orp_tak::decode_stream_frame(&accum) {
+                                                        Ok(frame) => {
+                                                            if let Ok(xml) =
+                                                                std::str::from_utf8(frame.payload)
+                                                            {
+                                                                handle_cot_xml(
+                                                                    xml,
+                                                                    &tx_clone,
+                                                                    &connector_id_clone,
+                                                                    &events_count_clone,
+                                                                    &errors_count_clone,
+                                                                )
+                                                                .await;
+                                                            }
+                                                            accum.drain(..frame.consumed);
+                                                        }
+                                                        Err(orp_tak::TakDecodeError::PayloadTruncated { .. })
+                                                        | Err(orp_tak::TakDecodeError::TooShort { .. }) => break,
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                "TAK-stream decode error: {}; resyncing",
+                                                                e
+                                                            );
+                                                            errors_count_clone.fetch_add(1, Ordering::Relaxed);
+                                                            // Drop one byte and try to resync at next 0xBF.
+                                                            if !accum.is_empty() {
+                                                                accum.drain(..1);
+                                                            } else {
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                });
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Cannot bind TAK-stream TCP {}: {}, using demo data",
+                                addr,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // ── Plain CoT XML over UDP (legacy ATAK) ─────────────────
                 if let Some(addr) = url_str.strip_prefix("udp://") {
                     match tokio::net::UdpSocket::bind(addr).await {
                         Ok(socket) => {
-                            tracing::info!("CoT listening on UDP {}", addr);
+                            tracing::info!("CoT listening on plain UDP {}", addr);
                             let mut buf = vec![0u8; 65535];
                             while running.load(Ordering::SeqCst) {
                                 match socket.recv_from(&mut buf).await {
                                     Ok((n, _src)) => {
                                         if let Ok(xml) = std::str::from_utf8(&buf[..n]) {
-                                            match parse_cot_xml(xml) {
-                                                Ok(cot) => {
-                                                    let event = cot.to_source_event(&connector_id);
-                                                    if tx.send(event).await.is_err() {
-                                                        return;
-                                                    }
-                                                    events_count.fetch_add(1, Ordering::Relaxed);
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!("CoT parse error: {}", e);
-                                                    errors_count.fetch_add(1, Ordering::Relaxed);
-                                                }
-                                            }
+                                            handle_cot_xml(
+                                                xml,
+                                                &tx,
+                                                &connector_id,
+                                                &events_count,
+                                                &errors_count,
+                                            )
+                                            .await;
                                         }
                                     }
                                     Err(e) => {

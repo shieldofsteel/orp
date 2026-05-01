@@ -14,12 +14,14 @@
 //! with Ed25519. The signature is over the *hash bytes*, so verifiers only
 //! need the per-row pre-image to re-derive everything.
 
+pub mod at_rest;
 pub mod crypto;
 pub mod entry;
 pub mod logger;
 pub mod persistent;
 pub mod traits;
 
+pub use at_rest::{default_at_rest_key_path, AtRestError, AtRestKey};
 pub use crypto::{compute_hash, default_audit_key_path, EventSigner};
 pub use entry::{canonical_preimage, compute_content_hash, AuditEntry, GENESIS_PREV_HASH};
 pub use logger::{AuditLog, InMemoryAuditLog};

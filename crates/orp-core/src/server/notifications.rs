@@ -794,8 +794,21 @@ impl Default for NotificationEngine {
 
 // ── SMTP sender ───────────────────────────────────────────────────────────────
 
-/// Minimal SMTP sender: TCP connect → EHLO → AUTH LOGIN → MAIL FROM → RCPT TO → DATA.
-/// Supports plain or STARTTLS (on port 587 and non-25 by convention).
+/// SMTP sender backed by `lettre 0.11` with rustls + webpki-roots. Replaces
+/// the hand-rolled SMTP block (~150 LOC) that sent AUTH LOGIN credentials
+/// in cleartext — closes P-audit F6.
+///
+/// Transport selection by port:
+///   * **465** → implicit TLS (`AsyncSmtpTransport::relay`). Connection
+///     starts with the TLS handshake; AUTH LOGIN runs over the encrypted
+///     channel from the first byte.
+///   * any other port (typically 587) → STARTTLS upgrade
+///     (`AsyncSmtpTransport::starttls_relay`). Plaintext EHLO, then
+///     STARTTLS, then TLS handshake, then re-EHLO + AUTH LOGIN over the
+///     encrypted channel.
+///
+/// AUTH mechanism is selected by lettre based on what the server
+/// advertises in EHLO (LOGIN/PLAIN/XOAUTH2 — strongest available).
 async fn send_email(
     smtp_host: &str,
     smtp_port: u16,
@@ -805,149 +818,53 @@ async fn send_email(
     to_addresses: &[String],
     payload: &AlertPayload,
 ) -> Result<(), String> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpStream;
+    use lettre::{
+        message::Message,
+        transport::smtp::{authentication::Credentials, AsyncSmtpTransport},
+        AsyncTransport, Tokio1Executor,
+    };
 
     let subject = format!("[ORP ALERT] {} — {}", payload.severity, payload.entity_id);
-    let body_text = format!(
-        "ORP Alert\r\nSeverity: {}\r\nEntity: {}\r\nAlert ID: {}\r\nMessage: {}\r\nTime: {}\r\n",
+    let body = format!(
+        "ORP Alert\nSeverity: {}\nEntity: {}\nAlert ID: {}\nMessage: {}\nTime: {}\n",
         payload.severity,
         payload.entity_id,
         payload.alert_id,
         payload.message,
-        payload.triggered_at.to_rfc3339()
-    );
-    let mime = format!(
-        "From: {from}\r\n\
-         To: {to}\r\n\
-         Subject: {subject}\r\n\
-         MIME-Version: 1.0\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
-         \r\n\
-         {body}",
-        from = from,
-        to = to_addresses.join(", "),
-        subject = subject,
-        body = body_text,
+        payload.triggered_at.to_rfc3339(),
     );
 
-    let addr = format!("{}:{}", smtp_host, smtp_port);
-    let stream = TcpStream::connect(&addr)
-        .await
-        .map_err(|e| format!("SMTP connect failed: {e}"))?;
-    let (reader_half, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader_half);
+    let mut builder = Message::builder()
+        .from(
+            from.parse()
+                .map_err(|e| format!("SMTP bad from '{from}': {e}"))?,
+        )
+        .subject(subject);
+    for to in to_addresses {
+        builder = builder.to(to.parse().map_err(|e| format!("SMTP bad to '{to}': {e}"))?);
+    }
+    let email = builder
+        .body(body)
+        .map_err(|e| format!("SMTP build message: {e}"))?;
 
-    // Read a single SMTP reply line
-    macro_rules! smtp_read {
-        ($label:expr) => {{
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| format!("SMTP read {}: {e}", $label))?;
-            line
-        }};
-    }
+    let creds = Credentials::new(username.to_string(), password.to_string());
 
-    // 220 greeting
-    let greeting = smtp_read!("greeting");
-    if !greeting.starts_with("220") {
-        return Err(format!("SMTP unexpected greeting: {}", greeting.trim()));
+    // Implicit TLS on 465, STARTTLS upgrade on every other port.
+    let transport: AsyncSmtpTransport<Tokio1Executor> = if smtp_port == 465 {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(smtp_host)
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
     }
+    .map_err(|e| format!("SMTP transport init: {e}"))?
+    .port(smtp_port)
+    .credentials(creds)
+    .build();
 
-    // EHLO
-    writer
-        .write_all(b"EHLO orp-notifications\r\n")
+    transport
+        .send(email)
         .await
-        .map_err(|e| format!("SMTP EHLO write: {e}"))?;
-    // Read all EHLO response lines (multi-line: 250-)
-    loop {
-        let line = smtp_read!("EHLO");
-        if line.starts_with("250 ") || line.starts_with("250\r") || line.starts_with("250\n") {
-            break;
-        }
-        if !line.starts_with("250-") {
-            return Err(format!("SMTP EHLO unexpected: {}", line.trim()));
-        }
-    }
-
-    // AUTH LOGIN
-    writer
-        .write_all(b"AUTH LOGIN\r\n")
-        .await
-        .map_err(|e| format!("SMTP AUTH write: {e}"))?;
-    let auth_prompt = smtp_read!("AUTH prompt");
-    if !auth_prompt.starts_with("334") {
-        return Err(format!(
-            "SMTP AUTH LOGIN not accepted: {}",
-            auth_prompt.trim()
-        ));
-    }
-    writer
-        .write_all(format!("{}\r\n", B64.encode(username)).as_bytes())
-        .await
-        .map_err(|e| format!("SMTP write username: {e}"))?;
-    let user_resp = smtp_read!("username resp");
-    if !user_resp.starts_with("334") {
-        return Err(format!("SMTP username not accepted: {}", user_resp.trim()));
-    }
-    writer
-        .write_all(format!("{}\r\n", B64.encode(password)).as_bytes())
-        .await
-        .map_err(|e| format!("SMTP write password: {e}"))?;
-    let pass_resp = smtp_read!("password resp");
-    if !pass_resp.starts_with("235") {
-        return Err(format!("SMTP AUTH failed: {}", pass_resp.trim()));
-    }
-
-    // MAIL FROM
-    writer
-        .write_all(format!("MAIL FROM:<{}>\r\n", from).as_bytes())
-        .await
-        .map_err(|e| format!("SMTP MAIL FROM write: {e}"))?;
-    let mail_resp = smtp_read!("MAIL FROM resp");
-    if !mail_resp.starts_with("250") {
-        return Err(format!("SMTP MAIL FROM rejected: {}", mail_resp.trim()));
-    }
-
-    // RCPT TO
-    for rcpt_addr in to_addresses {
-        writer
-            .write_all(format!("RCPT TO:<{}>\r\n", rcpt_addr).as_bytes())
-            .await
-            .map_err(|e| format!("SMTP RCPT TO write: {e}"))?;
-        let rcpt_resp = smtp_read!("RCPT TO resp");
-        if !rcpt_resp.starts_with("250") && !rcpt_resp.starts_with("251") {
-            return Err(format!(
-                "SMTP RCPT TO rejected for {rcpt_addr}: {}",
-                rcpt_resp.trim()
-            ));
-        }
-    }
-
-    // DATA
-    writer
-        .write_all(b"DATA\r\n")
-        .await
-        .map_err(|e| format!("SMTP DATA cmd: {e}"))?;
-    let data_resp = smtp_read!("DATA resp");
-    if !data_resp.starts_with("354") {
-        return Err(format!("SMTP DATA not accepted: {}", data_resp.trim()));
-    }
-    writer
-        .write_all(format!("{}\r\n.\r\n", mime).as_bytes())
-        .await
-        .map_err(|e| format!("SMTP DATA write: {e}"))?;
-    let sent_resp = smtp_read!("sent resp");
-    if !sent_resp.starts_with("250") {
-        return Err(format!("SMTP message not accepted: {}", sent_resp.trim()));
-    }
-
-    // QUIT
-    let _ = writer.write_all(b"QUIT\r\n").await;
-    Ok(())
+        .map(|_| ())
+        .map_err(|e| format!("SMTP send: {e}"))
 }
 
 // ── REST handlers ─────────────────────────────────────────────────────────────

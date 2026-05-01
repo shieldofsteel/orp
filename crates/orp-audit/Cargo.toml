@@ -16,6 +16,11 @@ async-trait = { workspace = true }
 hex = "0.4"
 duckdb = { version = "1.2", features = ["bundled"] }
 tokio = { workspace = true }
+# At-rest envelope encryption (audit-log details column). Closes P-audit F7
+# for the most sensitive column without requiring DuckDB encryption-
+# extension support.
+aes-gcm = { workspace = true }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

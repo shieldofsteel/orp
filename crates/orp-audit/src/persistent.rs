@@ -48,6 +48,35 @@ fn truncate_to_micros(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chr
     dt.with_nanosecond(micros * 1_000).unwrap_or(dt)
 }
 
+/// Try to interpret a `details` cell as the at-rest envelope
+/// `{"orpaead1": "<base64>"}`. Returns:
+/// * `Ok(Some(plaintext_json))` — the cell was sealed and decrypted cleanly.
+/// * `Ok(None)` — the cell is not in envelope shape (legacy plaintext row).
+/// * `Err(AtRestError)` — envelope shape but decryption failed (wrong key
+///   or tampered ciphertext); caller should surface the error.
+fn try_unseal_envelope(
+    cell: &str,
+    key: &crate::AtRestKey,
+) -> Result<Option<String>, crate::AtRestError> {
+    let parsed: serde_json::Value = match serde_json::from_str(cell) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let Some(obj) = parsed.as_object() else {
+        return Ok(None);
+    };
+    if obj.len() != 1 {
+        return Ok(None);
+    }
+    let Some(blob) = obj.get("orpaead1").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let plain = key.unseal(blob)?;
+    String::from_utf8(plain)
+        .map(Some)
+        .map_err(|_| crate::AtRestError::Malformed)
+}
+
 /// SQL fragments — kept here so this crate is self-contained and the table is
 /// idempotently created even if `orp-storage`'s base schema hasn't run yet
 /// (e.g. when callers use `PersistentAuditLog::open` against a bare DB file).
@@ -74,6 +103,13 @@ CREATE INDEX IF NOT EXISTS idx_audit_user      ON audit_log(user_id);
 pub struct PersistentAuditLog {
     conn: Arc<Mutex<Connection>>,
     signer: Arc<EventSigner>,
+    /// Optional at-rest envelope key. When set, the `details` column is
+    /// AES-256-GCM-sealed before INSERT and unsealed on read. Closes
+    /// P-audit Wave 2 F7 for the most sensitive column without requiring
+    /// DuckDB encryption-extension support. The chain hash is computed
+    /// over the plaintext JSON, so verification still works across the
+    /// encrypt/decrypt boundary.
+    at_rest: Option<Arc<crate::AtRestKey>>,
     /// Async-safe lock that wraps the SELECT-prev → INSERT-new critical
     /// section. We could fold this into the connection mutex (since DuckDB
     /// already serialises) but a dedicated lock keeps the contract explicit
@@ -98,8 +134,17 @@ impl PersistentAuditLog {
         Ok(Self {
             conn,
             signer,
+            at_rest: None,
             chain_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Builder-style: enable at-rest envelope encryption for the `details`
+    /// column. Mixed-mode is supported — pre-existing plaintext rows
+    /// continue to read correctly, and new rows are sealed.
+    pub fn with_at_rest_key(mut self, key: Arc<crate::AtRestKey>) -> Self {
+        self.at_rest = Some(key);
+        self
     }
 
     /// Open a fresh DuckDB file dedicated to the audit log. Used by the
@@ -153,7 +198,19 @@ impl PersistentAuditLog {
     }
 
     /// Iterate rows in seq-ascending order, returning materialised entries.
+    /// At-rest envelope (when configured on the log) is reversed here so
+    /// callers always see plaintext `details`. Pre-encrypted (legacy)
+    /// rows that don't carry the ORPAEAD1 magic pass through unchanged.
     pub fn read_all(conn: &Connection) -> AuditResult<Vec<AuditEntry>> {
+        Self::read_all_with(conn, None)
+    }
+
+    /// Variant that accepts an at-rest key for unsealing the `details`
+    /// column. Used by instance methods that already hold an `Arc<AtRestKey>`.
+    pub fn read_all_with(
+        conn: &Connection,
+        at_rest: Option<&crate::AtRestKey>,
+    ) -> AuditResult<Vec<AuditEntry>> {
         let mut stmt = conn
             .prepare(
                 "SELECT sequence_number, CAST(timestamp AS VARCHAR) AS ts,
@@ -199,10 +256,21 @@ impl PersistentAuditLog {
             let signature: Option<String> = row
                 .get(8)
                 .map_err(|e| AuditError::Database(e.to_string()))?;
-            let details_str: String = row
+            let raw_details: String = row
                 .get::<_, Option<String>>(9)
                 .map_err(|e| AuditError::Database(e.to_string()))?
                 .unwrap_or_else(|| "null".to_string());
+            // Detect the sealed envelope: a JSON object with a sole key
+            // `orpaead1` whose value is the base64-AEAD blob. Anything else
+            // is treated as legacy plaintext JSON (mixed-mode migration).
+            let details_str: String = match at_rest {
+                Some(key) => match try_unseal_envelope(&raw_details, key) {
+                    Ok(Some(plain)) => plain,
+                    Ok(None) => raw_details,
+                    Err(e) => return Err(AuditError::Database(format!("at-rest unseal: {e}"))),
+                },
+                None => raw_details,
+            };
             let details: serde_json::Value = serde_json::from_str(&details_str)
                 .unwrap_or(serde_json::Value::String(details_str));
 
@@ -281,7 +349,21 @@ impl AuditLogger for PersistentAuditLog {
             .map_err(|e| AuditError::Database(e.to_string()))?;
 
         let timestamp_str = timestamp.to_rfc3339();
-        let details_str = details.to_string();
+        // The chain hash is computed over the plaintext JSON above. The
+        // stored bytes can be the same JSON OR a JSON-wrapped AES-GCM
+        // envelope (`{"orpaead1": "<base64>"}`) so the column-level JSON
+        // type contract holds — either way `read_all` reverses the
+        // encoding and `verify_chain` recomputes from the plaintext.
+        let plaintext_details = details.to_string();
+        let details_str = match &self.at_rest {
+            Some(key) => {
+                let sealed = key
+                    .seal(plaintext_details.as_bytes())
+                    .map_err(|e| AuditError::Database(format!("at-rest seal failed: {e}")))?;
+                serde_json::json!({ "orpaead1": sealed }).to_string()
+            }
+            None => plaintext_details,
+        };
 
         let insert_res = conn.execute(
             "INSERT INTO audit_log
@@ -332,7 +414,7 @@ impl AuditLogger for PersistentAuditLog {
             .conn
             .lock()
             .map_err(|e| AuditError::Database(format!("mutex poisoned: {}", e)))?;
-        let mut all = Self::read_all(&conn)?;
+        let mut all = Self::read_all_with(&conn, self.at_rest.as_deref())?;
         if let Some(n) = limit {
             all.truncate(n);
         }
@@ -344,7 +426,7 @@ impl AuditLogger for PersistentAuditLog {
             .conn
             .lock()
             .map_err(|e| AuditError::Database(format!("mutex poisoned: {}", e)))?;
-        let entries = Self::read_all(&conn)?;
+        let entries = Self::read_all_with(&conn, self.at_rest.as_deref())?;
         let mut prev = GENESIS_PREV_HASH.to_string();
         for (i, entry) in entries.iter().enumerate() {
             let expected_seq = (i as u64) + 1;
@@ -519,6 +601,111 @@ mod tests {
         assert_eq!(truncated.year(), 2026);
         // The truncated value is a fixed point of the function.
         assert_eq!(truncate_to_micros(truncated), truncated);
+    }
+
+    #[tokio::test]
+    async fn at_rest_encrypted_details_round_trip_and_chain_verifies() {
+        // F7 end-to-end: with an at-rest key configured, the `details`
+        // column is sealed on INSERT and unsealed on read. Chain hash
+        // is over the plaintext JSON, so verify_chain still passes.
+        use crate::AtRestKey;
+
+        let signer = Arc::new(EventSigner::new());
+        let pubkey = signer.public_key_bytes();
+        let key = Arc::new(AtRestKey::from_bytes(&[42u8; 32]).unwrap());
+        let (_dir, path) = tmp_db();
+
+        {
+            let log = PersistentAuditLog::open(&path, signer.clone())
+                .unwrap()
+                .with_at_rest_key(key.clone());
+            log.record(
+                "entity_created",
+                Some("ship"),
+                Some("mmsi:42"),
+                Some("system"),
+                serde_json::json!({"name": "Sealed Boat", "secret_field": "PII"}),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Re-open with the same key. Chain replays cleanly.
+        {
+            let log = PersistentAuditLog::open(&path, signer.clone())
+                .unwrap()
+                .with_at_rest_key(key.clone());
+            let rows = log.replay(None).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            // Plaintext recovered through the unseal pass.
+            assert_eq!(rows[0].details["name"], "Sealed Boat");
+            assert_eq!(rows[0].details["secret_field"], "PII");
+            // Chain verifies.
+            let vk = VerifyKey::from_bytes(&pubkey).unwrap();
+            log.verify_chain(&vk).await.unwrap();
+        }
+
+        // Confirm the at-rest discipline: opening WITHOUT the key (i.e.
+        // a stolen DB without the sidecar key file) cannot read details.
+        {
+            let log = PersistentAuditLog::open(&path, signer.clone()).unwrap();
+            let rows = log.replay(None).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            // The sealed blob comes back as a JSON string (since
+            // serde_json::from_str fails on it and falls into the String
+            // fallback). Either way, the plaintext is NOT visible.
+            let recovered = rows[0].details.to_string();
+            assert!(!recovered.contains("Sealed Boat"));
+            assert!(!recovered.contains("secret_field"));
+        }
+    }
+
+    #[tokio::test]
+    async fn at_rest_mixed_mode_reads_legacy_plaintext_rows() {
+        // Migration scenario: a database has rows from before encryption
+        // was turned on. After enabling at-rest, the new rows are sealed
+        // but the old plaintext rows must still read correctly.
+        use crate::AtRestKey;
+
+        let signer = Arc::new(EventSigner::new());
+        let key = Arc::new(AtRestKey::from_bytes(&[1u8; 32]).unwrap());
+        let (_dir, path) = tmp_db();
+
+        // Phase 1: write a plaintext row.
+        {
+            let log = PersistentAuditLog::open(&path, signer.clone()).unwrap();
+            log.record(
+                "legacy",
+                None,
+                None,
+                None,
+                serde_json::json!({"era": "before-at-rest"}),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Phase 2: append a sealed row.
+        {
+            let log = PersistentAuditLog::open(&path, signer.clone())
+                .unwrap()
+                .with_at_rest_key(key.clone());
+            log.record(
+                "post_at_rest",
+                None,
+                None,
+                None,
+                serde_json::json!({"era": "after-at-rest"}),
+            )
+            .await
+            .unwrap();
+
+            // Both rows read correctly through the keyed log.
+            let rows = log.replay(None).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].details["era"], "before-at-rest");
+            assert_eq!(rows[1].details["era"], "after-at-rest");
+        }
     }
 
     #[tokio::test]

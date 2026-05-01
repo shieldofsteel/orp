@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Datelike;
 use colored::Colorize;
 use orp_audit::{
+    at_rest::{default_at_rest_key_path, AtRestKey},
     crypto::{default_audit_key_path, EventSigner},
     AuditLogger, InMemoryAuditLog, PersistentAuditLog,
 };
@@ -532,10 +533,46 @@ pub async fn run_start(args: StartArgs) -> Result<()> {
         let storage_obj = DuckDbStorage::new_with_path(path)
             .map_err(|e| anyhow::anyhow!("Storage init failed at {}: {}", path, e))?;
         let conn = storage_obj.connection();
-        let log = Arc::new(
-            PersistentAuditLog::from_connection(conn, audit_signer.clone())
-                .map_err(|e| anyhow::anyhow!("Audit log init failed: {}", e))?,
-        );
+        let raw_log = PersistentAuditLog::from_connection(conn, audit_signer.clone())
+            .map_err(|e| anyhow::anyhow!("Audit log init failed: {}", e))?;
+
+        // P-audit Wave 2 F7: app-layer AES-256-GCM envelope encryption of
+        // the `details` column. Opt-in: the operator either sets
+        // ORP_AT_REST_KEY_PATH or pre-creates the default key file at
+        // `${XDG_DATA_HOME}/orp/at-rest.key`. When the file exists we
+        // load it; otherwise we leave at-rest off (so legacy deployments
+        // keep working). Generation requires an explicit operator action
+        // (`orp gen-cert --at-rest-key`) — never auto-create the key in
+        // a long-running server. That keeps key custody an explicit step.
+        let log: Arc<dyn AuditLogger> = {
+            let key_path = default_at_rest_key_path();
+            if key_path.exists() {
+                match AtRestKey::load_or_generate(&key_path) {
+                    Ok(key) => {
+                        tracing::info!(
+                            path = %key_path.display(),
+                            "at-rest envelope encryption enabled for audit-log details"
+                        );
+                        Arc::new(raw_log.with_at_rest_key(Arc::new(key)))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %key_path.display(),
+                            error = %e,
+                            "at-rest key file present but unloadable — running without envelope encryption"
+                        );
+                        Arc::new(raw_log)
+                    }
+                }
+            } else {
+                tracing::info!(
+                    path = %key_path.display(),
+                    "at-rest key file not present — audit-log details stored as plaintext (set ORP_AT_REST_KEY_PATH or create the file to enable)"
+                );
+                Arc::new(raw_log)
+            }
+        };
+
         // Log the public key on startup so operators can record it for
         // off-machine signature verification later.
         tracing::info!(

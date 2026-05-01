@@ -6,6 +6,11 @@ edition.workspace = true
 [dependencies]
 orp-proto = { path = "../orp-proto" }
 orp-security = { path = "../orp-security" }
+# TAK Protocol v1 wire codec — used by the CoT adapter to decode binary
+# TAK frames (mesh + stream) when the URL scheme is `tak://` (UDP mesh) or
+# `tak-tcp://` (TCP stream). Plain `udp://` and `tcp://` continue to
+# accept raw CoT XML for backward compatibility.
+orp-tak = { path = "../orp-tak" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

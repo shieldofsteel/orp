@@ -294,6 +294,11 @@ impl OrpEvent {
             signature: self.signature.clone().unwrap_or_default().into(),
             audit,
             geo,
+            // Classification is wire-level only on this canonical conversion.
+            // Senders that hold an `orp_security::Classification` should
+            // populate via the dedicated helper in the security crate; for
+            // pass-through cases we leave it None.
+            classification: None,
         }
     }
 

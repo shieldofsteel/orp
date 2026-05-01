@@ -957,13 +957,22 @@ fn verify_csrf_cookie(cookie_val: &str, secret: &str) -> Option<String> {
     Some(state_val.to_string())
 }
 
-/// CSRF cookie secret — derived from client_secret or a fixed dev key.
-fn csrf_secret(oidc: &OidcClient) -> String {
+/// CSRF cookie secret — derived from `client_secret` in production, or a
+/// fixed dev key when OIDC is disabled. **In production (`enabled = true`)
+/// with an empty `client_secret`, this returns `None`** so the caller MUST
+/// refuse to issue or accept the cookie. The previous behaviour silently
+/// fell back to `"orp-dev-csrf-secret"` (a public string), which would
+/// degrade a misconfigured production deploy to no-CSRF-protection. The
+/// crypto audit flagged that as a concern.
+fn csrf_secret(oidc: &OidcClient) -> Option<String> {
     if oidc.config.client_secret.is_empty() {
-        "orp-dev-csrf-secret".to_string()
-    } else {
-        format!("orp-csrf-{}", &oidc.config.client_secret)
+        if oidc.config.enabled {
+            // Don't fall back. Caller fails-closed.
+            return None;
+        }
+        return Some("orp-dev-csrf-secret".to_string());
     }
+    Some(format!("orp-csrf-{}", &oidc.config.client_secret))
 }
 
 /// GET /auth/login — redirect to OIDC provider.
@@ -986,8 +995,25 @@ async fn handle_login(State(state): State<AuthRouterState>) -> Response {
 
     match oidc.authorization_url(&csrf_state) {
         Ok(url) => {
-            // Sign and store CSRF state in an httpOnly cookie
-            let secret = csrf_secret(&oidc);
+            // Sign and store CSRF state in an httpOnly cookie. If OIDC is
+            // enabled but client_secret is empty, csrf_secret returns None
+            // — refuse to issue a cookie rather than degrade to a public
+            // dev-mode key (audit-flagged misconfiguration vector).
+            let Some(secret) = csrf_secret(&oidc) else {
+                tracing::error!(
+                    "OIDC enabled but client_secret is empty — refusing to issue CSRF cookie"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "OIDC_MISCONFIGURED",
+                            "message": "OIDC enabled but client_secret is empty",
+                        }
+                    })),
+                )
+                    .into_response();
+            };
             let signed = sign_csrf_state(&csrf_state, &secret);
             let csrf_cookie = format!(
                 "orp_csrf={}; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=600",
@@ -1042,8 +1068,23 @@ async fn handle_callback(
             .into_response();
     }
 
-    // Verify CSRF state from signed cookie
-    let secret = csrf_secret(&oidc);
+    // Verify CSRF state from signed cookie. If misconfigured (OIDC enabled
+    // with empty client_secret) refuse the callback altogether — the
+    // alternative is verifying the cookie against a public dev-mode key,
+    // i.e. anyone can forge it.
+    let Some(secret) = csrf_secret(&oidc) else {
+        tracing::error!("OIDC enabled but client_secret is empty — refusing to verify CSRF cookie");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "OIDC_MISCONFIGURED",
+                    "message": "OIDC enabled but client_secret is empty",
+                }
+            })),
+        )
+            .into_response();
+    };
     let csrf_cookie_val = headers_map
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -1408,6 +1449,45 @@ mod tests {
         let s1 = sign_csrf_state(state, "secret-1");
         let s2 = sign_csrf_state(state, "secret-2");
         assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn csrf_secret_returns_none_when_oidc_enabled_with_empty_client_secret() {
+        // Crypto-audit concern: previously csrf_secret silently fell back
+        // to a public dev-mode key in this case, degrading production CSRF
+        // protection to zero. Now csrf_secret returns None and the caller
+        // must fail closed.
+        let cfg = OidcConfig {
+            enabled: true,
+            client_secret: String::new(),
+            ..Default::default()
+        };
+        let client = OidcClient::new(cfg);
+        assert!(csrf_secret(&client).is_none());
+    }
+
+    #[test]
+    fn csrf_secret_dev_mode_falls_back_to_dev_key() {
+        let cfg = OidcConfig {
+            enabled: false,
+            client_secret: String::new(),
+            ..Default::default()
+        };
+        let client = OidcClient::new(cfg);
+        let secret = csrf_secret(&client).expect("dev-mode fallback");
+        assert_eq!(secret, "orp-dev-csrf-secret");
+    }
+
+    #[test]
+    fn csrf_secret_with_real_client_secret_uses_it() {
+        let cfg = OidcConfig {
+            enabled: true,
+            client_secret: "very-real-secret".to_string(),
+            ..Default::default()
+        };
+        let client = OidcClient::new(cfg);
+        let secret = csrf_secret(&client).unwrap();
+        assert!(secret.contains("very-real-secret"));
     }
 
     #[test]

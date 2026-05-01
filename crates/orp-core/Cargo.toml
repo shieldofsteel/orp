@@ -59,6 +59,12 @@ hex = "0.4"
 # `password-hash` provides the PHC string format types (`SaltString`, `PasswordHash`).
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["alloc"] }
+# SMTP with proper STARTTLS / implicit-TLS / AUTH LOGIN. Replaces the
+# hand-rolled SMTP that sent credentials in cleartext (closes P-audit F6).
+# rustls + ring + webpki-roots — no native-tls/openssl-sys, single-binary
+# stays intact. Enable features explicitly so default=native-tls doesn't
+# sneak in.
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1", "tokio1-rustls-tls", "ring", "webpki-roots"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }

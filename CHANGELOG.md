@@ -6,6 +6,53 @@ This project follows [Semantic Versioning](https://semver.org/) and [Conventiona
 
 ---
 
+## [Unreleased] — 2026-05-02 v0.3.2 full integration + remaining Wave 2
+
+This wave closes every remaining P-audit Wave 2 ship-blocker (F5, F6, F7) plus three concerns the v0.3.1 crypto-audit agent flagged, and wires the v0.3.1 islands (orp-tak, classification) into the production code path.
+
+### Audit-driven security fixes
+
+- **F8 reload bypass (BLOCKER from crypto audit).** `SanctionsDatabase::load_signed` now pins the verifying key on the DB struct. `reload_if_changed` re-verifies the detached signature on every refresh — a disk-writeable attacker who swaps the file post-load no longer wins on the next 24-hour tick. Two new regression tests: pinned reload re-verifies; unsigned-loaded DBs still reload normally.
+- **F2 sidecar self-heal (CONCERN from crypto audit).** `EventSigner::load_or_generate` recreates the missing `*.pub.ed25519` sidecar when an existing-key load finds it gone (e.g. a previous run was killed mid-write). External verifiers pinning the public key recover automatically. New `load_or_generate_self_heals_missing_pub_sidecar` test.
+- **CSRF empty-secret refusal (CONCERN from crypto audit).** `csrf_secret` now returns `Option<String>` and yields `None` when OIDC is enabled but `client_secret` is empty. Both `handle_login` and `handle_callback` fail closed (HTTP 500 with `OIDC_MISCONFIGURED`) instead of silently degrading to a public dev-mode key. Three new tests cover the production-empty / dev-fallback / real-secret branches.
+
+### F5 — CSRF cookie HMAC + constant-time verify (P-audit Wave 2)
+
+- `sign_csrf_state`: switched from `SHA256(state || secret)` (length-extension forgeable) to `HMAC-SHA256(secret, state)`.
+- `verify_csrf_cookie`: switched from `String ==` (variable-time) to `hmac::Mac::verify_slice` (constant-time).
+- 8 regression tests cover roundtrip, tampered-tag, tampered-state, wrong-secret, missing separator, non-hex tag, state-changes-tag, secret-changes-tag.
+
+### F6 — SMTP STARTTLS via lettre (P-audit Wave 2)
+
+- `notifications::send_email` rewritten on top of `lettre 0.11` with rustls + ring + webpki-roots (no native-tls / openssl-sys). 152 LOC of hand-rolled SMTP deleted, ~30 LOC added.
+- Implicit TLS on 465 (`AsyncSmtpTransport::relay`); STARTTLS upgrade on every other port (`starttls_relay`).
+- AUTH LOGIN now runs **inside** the TLS-protected channel, not before it. Cleartext-credentials path is gone.
+
+### F7 — At-rest envelope encryption (P-audit Wave 2)
+
+- New `crates/orp-audit/src/at_rest.rs` module: AES-256-GCM envelope with 12-byte random nonce per call, `ORPAEAD1` format magic for migration support, file-format key persistence with mode 0600.
+- `PersistentAuditLog::with_at_rest_key` opt-in: when set, the `details` JSON column is sealed before INSERT and unsealed on read. Wire format `{"orpaead1": "<base64>"}` keeps the column's JSON-type contract.
+- Mixed-mode reads — pre-existing plaintext rows continue to deserialize correctly, so the migration is in-place rather than backfill.
+- Production wire-up in `orp start` (persistent mode): when `${ORP_AT_REST_KEY_PATH}` or `${XDG_DATA_HOME}/orp/at-rest.key` exists, encryption activates automatically. No key file means plaintext as before — opt-in.
+- 11 new tests across the module + the persistent log: round-trip, fresh-nonce-per-call, wrong-key-rejected, tampered-ciphertext-rejected, plaintext-passthrough-for-migration, encrypted-replay-still-chain-verifies, mixed-mode-rows-coexist.
+
+### TAK Protocol v1 → orp-connector wire-up
+
+- `orp-connector::adapters::cot` now accepts two new URL schemes:
+  - `tak://host:port` — UDP mesh (`0xBF/0x01/0xBF/<CoT XML>` per RFC-style framing).
+  - `tak-tcp://host:port` — TCP stream (`0xBF/varint(N)/<CoT XML[N]>`); incremental decoder accumulates partial reads, drops one byte to resync on garbage, drains every complete frame per recv.
+- Existing `udp://` continues to work for legacy plaintext-XML ATAK clients.
+- Shared `handle_cot_xml` path so all three transports increment the same counters and route through the same `parse_cot_xml`.
+
+### Classification → wire-level + middleware
+
+- **Proto field**: `OrpEvent.classification` (field 15) and `Entity.classification` (field 10), plus a new `Classification` message mirroring `orp_security::classification::Classification`. Empty = unclassified; full CAPCO breakdown when set.
+- **HTTP middleware**: `ORP_CLASSIFICATION_BANNER="TOP SECRET//SI//NOFORN"` env var enables an `X-Classification` response header on every API/UI response, capped at `MAX_BANNER_LEN` so no oversized header sneaks in. Federal IL5/IL6 reviewers expect this on every response.
+
+### Tests
+
+**~30 new tests this wave**: 8 CSRF HMAC, 3 CSRF empty-secret, 1 audit-key sidecar self-heal, 2 sanctions reload sig (pinned + unsigned), 9 at-rest module, 2 at-rest persistent-log integration, 5 classification proto/middleware (existing). All `cargo fmt --all -- --check` / `cargo clippy --workspace --all-features --tests -- -D warnings` / `cargo audit` clean.
+
 ## [Unreleased] — 2026-05-02 v0.3.1 hardening + capability wave (continued)
 
 ### Additional security + correctness commits
