@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use chrono::Datelike;
 use colored::Colorize;
 use orp_audit::{crypto::EventSigner, AuditLogger, InMemoryAuditLog, PersistentAuditLog};
 use orp_config::{get_maritime_template, Config};
@@ -372,25 +373,54 @@ fn base_url(host: &str) -> String {
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
+/// Arguments for `run_start`. Replaces the previous flat positional list to
+/// keep call sites readable as TLS / mTLS flags accumulate.
+pub struct StartArgs {
+    pub config_path: Option<String>,
+    pub template: Option<String>,
+    pub port_override: Option<u16>,
+    pub dev: bool,
+    pub headless: bool,
+    pub no_auth: bool,
+    pub in_memory: bool,
+    pub bootstrap_admin_key: Option<String>,
+    pub federation_tls_enabled: bool,
+    pub federation_cert: Option<String>,
+    pub federation_key: Option<String>,
+    pub federation_ca: Option<String>,
+    pub federation_tls_listen: Option<String>,
+    pub federation_signing_key: Option<String>,
+    pub local_node_id: Option<String>,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    pub tls_client_ca: Option<String>,
+    pub redirect_http: Option<u16>,
+}
+
 /// Start the ORP server
-#[allow(clippy::too_many_arguments)]
-pub async fn run_start(
-    config_path: Option<String>,
-    template: Option<String>,
-    port_override: Option<u16>,
-    dev: bool,
-    headless: bool,
-    no_auth: bool,
-    in_memory: bool,
-    bootstrap_admin_key: Option<String>,
-    federation_tls_enabled: bool,
-    federation_cert: Option<String>,
-    federation_key: Option<String>,
-    federation_ca: Option<String>,
-    federation_tls_listen: Option<String>,
-    federation_signing_key: Option<String>,
-    local_node_id: Option<String>,
-) -> Result<()> {
+pub async fn run_start(args: StartArgs) -> Result<()> {
+    let StartArgs {
+        config_path,
+        template,
+        port_override,
+        dev,
+        headless,
+        no_auth,
+        in_memory,
+        bootstrap_admin_key,
+        federation_tls_enabled,
+        federation_cert,
+        federation_key,
+        federation_ca,
+        federation_tls_listen,
+        federation_signing_key,
+        local_node_id,
+        tls_cert,
+        tls_key,
+        tls_client_ca,
+        redirect_http,
+    } = args;
+
     // --no-auth implies --dev and sets ORP_DEV_MODE
     let dev = dev || no_auth;
     if dev || no_auth {
@@ -405,7 +435,29 @@ pub async fn run_start(
         Config::load_or_default()
     };
 
-    let port = port_override.unwrap_or(config.server.port);
+    // TLS is active when both cert + key are provided. clap's `requires_all`
+    // already guarantees this pairing — but defensively re-check here.
+    let tls_config = match (tls_cert.as_ref(), tls_key.as_ref()) {
+        (Some(cert), Some(key)) => Some(server::http::TlsConfig {
+            cert_path: std::path::PathBuf::from(cert),
+            key_path: std::path::PathBuf::from(key),
+            client_ca_path: tls_client_ca.as_ref().map(std::path::PathBuf::from),
+        }),
+        (None, None) => None,
+        _ => anyhow::bail!("--tls-cert and --tls-key must be provided together"),
+    };
+
+    // Default port: explicit override > config > 9443 (HTTPS) or config (HTTP).
+    let port = port_override.unwrap_or_else(|| {
+        if tls_config.is_some() && config.server.port == 9090 {
+            // Caller didn't customize the config port — switch to the
+            // conventional HTTPS dev port so HTTPS doesn't silently land on
+            // the same number as HTTP.
+            9443
+        } else {
+            config.server.port
+        }
+    });
 
     if colors_enabled() {
         println!(
@@ -820,11 +872,169 @@ pub async fn run_start(
         federation_registry: Some(server::federation::PeerRegistry::new()),
         port,
         headless,
-        federation_tls,
+        federation_tls: federation_tls_enabled,
         federation_signing_key_path: federation_signing_key.map(std::path::PathBuf::from),
         local_node_id,
+        tls: tls_config,
+        redirect_http_port: redirect_http,
     })
     .await?;
+
+    Ok(())
+}
+
+/// Arguments for `run_gen_cert`.
+pub struct GenCertArgs {
+    pub cert_out: String,
+    pub key_out: String,
+    pub out_dir: Option<String>,
+    pub cn: String,
+    pub sans: Vec<String>,
+    pub days: u32,
+    pub force: bool,
+}
+
+/// Generate a self-signed TLS certificate suitable for `orp start --tls-*`.
+/// Writes PEM-encoded `cert.pem` and `key.pem`. Designed for dev/test only.
+pub fn run_gen_cert(args: GenCertArgs) -> Result<()> {
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, KeyUsagePurpose, SanType};
+    use std::path::{Path, PathBuf};
+
+    fn resolve(out_dir: Option<&str>, given: &str, default_name: &str) -> PathBuf {
+        let path = Path::new(given);
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        match out_dir {
+            // If a directory is set and the user passed the default, drop the
+            // default name into the directory; otherwise honour the user path
+            // verbatim relative to the directory.
+            Some(dir) => {
+                let dir = Path::new(dir);
+                if given == default_name {
+                    dir.join(default_name)
+                } else {
+                    dir.join(given)
+                }
+            }
+            None => path.to_path_buf(),
+        }
+    }
+
+    let cert_path = resolve(args.out_dir.as_deref(), &args.cert_out, "cert.pem");
+    let key_path = resolve(args.out_dir.as_deref(), &args.key_out, "key.pem");
+
+    if !args.force {
+        for p in [&cert_path, &key_path] {
+            if p.exists() {
+                anyhow::bail!("{} already exists; pass --force to overwrite", p.display());
+            }
+        }
+    }
+
+    if let Some(parent) = cert_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create cert output dir {}", parent.display())
+            })?;
+        }
+    }
+    if let Some(parent) = key_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create key output dir {}", parent.display()))?;
+        }
+    }
+
+    let mut params = CertificateParams::new(Vec::<String>::new())
+        .map_err(|e| anyhow::anyhow!("rcgen params init failed: {}", e))?;
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, args.cn.clone());
+    dn.push(DnType::OrganizationName, "ORP Dev".to_string());
+    params.distinguished_name = dn;
+
+    // SANs: defaults if none provided. Otherwise parse each as IP or DNS.
+    let sans: Vec<String> = if args.sans.is_empty() {
+        vec![
+            args.cn.clone(),
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ]
+    } else {
+        args.sans.clone()
+    };
+    for san in sans {
+        let entry = if let Ok(ip) = san.parse::<std::net::IpAddr>() {
+            SanType::IpAddress(ip)
+        } else {
+            SanType::DnsName(
+                san.clone()
+                    .try_into()
+                    .map_err(|e| anyhow::anyhow!("invalid DNS SAN '{}': {}", san, e))?,
+            )
+        };
+        params.subject_alt_names.push(entry);
+    }
+
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    params.key_usages.push(KeyUsagePurpose::KeyEncipherment);
+    params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+
+    // rcgen's time fields use the `time` crate. Convert from chrono via a
+    // unix-timestamp round-trip so we don't add a direct `time` dep.
+    let now = chrono::Utc::now();
+    let not_before = now - chrono::Duration::hours(1);
+    let not_after = now + chrono::Duration::days(args.days as i64);
+    params.not_before = rcgen::date_time_ymd(
+        not_before.year(),
+        not_before.month() as u8,
+        not_before.day() as u8,
+    );
+    params.not_after = rcgen::date_time_ymd(
+        not_after.year(),
+        not_after.month() as u8,
+        not_after.day() as u8,
+    );
+
+    let key = KeyPair::generate().map_err(|e| anyhow::anyhow!("keypair gen failed: {}", e))?;
+    let cert = params
+        .self_signed(&key)
+        .map_err(|e| anyhow::anyhow!("self-signed cert generation failed: {}", e))?;
+
+    std::fs::write(&cert_path, cert.pem())
+        .with_context(|| format!("failed to write cert {}", cert_path.display()))?;
+    std::fs::write(&key_path, key.serialize_pem())
+        .with_context(|| format!("failed to write key {}", key_path.display()))?;
+
+    // Best-effort lock the key file down to user-only read/write on Unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&key_path) {
+            let mut perm = meta.permissions();
+            perm.set_mode(0o600);
+            let _ = std::fs::set_permissions(&key_path, perm);
+        }
+    }
+
+    print_header("Generated self-signed TLS certificate");
+    println!("  Cert:    {}", cert_path.display());
+    println!("  Key:     {}", key_path.display());
+    println!("  CN:      {}", args.cn);
+    println!("  Days:    {}", args.days);
+    println!();
+    println!("  Start the server with:");
+    println!(
+        "    orp start --tls-cert {} --tls-key {}",
+        cert_path.display(),
+        key_path.display()
+    );
+    println!();
+    println!("  WARNING: self-signed — clients must trust the cert explicitly.");
+    println!("  For production see docs/TLS.md (Let's Encrypt + corp PKI).");
 
     Ok(())
 }

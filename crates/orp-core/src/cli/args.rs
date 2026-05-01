@@ -47,7 +47,9 @@ pub enum Commands {
     ///   orp start --headless              # API-only mode for servers/Pi/embedded
     ///   orp start --no-auth               # Dev shortcut (permissive auth + dev mode)
     Start {
-        /// Override the server port
+        /// Override the server port. Defaults to the value in config.yaml
+        /// (typically 9090 for HTTP). When TLS flags are passed and `--port`
+        /// is not, the default becomes 9443.
         #[arg(short, long)]
         port: Option<u16>,
 
@@ -126,6 +128,28 @@ pub enum Commands {
         /// to peers. Defaults to a per-process UUID.
         #[arg(long, env = "ORP_NODE_ID", value_name = "ID")]
         node_id: Option<String>,
+
+        /// Path to PEM-encoded TLS server certificate (chain). Pair with
+        /// `--tls-key` to enable HTTPS termination via rustls.
+        #[arg(long, value_name = "PATH", requires = "tls_key")]
+        tls_cert: Option<String>,
+
+        /// Path to PEM-encoded TLS server private key. Required with
+        /// `--tls-cert`.
+        #[arg(long, value_name = "PATH", requires = "tls_cert")]
+        tls_key: Option<String>,
+
+        /// Optional path to a PEM bundle of trusted client CAs. When set,
+        /// the server requires every client to present a certificate signed
+        /// by one of these CAs (mTLS). Requires `--tls-cert`/`--tls-key`.
+        #[arg(long, value_name = "PATH", requires_all = ["tls_cert", "tls_key"])]
+        tls_client_ca: Option<String>,
+
+        /// When TLS is active, also bind a plain-HTTP listener on this port
+        /// that 301-redirects every request to the HTTPS origin. Common
+        /// values: 80 (when ORP is fronted directly).
+        #[arg(long, value_name = "PORT", requires_all = ["tls_cert", "tls_key"])]
+        redirect_http: Option<u16>,
     },
 
     /// Connect a data source in one command
@@ -345,6 +369,50 @@ pub enum Commands {
     Completions {
         /// Target shell
         shell: Shell,
+    },
+
+    /// Generate a self-signed TLS certificate for development and testing
+    ///
+    /// Writes `cert.pem` and `key.pem` (or the paths given) suitable for
+    /// `orp start --tls-cert cert.pem --tls-key key.pem`. NOT for production —
+    /// browsers and clients will reject the cert by default. For production,
+    /// see docs/TLS.md (Let's Encrypt + corporate PKI).
+    ///
+    /// Examples:
+    ///   orp gen-cert
+    ///   orp gen-cert --cn orp.example.test --san orp.example.test --san 127.0.0.1
+    ///   orp gen-cert --out-dir /etc/orp/tls --days 90
+    GenCert {
+        /// Output path for the certificate PEM
+        #[arg(long, value_name = "PATH", default_value = "cert.pem")]
+        cert_out: String,
+
+        /// Output path for the private key PEM
+        #[arg(long, value_name = "PATH", default_value = "key.pem")]
+        key_out: String,
+
+        /// Optional output directory. When set, both files are written here
+        /// using their default names (cert.pem, key.pem) unless `--cert-out`
+        /// / `--key-out` are absolute paths.
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<String>,
+
+        /// Common Name (CN) for the certificate subject
+        #[arg(long, default_value = "localhost")]
+        cn: String,
+
+        /// Subject Alternative Names. Repeat the flag for multiple values.
+        /// Accepts DNS names and IP literals. Defaults: localhost, 127.0.0.1, ::1.
+        #[arg(long = "san", value_name = "DNS_OR_IP")]
+        sans: Vec<String>,
+
+        /// Validity period in days
+        #[arg(long, default_value_t = 365)]
+        days: u32,
+
+        /// Overwrite existing files instead of refusing
+        #[arg(long)]
+        force: bool,
     },
 }
 

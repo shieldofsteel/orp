@@ -37,24 +37,32 @@ async fn main() -> Result<()> {
             federation_tls_listen,
             federation_signing_key,
             node_id,
+            tls_cert,
+            tls_key,
+            tls_client_ca,
+            redirect_http,
         } => {
-            cli::commands::run_start(
-                config,
+            cli::commands::run_start(cli::commands::StartArgs {
+                config_path: config,
                 template,
-                port,
+                port_override: port,
                 dev,
                 headless,
                 no_auth,
                 in_memory,
                 bootstrap_admin_key,
-                federation_tls,
+                federation_tls_enabled: federation_tls,
                 federation_cert,
                 federation_key,
                 federation_ca,
                 federation_tls_listen,
                 federation_signing_key,
-                node_id,
-            )
+                local_node_id: node_id,
+                tls_cert,
+                tls_key,
+                tls_client_ca,
+                redirect_http,
+            })
             .await?;
         }
 
@@ -271,6 +279,26 @@ async fn main() -> Result<()> {
 
         cli::args::Commands::Completions { shell } => {
             cli::commands::run_completions(shell);
+        }
+
+        cli::args::Commands::GenCert {
+            cert_out,
+            key_out,
+            out_dir,
+            cn,
+            sans,
+            days,
+            force,
+        } => {
+            cli::commands::run_gen_cert(cli::commands::GenCertArgs {
+                cert_out,
+                key_out,
+                out_dir,
+                cn,
+                sans,
+                days,
+                force,
+            })?;
         }
     }
 
