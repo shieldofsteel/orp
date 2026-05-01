@@ -27,9 +27,23 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 base64 = "0.22"
 hex = "0.4"
 
+# API key hashing — Argon2id (pure Rust, RustCrypto). Replaces the
+# legacy SHA-256-unsalted scheme. Matches OWASP 2023 password-hashing
+# guidance (m=19 MiB, t=2, p=1) by default; see `keystore::ARGON2_PARAMS`.
+argon2 = "0.5"
+
+# Persistent API-key store (Argon2id PHC hashes are written to a
+# `api_keys` table on the same embedded DuckDB instance the rest of ORP
+# uses, so keys survive process restarts). `bundled` keeps the
+# single-binary identity intact — no system DuckDB lib required at run
+# time. Cargo dedupes against the orp-storage dep (same workspace
+# version + features), so this does not link a second copy of DuckDB.
+duckdb = { version = "1.2", features = ["bundled"] }
+
 # Async traits
 async-trait = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 serial_test = "3"
+tempfile = "3"

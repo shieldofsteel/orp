@@ -79,6 +79,17 @@ pub enum Commands {
         /// vanish on shutdown.
         #[arg(long)]
         in_memory: bool,
+
+        /// Seed the API-key store with this admin key on first startup
+        /// (only when the `api_keys` table is empty). Pass the literal raw
+        /// key value (e.g. `orpk_prod_<id>_<plaintext>`); ORP hashes it
+        /// with Argon2id before persisting. If the table is already
+        /// non-empty this flag is ignored. If the table is empty AND
+        /// this flag is unset, ORP generates a random admin key and
+        /// prints it to stderr exactly once — capture it from the
+        /// startup logs and rotate before going to production.
+        #[arg(long, value_name = "RAW_KEY")]
+        bootstrap_admin_key: Option<String>,
     },
 
     /// Connect a data source in one command
