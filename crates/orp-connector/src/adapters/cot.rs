@@ -744,10 +744,12 @@ impl Connector for CotConnector {
     }
 
     fn stats(&self) -> ConnectorStats {
+        // `Some(Utc::now())` would lie to ops dashboards. We don't yet
+        // track the per-event timestamp, so report None until we do.
         ConnectorStats {
             events_processed: self.events_count.load(Ordering::Relaxed),
             errors: self.errors_count.load(Ordering::Relaxed),
-            last_event_timestamp: Some(Utc::now()),
+            last_event_timestamp: None,
             uptime_seconds: 0,
         }
     }

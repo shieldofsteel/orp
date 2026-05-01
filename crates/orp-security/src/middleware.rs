@@ -149,45 +149,79 @@ impl AuthState {
         }
     }
 
-    /// Development mode — permissive only when ORP_DEV_MODE=true.
+    /// Development mode — permissive only when `ORP_DEV_MODE=true` AND
+    /// `ORP_ENV` is empty / `development` / `dev` / `test` / `ci`.
     ///
-    /// **Production safety belt.** The permissive flag also requires
-    /// `ORP_ENV=development` (or `--dev` already having set
-    /// `ORP_DEV_MODE`). If `ORP_ENV` is anything else, an attempt to enable
-    /// permissive mode emits a loud warning and is *ignored* — so leaking
-    /// `ORP_DEV_MODE=true` into prod env doesn't open the front door.
-    pub fn dev() -> Self {
+    /// **Production safety belt.** This constructor refuses to return an
+    /// effectively-broken server: if the operator set `ORP_DEV_MODE=true`
+    /// while `ORP_ENV` looks production-y, [`AuthState::dev`] returns
+    /// [`AuthStateError::DevModeRefusedInProd`]. Callers must either
+    /// (a) drop the dev flag and use [`AuthState::production`] with real
+    /// JWT/API-key services, or (b) explicitly set `ORP_ENV` to a dev
+    /// value. We deliberately surface this as a fatal startup error rather
+    /// than silently denying every request — which is what an earlier
+    /// version of this gate did, leaving the server appearing healthy
+    /// while returning 401/500 to literally every caller.
+    pub fn dev() -> Result<Self, AuthStateError> {
         let env = std::env::var("ORP_ENV").unwrap_or_default();
-        let env_ok = env.is_empty()
-            || env == "development"
-            || env == "dev"
-            || env == "test"
-            || env == "ci";
+        // **Closed by default.** `ORP_ENV` must explicitly be one of the
+        // dev-class names. An unset / empty `ORP_ENV` is *not* treated as
+        // dev — that previously meant a production deploy that simply
+        // forgot to set `ORP_ENV` while inheriting `ORP_DEV_MODE=true`
+        // from a CI script would silently grant admin to every caller.
+        let env_ok = env == "development" || env == "dev" || env == "test" || env == "ci";
         let raw_permissive = std::env::var("ORP_DEV_MODE")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        let permissive = raw_permissive && env_ok;
+
         if raw_permissive && !env_ok {
-            tracing::error!(
-                env = %env,
-                "ORP_DEV_MODE=true but ORP_ENV='{}' — refusing permissive auth. \
-                 Permissive auth is only allowed when ORP_ENV is unset, 'development', 'dev', \
-                 'test', or 'ci'.",
-                env
-            );
+            return Err(AuthStateError::DevModeRefusedInProd { env });
         }
+
+        let permissive = raw_permissive && env_ok;
         if permissive {
             tracing::warn!(
                 "Permissive auth ENABLED — every request is treated as anonymous admin. \
                  NEVER set ORP_DEV_MODE=true in production."
             );
+        } else {
+            tracing::warn!(
+                "AuthState::dev() returning a state with no JWT or API-key service attached. \
+                 Authenticated endpoints will reject every request. Use AuthState::production() \
+                 to wire real auth services for any non-demo deployment."
+            );
         }
-        Self {
+        Ok(Self {
             jwt_service: None,
             api_key_service: None,
             permissive_mode: permissive,
-        }
+        })
     }
+
+    /// Infallible variant of [`Self::dev`] for tests and demos that
+    /// genuinely want the old "best-effort dev state" behaviour.
+    /// Returns an effectively-broken state when env is wrong; do not use
+    /// in any production-bound code path.
+    #[doc(hidden)]
+    pub fn dev_or_broken() -> Self {
+        Self::dev().unwrap_or_else(|_| Self {
+            jwt_service: None,
+            api_key_service: None,
+            permissive_mode: false,
+        })
+    }
+}
+
+/// Errors from constructing an [`AuthState`].
+#[derive(Debug, thiserror::Error)]
+pub enum AuthStateError {
+    #[error(
+        "ORP_DEV_MODE=true but ORP_ENV='{env}' looks production-y. Refusing to start with no \
+         JWT/API-key services attached — that would silently 401/500 every request. Either \
+         unset ORP_DEV_MODE, set ORP_ENV to one of {{development, dev, test, ci}}, or call \
+         AuthState::production() with real services."
+    )]
+    DevModeRefusedInProd { env: String },
 }
 
 /// Authentication error returned as an HTTP response.

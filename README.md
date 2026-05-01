@@ -4,7 +4,7 @@
 
 ### A single binary that does what Palantir charges $50M for.
 
-[![Tests](https://img.shields.io/badge/tests-1113%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
+[![Tests](https://img.shields.io/badge/tests-1122%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
 [![Binary Size](https://img.shields.io/badge/binary-45MB-blue?style=flat-square)](https://github.com/shieldofsteel/orp/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square)](https://www.rust-lang.org)

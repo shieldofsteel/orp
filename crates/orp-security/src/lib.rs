@@ -16,8 +16,9 @@
 //! use orp_security::middleware::{AuthState, AuthContext};
 //! use std::sync::Arc;
 //!
-//! // All requests pass through with admin context
-//! let auth = Arc::new(AuthState::dev());
+//! // All requests pass through with admin context (when ORP_DEV_MODE=true
+//! // and ORP_ENV is unset / development / dev / test / ci).
+//! let auth = Arc::new(AuthState::dev().expect("ORP_ENV gate refused dev mode"));
 //! ```
 //!
 //! ### Production

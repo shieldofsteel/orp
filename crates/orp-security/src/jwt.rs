@@ -242,16 +242,21 @@ impl JwtService {
 
     /// Build the strictest validation profile we accept:
     /// - algorithm pinned (no `none`, no alg-confusion)
-    /// - `exp`, `nbf`, `iss`, `aud`, `sub` are required claims
+    /// - `exp`, `nbf`, `iss`, `aud`, `sub` are *required* (not just
+    ///   "validated when present" — the absence of `nbf` would otherwise
+    ///   silently skip the not-before check)
     /// - configurable `leeway` for clock skew
-    /// - `nbf` validation is on by default (jsonwebtoken's `validate_nbf`)
     fn base_validation(&self) -> Validation {
         let mut validation = Validation::new(self.algorithm());
         validation.set_issuer(&[&self.config.issuer]);
         validation.leeway = self.config.leeway_seconds;
         validation.validate_nbf = true;
         validation.validate_exp = true;
-        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        // `nbf` must be present and valid: jsonwebtoken's `validate_nbf`
+        // alone would only check it if it appears in the claim set, which
+        // means a token without `nbf` would slip through. Listing it in
+        // `required_spec_claims` forces presence.
+        validation.set_required_spec_claims(&["exp", "nbf", "iss", "aud", "sub"]);
         validation
     }
 

@@ -10,7 +10,7 @@ This project follows [Semantic Versioning](https://semver.org/) and [Conventiona
 
 ### New crate
 
-- **`orp-ml`** — first ML seam in ORP. Exposes an `AnomalyScorer` trait so any model (rule-based, statistical, deep) plugs into the same hot path. Ships with `NullScorer`, `OnlineQuantileScorer` (rolling-p99.5 baseline), and a small in-house `IsolationForestScorer` (≈200 LoC, `bincode` model load) — no heavyweight ML dep. `crates/orp-stream/src/processor.rs` calls the scorer in `upsert_entity`; the result lands on entities as `ml_anomaly_score: f32` + `ml_model_id: String` and **augments** (does not replace) the rule-based score.
+- **`orp-ml`** — first ML seam in ORP. Exposes an `AnomalyScorer` trait so any model (rule-based, statistical, deep) plugs into the same hot path. Ships with `NullScorer`, `OnlineQuantileScorer` (rolling-p99.5 baseline), and a small in-house `IsolationForestScorer` (~275 LoC, `bincode` model load) — no heavyweight ML dep. `crates/orp-stream/src/processor.rs` calls the scorer in `upsert_entity`; non-`NullScorer` results land on entities as `ml_anomaly_score: f32` + `ml_model_id: String` and **augments** (does not replace) the rule-based score. The default `NullScorer` is a true no-op — no properties are written — so storage isn't bloated by zero scores from a disabled model.
 
 ### New connector
 
@@ -18,7 +18,7 @@ This project follows [Semantic Versioning](https://semver.org/) and [Conventiona
 
 ### Connector capability expansions
 
-- **GRIB Section 7 (data unpacking)** — `crates/orp-connector/src/adapters/grib.rs` now unpacks Data Representation Template 5.0 (simple packing) per the WMO formula `Y = (R + (X << E)) / 10^D`. GRIB messages now carry actual weather values, not just metadata. Templates other than 5.0 still return metadata-only with a warning rather than failing.
+- **GRIB Section 7 (data unpacking)** — `crates/orp-connector/src/adapters/grib.rs` now unpacks Data Representation Template 5.0 (simple packing) per the WMO formula `Y = (R + X * 2^E) / 10^D` (the binary-scale `E` may be negative, so it's a real exponentiation, not a left-shift). GRIB messages now carry actual weather values, not just metadata. Templates other than 5.0 still return metadata-only with a warning rather than failing.
 - **Universal-ingest CSV** — `csv_watcher.rs` switched from naive `line.split(',')` to the `csv` crate. Quoted fields containing commas (`"Doe, John",51.5,-0.1`) parse correctly instead of being silently dropped.
 - **NFFI track-id collision fix** — `nffi.rs` no longer falls back to index-based IDs (`track-0`, `track-1`) for unnamed tracks. Synthesises a stable hash of `(name, lat, lon, affiliation)` so two distinct unnamed tracks don't merge during entity resolution.
 
@@ -66,7 +66,7 @@ This project follows [Semantic Versioning](https://semver.org/) and [Conventiona
 
 - 13 crates (added `orp-ml`)
 - 34 protocol adapters (added MAVLink)
-- 1,061 backend test functions across the workspace; this wave's verified passing test counts: orp-connector 538 / orp-stream 93 / orp-ml 17 / orp-security 80 / orp-storage 53 / orp-core 154 / cross-crate 80 → **1,015 passing in the most recent verification gauntlet**, 0 failing.
+- 1,122 backend tests passing across the workspace (orp-connector 547 / orp-core 154 / orp-stream 93 / orp-security 80 / orp-storage 53 / orp-ml 17 / cross-crate 178 + small crates), 0 failing.
 - 45 MB stripped release binary (Mach-O arm64) — verified, persistence test passed end-to-end.
 
 ---

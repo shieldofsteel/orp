@@ -260,8 +260,39 @@ impl Connector for HttpPollerConnector {
                         errors_count.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    // Try real HTTP request
-                    match reqwest::get(url).await {
+                    // Build a redirect-aware client: a 302 to an internal
+                    // address would defeat the SSRF guard above. Re-check
+                    // every redirect target against `is_url_safe` and abort
+                    // the request if any hop fails policy.
+                    let allow_private_for_redirects = allow_private;
+                    let policy = reqwest::redirect::Policy::custom(move |attempt| {
+                        // Cap at 5 hops and re-check every target via the
+                        // SSRF guard so a 302 to an internal address can't
+                        // bypass the up-front check.
+                        if attempt.previous().len() >= 5 {
+                            return attempt.error("redirect chain exceeded 5 hops");
+                        }
+                        let target = attempt.url().to_string();
+                        match is_url_safe(&target, allow_private_for_redirects) {
+                            Ok(()) => attempt.follow(),
+                            Err(reason) => attempt.error(format!(
+                                "SSRF guard blocked redirect to '{target}': {reason}"
+                            )),
+                        }
+                    });
+                    let client = match reqwest::Client::builder()
+                        .redirect(policy)
+                        .build()
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(connector_id = %connector_id, error = %e, "HTTP poller client build failed");
+                            errors_count.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+                    // Try real HTTP request via the policy-aware client.
+                    match client.get(url).send().await {
                         Ok(resp) => match resp.json::<serde_json::Value>().await {
                             Ok(json) => {
                                 let events = HttpPollerConnector::extract_entities(
@@ -358,10 +389,12 @@ impl Connector for HttpPollerConnector {
     }
 
     fn stats(&self) -> ConnectorStats {
+        // `Some(Utc::now())` would lie to ops dashboards. Report None
+        // until per-event timestamp tracking is wired in.
         ConnectorStats {
             events_processed: self.events_count.load(Ordering::Relaxed),
             errors: self.errors_count.load(Ordering::Relaxed),
-            last_event_timestamp: Some(Utc::now()),
+            last_event_timestamp: None,
             uptime_seconds: 0,
         }
     }

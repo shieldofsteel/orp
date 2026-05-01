@@ -525,7 +525,13 @@ pub async fn run_start(
 
     let auth_state: Arc<AuthState> = if is_dev_mode {
         tracing::warn!("⚠️  ORP_DEV_MODE is enabled — authentication is permissive");
-        Arc::new(AuthState::dev())
+        // Refuse to boot if `ORP_DEV_MODE=true` is leaking into a
+        // production-y `ORP_ENV`: the alternative was silently denying
+        // every request with a misleading error.
+        Arc::new(
+            AuthState::dev()
+                .map_err(|e| anyhow::anyhow!("auth state init failed: {}", e))?,
+        )
     } else {
         match JwtService::from_env() {
             Ok(jwt_svc) => {

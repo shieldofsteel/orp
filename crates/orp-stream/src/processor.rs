@@ -279,25 +279,35 @@ impl DefaultStreamProcessor {
                 buf.iter().copied().collect()
             };
             if let Some(features) = extract_kinematic_features(&event.entity_id, &history_snapshot) {
-                if features.len() == self.anomaly_scorer.feature_dim()
-                    || self.anomaly_scorer.feature_dim() == 0
-                {
-                    let ml_score = self.anomaly_scorer.score(&features);
-                    entity
-                        .properties
-                        .insert("ml_anomaly_score".into(), json!(ml_score));
-                    entity.properties.insert(
-                        "ml_model_id".into(),
-                        json!(self.anomaly_scorer.model_id()),
-                    );
-                } else {
-                    tracing::debug!(
-                        entity_id = %event.entity_id,
-                        model = self.anomaly_scorer.model_id(),
-                        expected = self.anomaly_scorer.feature_dim(),
-                        got = features.len(),
-                        "Skipping ML scoring: feature dim mismatch",
-                    );
+                // Skip the entire write path for the default `NullScorer` —
+                // otherwise every entity would carry `ml_anomaly_score: 0.0`
+                // and `ml_model_id: "null-v0"`, bloating storage and giving
+                // downstream consumers a false "ML is on" signal. Real
+                // scorers (any non-`null-v0` model_id) execute as before.
+                if self.anomaly_scorer.model_id() != "null-v0" {
+                    if features.len() == self.anomaly_scorer.feature_dim()
+                        || self.anomaly_scorer.feature_dim() == 0
+                    {
+                        let ml_score = self.anomaly_scorer.score(&features);
+                        entity
+                            .properties
+                            .insert("ml_anomaly_score".into(), json!(ml_score));
+                        entity.properties.insert(
+                            "ml_model_id".into(),
+                            json!(self.anomaly_scorer.model_id()),
+                        );
+                    } else {
+                        // Promote dim mismatch to `warn!` so a misconfigured
+                        // model surfaces in operator logs rather than silently
+                        // skipping every event.
+                        tracing::warn!(
+                            entity_id = %event.entity_id,
+                            model = self.anomaly_scorer.model_id(),
+                            expected = self.anomaly_scorer.feature_dim(),
+                            got = features.len(),
+                            "Skipping ML scoring: feature dim mismatch",
+                        );
+                    }
                 }
             }
         }

@@ -375,10 +375,14 @@ impl Connector for MavlinkConnector {
     }
 
     fn stats(&self) -> ConnectorStats {
+        // Returning `Some(Utc::now())` would lie: ops dashboards keying off
+        // "last event timestamp" would see a fresh value even when no
+        // events have flowed. We don't currently track the per-event
+        // timestamp in this adapter, so report `None` until we do.
         ConnectorStats {
             events_processed: self.events_count.load(Ordering::Relaxed),
             errors: self.errors_count.load(Ordering::Relaxed),
-            last_event_timestamp: Some(Utc::now()),
+            last_event_timestamp: None,
             uptime_seconds: 0,
         }
     }
