@@ -6,6 +6,21 @@ This project follows [Semantic Versioning](https://semver.org/) and [Conventiona
 
 ---
 
+## [Unreleased] — 2026-05-02 v0.3.1 hardening + capability wave (continued)
+
+### Additional security + correctness commits
+
+- **F5 — CSRF cookie HMAC + constant-time verify.** `sign_csrf_state` switched from `SHA256(state || secret)` (length-extension forgeable) to `HMAC-SHA256(secret, state)`; `verify_csrf_cookie` switched from `String ==` (variable-time) to `hmac::Mac::verify_slice` (constant-time). 8 regression tests cover roundtrip, tampered tag, tampered state, wrong secret, missing separator, non-hex tag, state-changes-tag, secret-changes-tag.
+- **Persistent audit chain — DuckDB timestamp round-trip fix.** Pre-existing master bug. `chrono::Utc::now()` returned nanosecond precision but DuckDB TIMESTAMP truncated to microseconds, so the chain hash computed at insert (full ns RFC3339) diverged from the hash recomputed during replay (truncated read-back). macOS local sometimes dodged this when the clock landed on a 0-ns boundary; Linux CI surfaced it consistently. Fix truncates `Utc::now()` to microseconds via `with_nanosecond()` before computing the hash. New `truncate_to_micros_drops_only_sub_microsecond_bits` regression test.
+- **Resolver bonus — `EntityResolver` plumbing through the AuditLogger trait.** P-audit Wave 2 bonus item. `StructuralEntityResolver::with_audit(storage, audit)` and `attach_audit(audit)` constructors; `record_match` now routes feedback through the hash-chained Ed25519-signed logger. The legacy `Storage::log_audit` bypass is removed. New `record_match_routes_through_audit_logger` test.
+
+### TAK Protocol v1 — first Rust implementation
+
+- **`crates/orp-tak`** — wire codec for TAK Protocol v1, the binary envelope ATAK / WinTAK / iTAK clients use to wrap CoT XML over UDP multicast (mesh) and TCP/TLS (stream). Reference impls are Python (`takproto`) and Go (`gotak`); this crate ports their framing layer to Rust. No first-class Rust TAK crate existed before.
+- **Wire formats** — Mesh `[0xBF, 0x01, 0xBF, <CoT XML>]` (UDP datagram-bounded) and Stream `[0xBF, varint(N), <CoT XML[N]>]` (length-prefixed for TCP). Encode + decode functions for both flavours, plus a `TakFrameKind::classify(buf)` dispatcher for adapters that accept both on the same port.
+- **Hardened** — `MAX_VARINT_BYTES=5` + `MAX_PAYLOAD_BYTES=1 MiB` ceilings reject hostile or runaway length prefixes before any allocation; partial reads return `PayloadTruncated` so callers can accumulate from a TCP socket and retry.
+- **20 unit tests + 2 doc tests** — varint round-trips, both framings happy/sad paths, two-frames-in-one-buffer parsing, oversize rejection, the 0x01-byte disambiguation case where mesh and stream framings collide on the third byte.
+
 ## [Unreleased] — 2026-05-01 v0.3.1 hardening + capability wave
 
 ### Security — media relay (closes audit C1/C2/C3 + H1-H4)
