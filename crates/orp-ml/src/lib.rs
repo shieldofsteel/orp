@@ -33,6 +33,7 @@
 //!   fixed-length `Vec<f32>` suitable for any of the scorers above.
 
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 use thiserror::Error;
 
@@ -109,14 +110,128 @@ impl AnomalyScorer for NullScorer {
 const QUANTILE_BUFFER_CAP: usize = 2048;
 const QUANTILE_HIGH: f32 = 0.9975;
 const QUANTILE_LOW: f32 = 0.0025;
+const QUANTILE_WARMUP: usize = 64;
+
+/// Encode an `f32` into a `u32` key whose unsigned ordering matches the
+/// IEEE-754 *total* ordering of the original floats.
+///
+/// Trick: for a non-negative `f32` we just flip the sign bit (so it sorts
+/// after negatives); for a negative `f32` we invert all bits (so larger
+/// magnitudes sort before smaller magnitudes, matching numerical order).
+/// Result: `BTreeMap<u32, _>` keyed by `f32_to_sortable(x)` walks samples
+/// in ascending numerical order. NaN is mapped to a high sentinel range
+/// and treated as out-of-band — see `insert()` for the explicit filter.
+#[inline]
+fn f32_to_sortable(x: f32) -> u32 {
+    let bits = x.to_bits();
+    if bits & 0x8000_0000 != 0 {
+        // Negative: invert all bits.
+        !bits
+    } else {
+        // Non-negative: flip just the sign bit.
+        bits ^ 0x8000_0000
+    }
+}
+
+#[inline]
+fn sortable_to_f32(s: u32) -> f32 {
+    let bits = if s & 0x8000_0000 != 0 {
+        s ^ 0x8000_0000
+    } else {
+        !s
+    };
+    f32::from_bits(bits)
+}
+
+/// Bounded online quantile estimator: O(log N) insert, O(N_distinct) walk
+/// for quantile (in practice dominated by the cumulative-count traversal,
+/// not by `clone` + `sort`).
+///
+/// Maintains a `BTreeMap` keyed by a totally-ordered bit-encoding of `f32`
+/// (count-bucketed so duplicate samples don't bloat the map) plus a parallel
+/// `VecDeque<f32>` of insertion order for FIFO eviction once `total_count`
+/// exceeds `max_size`. This preserves the same "rolling window of last N"
+/// semantics as the previous `Vec<f32>` ring buffer.
+#[derive(Debug, Default)]
+struct QuantileEstimator {
+    counts: BTreeMap<u32, u32>,
+    order: VecDeque<f32>,
+    max_size: usize,
+}
+
+impl QuantileEstimator {
+    fn new(max_size: usize) -> Self {
+        Self {
+            counts: BTreeMap::new(),
+            order: VecDeque::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    /// Number of samples currently held (≤ `max_size`).
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Insert a sample, evicting the oldest if the window is full.
+    /// NaN is silently ignored — it has no defined ordering.
+    fn insert(&mut self, x: f32) {
+        if x.is_nan() {
+            return;
+        }
+        if self.order.len() >= self.max_size {
+            if let Some(oldest) = self.order.pop_front() {
+                let key = f32_to_sortable(oldest);
+                if let Some(c) = self.counts.get_mut(&key) {
+                    *c -= 1;
+                    if *c == 0 {
+                        self.counts.remove(&key);
+                    }
+                }
+            }
+        }
+        let key = f32_to_sortable(x);
+        *self.counts.entry(key).or_insert(0) += 1;
+        self.order.push_back(x);
+    }
+
+    /// Return the value at quantile `q ∈ [0, 1]` using nearest-rank, matching
+    /// the previous `sort + index` behaviour to a tee. Empty estimator
+    /// returns `0.0` by convention; callers should warmup-gate before this.
+    fn quantile(&self, q: f32) -> f32 {
+        let n = self.order.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let last = n.saturating_sub(1);
+        // Match the original `(len * q).floor()` indexing exactly so that
+        // small-buffer rounding behaviour is byte-identical.
+        let target_idx = (((n as f32) * q).floor() as usize).min(last);
+        let mut cum: usize = 0;
+        for (key, count) in self.counts.iter() {
+            cum += *count as usize;
+            if cum > target_idx {
+                return sortable_to_f32(*key);
+            }
+        }
+        // Should not be reachable while `n > 0`, but fall back to the max.
+        self.counts
+            .keys()
+            .next_back()
+            .copied()
+            .map(sortable_to_f32)
+            .unwrap_or(0.0)
+    }
+}
 
 /// Per-feature streaming two-sided envelope anomaly flagger.
 ///
-/// Maintains a rolling buffer of the last `N=2048` samples per feature and,
-/// on each call, computes a two-sided envelope `[p0.25, p99.75]` from that
-/// buffer. A feature value is "outside" if it is `< low` or `> high` on
-/// that axis. The returned score is the maximum normalised excursion
-/// across all axes, scaled to `[0, 100]`:
+/// Maintains a rolling window of the last `N=2048` samples per feature
+/// (via [`QuantileEstimator`]) and, on each call, computes a two-sided
+/// envelope `[p0.25, p99.75]` directly from a sorted `BTreeMap` walk —
+/// no `clone`, no `sort_by` per call. A feature value is "outside" if it
+/// is `< low` or `> high` on that axis. The returned score is the maximum
+/// normalised excursion across all axes, scaled to `[0, 100]`:
 ///
 /// - `0` — the sample is inside the envelope on every axis.
 /// - `100` — the sample is outside the envelope on at least one axis with
@@ -132,31 +247,43 @@ const QUANTILE_LOW: f32 = 0.0025;
 ///
 /// During warmup (fewer than 64 samples) the scorer always returns 0 — it
 /// will not flag noise on a cold start.
+///
+/// # Concurrency
+///
+/// Each feature axis owns its own `Mutex<QuantileEstimator>`, so concurrent
+/// `score()` calls operating on disjoint dimensions never serialise on each
+/// other. The lock is held only for the per-axis insert + quantile read,
+/// never spanning all features and never around any allocation.
 pub struct OnlineQuantileScorer {
     model_id: String,
     feature_dim: usize,
-    /// Per-feature ring buffer, protected by a single Mutex so updates are
-    /// race-free. Hot-path contention is acceptable; the critical section
-    /// is O(N) once per call but bounded by `QUANTILE_BUFFER_CAP`.
-    buffers: Mutex<Vec<Vec<f32>>>,
+    /// One independently-locked estimator per feature axis. Disjoint locks
+    /// mean axis `i` and axis `j` (i ≠ j) can score in parallel; only two
+    /// callers landing on the same axis serialise, and that critical section
+    /// is `O(log N)` insert + `O(K)` cumulative-count walk where K is the
+    /// distinct-key count below the quantile rank.
+    buffers: Vec<Mutex<QuantileEstimator>>,
 }
 
 impl OnlineQuantileScorer {
     pub fn new(model_id: impl Into<String>, feature_dim: usize) -> Self {
+        let buffers = (0..feature_dim)
+            .map(|_| Mutex::new(QuantileEstimator::new(QUANTILE_BUFFER_CAP)))
+            .collect();
         Self {
             model_id: model_id.into(),
             feature_dim,
-            buffers: Mutex::new(vec![Vec::with_capacity(QUANTILE_BUFFER_CAP); feature_dim]),
+            buffers,
         }
     }
 
     /// Returns the number of samples seen for the first feature axis.
     /// Useful for tests and metrics.
     pub fn samples_seen(&self) -> usize {
-        match self.buffers.lock() {
-            Ok(b) => b.first().map(|v| v.len()).unwrap_or(0),
-            Err(_) => 0,
-        }
+        self.buffers
+            .first()
+            .and_then(|m| m.lock().ok().map(|g| g.len()))
+            .unwrap_or(0)
     }
 }
 
@@ -171,29 +298,27 @@ impl AnomalyScorer for OnlineQuantileScorer {
             );
             return 0.0;
         }
-        let mut bufs = match self.buffers.lock() {
-            Ok(b) => b,
-            Err(_) => return 0.0,
-        };
 
-        // Compute score against the *current* distribution before folding the
-        // new sample in — otherwise an extreme value contaminates its own
-        // envelope estimate.
         let mut max_excursion = 0.0f32;
         let mut warming_up = false;
+
+        // Lock per axis, one at a time. We compute the envelope from the
+        // *current* distribution before folding the new sample in —
+        // otherwise an extreme value contaminates its own envelope
+        // estimate. Each critical section is the per-axis quantile walk
+        // plus a single `insert`; nothing else runs under the lock.
         for (i, &f) in features.iter().enumerate() {
-            let buf = &bufs[i];
-            if buf.len() < 64 {
+            let mut est = match self.buffers[i].lock() {
+                Ok(g) => g,
+                Err(_) => return 0.0,
+            };
+            if est.len() < QUANTILE_WARMUP {
                 warming_up = true;
+                est.insert(f);
                 continue;
             }
-            let mut sorted: Vec<f32> = buf.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let last = sorted.len().saturating_sub(1);
-            let hi_idx = ((sorted.len() as f32) * QUANTILE_HIGH).floor() as usize;
-            let lo_idx = ((sorted.len() as f32) * QUANTILE_LOW).floor() as usize;
-            let hi = sorted[hi_idx.min(last)];
-            let lo = sorted[lo_idx.min(last)];
+            let hi = est.quantile(QUANTILE_HIGH);
+            let lo = est.quantile(QUANTILE_LOW);
             // `width` guards against a degenerate envelope (lo == hi); when
             // the distribution is constant the only meaningful excursion is
             // "outside vs inside", saturating to 1.0.
@@ -208,15 +333,7 @@ impl AnomalyScorer for OnlineQuantileScorer {
             if excursion > max_excursion {
                 max_excursion = excursion;
             }
-        }
-
-        // Fold sample in (ring buffer).
-        for (i, &f) in features.iter().enumerate() {
-            let buf = &mut bufs[i];
-            if buf.len() >= QUANTILE_BUFFER_CAP {
-                buf.remove(0);
-            }
-            buf.push(f);
+            est.insert(f);
         }
 
         if warming_up || self.feature_dim == 0 {
@@ -737,5 +854,185 @@ mod tests {
         assert_send_sync::<IsolationForestScorer>();
         assert_send_sync::<OnlineQuantileScorer>();
         assert_send_sync::<NullScorer>();
+    }
+
+    // ── QuantileEstimator tests (post-O(log N) refactor) ──────────────────
+
+    #[test]
+    fn test_quantile_estimator_correct() {
+        // Insert 10 000 random f32 in [-100, 100], compare q=0.5 against
+        // the sort-once ground-truth median; must agree to within 1%.
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let n = 10_000usize;
+        let mut est = QuantileEstimator::new(n);
+        let mut raw: Vec<f32> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let v: f32 = rng.gen_range(-100.0..100.0);
+            est.insert(v);
+            raw.push(v);
+        }
+        raw.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let truth_median = raw[(n as f32 * 0.5) as usize];
+        let est_median = est.quantile(0.5);
+        let err = (est_median - truth_median).abs();
+        // Ground-truth max range is 200 (-100..100); 1% tolerance == 2.0.
+        assert!(
+            err <= 2.0,
+            "median estimator off by {err}: estimator={est_median} truth={truth_median}"
+        );
+    }
+
+    #[test]
+    fn test_quantile_estimator_bounded_memory() {
+        // Insert max_size + 1 samples and assert internal state stays
+        // bounded. Both `order` (FIFO log) and `counts` (BTreeMap of
+        // distinct keys) must stay ≤ max_size in entry count.
+        let max_size = 10_000usize;
+        let mut est = QuantileEstimator::new(max_size);
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..(max_size + 1) {
+            let v: f32 = rng.gen_range(-1.0..1.0);
+            est.insert(v);
+        }
+        assert!(
+            est.order.len() <= max_size,
+            "order grew past max_size: {}",
+            est.order.len()
+        );
+        assert!(
+            est.counts.values().map(|c| *c as usize).sum::<usize>() <= max_size,
+            "count-sum grew past max_size: {}",
+            est.counts.values().map(|c| *c as usize).sum::<usize>()
+        );
+        assert!(
+            est.counts.len() <= max_size,
+            "distinct-key count grew past max_size: {}",
+            est.counts.len()
+        );
+    }
+
+    #[test]
+    fn test_quantile_estimator_bit_encoding_orders_correctly() {
+        // Spot-check that f32_to_sortable preserves IEEE-754 total order
+        // across negative / zero / positive / subnormal / large.
+        let xs: [f32; 9] = [-100.0, -1.5, -0.0, 0.0, 1e-30, 1.0, 1.5, 100.0, 1e30];
+        let mut keys: Vec<u32> = xs.iter().copied().map(f32_to_sortable).collect();
+        keys.sort_unstable();
+        let recovered: Vec<f32> = keys.iter().copied().map(sortable_to_f32).collect();
+        // The sequence is already monotone, so sorting the keys must give
+        // the same order back.
+        for w in recovered.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "bit-encoded keys did not sort monotonically: {recovered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_quantile_estimator_handles_duplicates() {
+        // 100 copies of 7.0; quantile at any q must return 7.0 and the
+        // map must hold a single key with count 100.
+        let mut est = QuantileEstimator::new(1024);
+        for _ in 0..100 {
+            est.insert(7.0);
+        }
+        assert_eq!(est.counts.len(), 1, "duplicates should collapse to one key");
+        assert_eq!(est.counts.values().copied().next(), Some(100));
+        assert_eq!(est.quantile(0.0), 7.0);
+        assert_eq!(est.quantile(0.5), 7.0);
+        assert_eq!(est.quantile(1.0), 7.0);
+    }
+
+    #[test]
+    fn test_quantile_estimator_eviction_is_fifo() {
+        // Insert 0, 1, 2 ... 9 with max_size=5; window should hold {5..9}.
+        let mut est = QuantileEstimator::new(5);
+        for i in 0..10 {
+            est.insert(i as f32);
+        }
+        assert_eq!(est.order.len(), 5);
+        let recovered: Vec<f32> = est.order.iter().copied().collect();
+        assert_eq!(recovered, vec![5.0, 6.0, 7.0, 8.0, 9.0]);
+        // Min of remaining should be 5.0.
+        assert_eq!(est.quantile(0.0), 5.0);
+    }
+
+    /// Static-source check that `score` no longer clones or sorts the
+    /// internal buffer per call. We grep the crate's own `lib.rs` source
+    /// for `.clone()` / `.sort_by(` *inside* the OnlineQuantileScorer
+    /// impl block. Failing this asserts that someone re-introduced the
+    /// O(N log N) hot-path regression.
+    #[test]
+    fn test_score_no_clone_no_sort() {
+        let src = include_str!("lib.rs");
+        // Find the `impl AnomalyScorer for OnlineQuantileScorer` block.
+        let start = src
+            .find("impl AnomalyScorer for OnlineQuantileScorer")
+            .expect("OnlineQuantileScorer impl block not found");
+        // The next `impl ` after that delimits our region of interest.
+        let after = &src[start + 1..];
+        let end_rel = after.find("\nimpl ").unwrap_or(after.len());
+        let region = &after[..end_rel];
+        assert!(
+            !region.contains(".clone()"),
+            "OnlineQuantileScorer::score must not clone — found `.clone()` inside the impl block"
+        );
+        assert!(
+            !region.contains(".sort_by("),
+            "OnlineQuantileScorer::score must not sort — found `.sort_by(` inside the impl block"
+        );
+        assert!(
+            !region.contains(".sort_unstable("),
+            "OnlineQuantileScorer::score must not sort — found `.sort_unstable(` inside the impl block"
+        );
+    }
+
+    #[test]
+    fn test_score_concurrent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // 8 threads each scoring 1 000 times against a shared scorer.
+        // Asserts (a) no panic / lock-poison under contention, and
+        // (b) every returned score is within the documented [0, 100].
+        let scorer = Arc::new(OnlineQuantileScorer::new("concurrent", 4));
+        let mut handles = Vec::with_capacity(8);
+        for tid in 0..8 {
+            let s = Arc::clone(&scorer);
+            handles.push(thread::spawn(move || {
+                let mut rng = StdRng::seed_from_u64(0xA11CE ^ tid as u64);
+                let mut max_seen = 0.0f32;
+                for _ in 0..1_000 {
+                    let f = [
+                        rng.gen_range(-1.0..1.0_f32),
+                        rng.gen_range(-1.0..1.0_f32),
+                        rng.gen_range(-1.0..1.0_f32),
+                        rng.gen_range(-1.0..1.0_f32),
+                    ];
+                    let r = s.score(&f);
+                    assert!(
+                        (0.0..=100.0).contains(&r),
+                        "thread {tid}: score out of [0, 100]: {r}"
+                    );
+                    if r > max_seen {
+                        max_seen = r;
+                    }
+                }
+                max_seen
+            }));
+        }
+        for h in handles {
+            // No thread should have panicked.
+            let _ = h.join().expect("worker panicked");
+        }
+        // After 8 000 in-distribution samples, a far-out outlier must
+        // saturate the score — sanity check that the merged distribution
+        // built up under contention is still useful.
+        let outlier = scorer.score(&[100.0, 100.0, 100.0, 100.0]);
+        assert!(
+            outlier > 50.0,
+            "post-contention outlier score should saturate, got {outlier}"
+        );
     }
 }

@@ -140,19 +140,71 @@ fn unauthorized_response(reason: &str) -> axum::response::Response {
         .into_response()
 }
 
+/// Resolve the per-connection identity from the request before upgrade.
+///
+/// Returns `Err(reason)` on auth failure; the caller turns that into a 401.
+/// Extracted from [`ws_handler`] so each branch can be unit-tested without
+/// spinning up an axum router or a real WebSocket.
+pub(crate) async fn resolve_ws_auth(
+    auth_state: &orp_security::AuthState,
+    bearer_jwt: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<WsAuth, &'static str> {
+    if let Some(token) = bearer_jwt {
+        match auth_state.jwt_service.as_ref() {
+            Some(jwt_svc) => match jwt_svc.validate_token(token) {
+                Ok(claims) => Ok(WsAuth::from_claims(claims)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "WebSocket JWT rejected");
+                    Err("Invalid or expired token")
+                }
+            },
+            None if auth_state.permissive_mode => {
+                // Dev-mode safety net: no JWT service configured, but a token
+                // was offered. Treat as permissive-dev rather than 500.
+                tracing::warn!(
+                    "WebSocket received JWT but no jwt_service is configured; \
+                     falling through to permissive-dev identity"
+                );
+                Ok(WsAuth::permissive_dev())
+            }
+            None => Err("Authentication not configured"),
+        }
+    } else if let Some(key) = api_key {
+        match auth_state.api_key_service.as_ref() {
+            Some(svc) => match svc.validate_key(key).await {
+                Ok(result) if result.is_revoked => Err("API key has been revoked"),
+                Ok(result) if result.is_expired => Err("API key has expired"),
+                Ok(result) => Ok(WsAuth::from_api_key(result)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "WebSocket API key rejected");
+                    Err("Invalid API key")
+                }
+            },
+            None if auth_state.permissive_mode => Ok(WsAuth::permissive_dev()),
+            None => Err("API key auth not configured"),
+        }
+    } else if auth_state.permissive_mode {
+        tracing::warn!(
+            "WebSocket admitted in permissive (dev) mode — synthetic admin identity. \
+             Refuse this if you see it in production."
+        );
+        Ok(WsAuth::permissive_dev())
+    } else {
+        Err("Missing authentication credentials")
+    }
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(params): Query<WsParams>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    // ─── Resolve credentials ─────────────────────────────────────────────
-    //
     // Priority: Authorization header → ?token query param → X-API-Key header.
     // Browsers can't easily set custom headers on a `new WebSocket()`, so the
     // ?token query path remains the primary JWT carrier; the `Authorization`
     // header is honoured for non-browser clients (CLI, server-to-server).
-
     let bearer_jwt = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
@@ -165,56 +217,15 @@ pub async fn ws_handler(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // ─── Validate and build WsAuth ────────────────────────────────────────
-
-    let auth: WsAuth = if let Some(token) = bearer_jwt {
-        // JWT path — must be valid; on success we *carry* the claims.
-        match state.auth_state.jwt_service.as_ref() {
-            Some(jwt_svc) => match jwt_svc.validate_token(&token) {
-                Ok(claims) => WsAuth::from_claims(claims),
-                Err(e) => {
-                    tracing::warn!(error = %e, "WebSocket JWT rejected");
-                    return unauthorized_response("Invalid or expired token");
-                }
-            },
-            None if state.auth_state.permissive_mode => {
-                // Dev-mode safety net: no JWT service configured, but a token
-                // was offered. Treat as permissive-dev rather than 500.
-                tracing::warn!(
-                    "WebSocket received JWT but no jwt_service is configured; \
-                     falling through to permissive-dev identity"
-                );
-                WsAuth::permissive_dev()
-            }
-            None => {
-                return unauthorized_response("Authentication not configured");
-            }
-        }
-    } else if let Some(key) = api_key {
-        // API key path — validate the same way the HTTP middleware does.
-        match state.auth_state.api_key_service.as_ref() {
-            Some(svc) => match svc.validate_key(&key).await {
-                Ok(result) if result.is_revoked => {
-                    return unauthorized_response("API key has been revoked");
-                }
-                Ok(result) if result.is_expired => {
-                    return unauthorized_response("API key has expired");
-                }
-                Ok(result) => WsAuth::from_api_key(result),
-                Err(e) => {
-                    tracing::warn!(error = %e, "WebSocket API key rejected");
-                    return unauthorized_response("Invalid API key");
-                }
-            },
-            None if state.auth_state.permissive_mode => WsAuth::permissive_dev(),
-            None => return unauthorized_response("API key auth not configured"),
-        }
-    } else if state.auth_state.permissive_mode {
-        // Dev mode with no credentials — admit and log.
-        tracing::debug!("WebSocket connection in permissive mode (no credentials)");
-        WsAuth::permissive_dev()
-    } else {
-        return unauthorized_response("Missing authentication credentials");
+    let auth = match resolve_ws_auth(
+        state.auth_state.as_ref(),
+        bearer_jwt.as_deref(),
+        api_key.as_deref(),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(reason) => return unauthorized_response(reason),
     };
 
     ws.on_upgrade(move |socket| handle_socket(socket, state, auth))
@@ -234,6 +245,7 @@ fn can_see_entity(
     abac: &orp_security::AbacEngine,
     user_sub: &str,
     user_permissions: &[String],
+    user_org_id: Option<&str>,
     entity_type: &str,
     entity_id: &str,
 ) -> bool {
@@ -246,7 +258,7 @@ fn can_see_entity(
             } else {
                 None
             },
-            org_id: None,
+            org_id: user_org_id.map(|s| s.to_string()),
             attributes: std::collections::HashMap::new(),
         },
         action: "entities:read".to_string(),
@@ -314,6 +326,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, auth: WsAuth
     // produces zero deliveries instead of full admin replay.
     let ws_user_sub = auth.subject.clone();
     let ws_user_permissions = auth.permissions.clone();
+    let ws_user_org_id = auth.org_id.clone();
 
     loop {
         tokio::select! {
@@ -413,6 +426,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, auth: WsAuth
                                 &state.abac_engine,
                                 &ws_user_sub,
                                 &ws_user_permissions,
+                                ws_user_org_id.as_deref(),
                                 &event_entity_type,
                                 &event_entity_id,
                             ) {
@@ -451,4 +465,195 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, auth: WsAuth
     }
 
     tracing::info!(subject = %ws_user_sub, "WebSocket client disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orp_security::{
+        AbacEngine, ApiKeyService, AuthState, CreateApiKeyRequest, JwtConfig, JwtService,
+    };
+
+    fn make_jwt_service() -> JwtService {
+        let config = JwtConfig {
+            hs256_secret: Some(b"test-secret-do-not-use-in-prod-32bytes!!".to_vec()),
+            ..JwtConfig::default()
+        };
+        JwtService::new(config).expect("jwt service")
+    }
+
+    #[tokio::test]
+    async fn test_ws_uses_jwt_subject() {
+        let jwt_svc = make_jwt_service();
+        let token = jwt_svc
+            .issue_token(
+                "alice",
+                Some("alice@example.com"),
+                None,
+                Some("org-acme"),
+                vec!["entities:read".to_string()],
+            )
+            .unwrap();
+
+        let auth_state = AuthState {
+            jwt_service: Some(Arc::new(jwt_svc)),
+            api_key_service: None,
+            permissive_mode: false,
+        };
+
+        let auth = resolve_ws_auth(&auth_state, Some(&token), None)
+            .await
+            .expect("auth resolves");
+
+        assert_eq!(auth.subject, "alice");
+        assert_eq!(auth.permissions, vec!["entities:read".to_string()]);
+        assert_eq!(auth.org_id.as_deref(), Some("org-acme"));
+        assert_eq!(auth.method, WsAuthMethod::Jwt);
+    }
+
+    #[tokio::test]
+    async fn test_ws_respects_jwt_permissions() {
+        // JWT with empty permissions → ABAC denies non-admin reads.
+        let jwt_svc = make_jwt_service();
+        let token = jwt_svc
+            .issue_token("bob", None, None, None, vec![])
+            .unwrap();
+
+        let auth_state = AuthState {
+            jwt_service: Some(Arc::new(jwt_svc)),
+            api_key_service: None,
+            permissive_mode: false,
+        };
+        let auth = resolve_ws_auth(&auth_state, Some(&token), None)
+            .await
+            .unwrap();
+
+        assert_eq!(auth.subject, "bob");
+        assert!(auth.permissions.is_empty());
+
+        // Default-deny ABAC engine — empty permissions must produce a deny.
+        let abac = AbacEngine::new();
+        let allowed = can_see_entity(&abac, &auth.subject, &auth.permissions, None, "ship", "v-1");
+        assert!(
+            !allowed,
+            "JWT with empty permissions must NOT see entities under default-deny ABAC"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_admin_jwt() {
+        let jwt_svc = make_jwt_service();
+        let token = jwt_svc
+            .issue_token("carol", None, None, None, vec!["admin".to_string()])
+            .unwrap();
+
+        let auth_state = AuthState {
+            jwt_service: Some(Arc::new(jwt_svc)),
+            api_key_service: None,
+            permissive_mode: false,
+        };
+        let auth = resolve_ws_auth(&auth_state, Some(&token), None)
+            .await
+            .unwrap();
+
+        assert_eq!(auth.subject, "carol");
+        assert_eq!(auth.permissions, vec!["admin".to_string()]);
+
+        // permissive ABAC → admin definitely sees entities.
+        let abac = AbacEngine::default_permissive();
+        let allowed = can_see_entity(&abac, &auth.subject, &auth.permissions, None, "ship", "v-1");
+        assert!(allowed, "admin JWT must see entities under permissive ABAC");
+    }
+
+    #[tokio::test]
+    async fn test_ws_rejects_invalid_jwt() {
+        let jwt_svc = make_jwt_service();
+        let auth_state = AuthState {
+            jwt_service: Some(Arc::new(jwt_svc)),
+            api_key_service: None,
+            permissive_mode: false,
+        };
+        let err = resolve_ws_auth(&auth_state, Some("not.a.jwt"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "Invalid or expired token");
+    }
+
+    #[tokio::test]
+    async fn test_ws_rejects_missing_credentials_in_strict_mode() {
+        let auth_state = AuthState {
+            jwt_service: Some(Arc::new(make_jwt_service())),
+            api_key_service: None,
+            permissive_mode: false,
+        };
+        let err = resolve_ws_auth(&auth_state, None, None).await.unwrap_err();
+        assert_eq!(err, "Missing authentication credentials");
+    }
+
+    #[tokio::test]
+    async fn test_ws_permissive_dev_admits_anonymous() {
+        let auth_state = AuthState {
+            jwt_service: None,
+            api_key_service: None,
+            permissive_mode: true,
+        };
+        let auth = resolve_ws_auth(&auth_state, None, None).await.unwrap();
+        assert_eq!(auth.method, WsAuthMethod::PermissiveDev);
+        assert_eq!(auth.subject, "anonymous-dev");
+    }
+
+    #[tokio::test]
+    async fn test_ws_api_key_uses_key_identity() {
+        let svc = ApiKeyService::new();
+        let resp = svc
+            .create_key(CreateApiKeyRequest {
+                name: "test".to_string(),
+                scopes: vec!["entities:read".to_string()],
+                rate_limit: Some(0),
+                expires_in: None,
+                org_id: Some("org-acme".to_string()),
+            })
+            .unwrap();
+
+        let auth_state = AuthState {
+            jwt_service: None,
+            api_key_service: Some(Arc::new(svc)),
+            permissive_mode: false,
+        };
+        let auth = resolve_ws_auth(&auth_state, None, Some(&resp.api_key))
+            .await
+            .unwrap();
+
+        assert_eq!(auth.subject, resp.id);
+        assert_eq!(auth.permissions, vec!["entities:read".to_string()]);
+        assert_eq!(auth.org_id.as_deref(), Some("org-acme"));
+        assert_eq!(auth.method, WsAuthMethod::ApiKey);
+    }
+
+    #[tokio::test]
+    async fn test_ws_rejects_revoked_api_key() {
+        let svc = ApiKeyService::new();
+        let resp = svc
+            .create_key(CreateApiKeyRequest {
+                name: "test".to_string(),
+                scopes: vec!["entities:read".to_string()],
+                rate_limit: Some(0),
+                expires_in: None,
+                org_id: None,
+            })
+            .unwrap();
+        svc.revoke_key(&resp.id).unwrap();
+
+        let auth_state = AuthState {
+            jwt_service: None,
+            api_key_service: Some(Arc::new(svc)),
+            permissive_mode: false,
+        };
+        let err = resolve_ws_auth(&auth_state, None, Some(&resp.api_key))
+            .await
+            .unwrap_err();
+        // Revoked keys come back as `ApiKeyError::Revoked` from validate_key,
+        // which falls through to the generic "Invalid API key" branch.
+        assert_eq!(err, "Invalid API key");
+    }
 }
