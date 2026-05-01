@@ -94,6 +94,10 @@ This project follows [Semantic Versioning](https://semver.org/) and [Conventiona
 - **`useWebSocket` tests un-skipped** — `describe.skip` removed from all four blocks; the existing `MockWebSocket` was already correct. **All 19 tests now pass.**
 - **`vite.config.ts` `manualChunks`** for `react-vendor` / `leaflet-vendor` / `data-vendor`; `chunkSizeWarningLimit: 250`.
 
+### Dependencies
+
+- **`bincode` 1.3 → 2.x.** Migrated `orp-stream::dlq` (federation outbox + DLQ) and `orp-ml` (Isolation Forest serialiser) to `bincode::serde::encode_to_vec` / `decode_from_slice` with `bincode::config::standard()`. The wire format is **incompatible** with the v0.2.x bytes — see [docs/upgrades/v0.3.0.md](docs/upgrades/v0.3.0.md) for the operator drain procedure. The `FederationOutbox` carries an explicit `b"v2"` version marker under a reserved key (`0xFFFF __orp_outbox_wire_version__`) and refuses to start against an unmarked store with data, instead of mis-decoding silently. The Isolation Forest schema version was bumped from `1` to `2` for the same reason. Note: bincode is flagged unmaintained (RUSTSEC-2025-0141) with `patched = []`; the v3 stub on crates.io is a `compile_error!` placeholder, so a version bump cannot resolve the advisory. The exit ramp is migrating to `postcard` workspace-wide; tracked for v0.4. RUSTSEC-2025-0141 is suppressed in `audit.toml` with a documented reason.
+
 ### Docs
 
 - **Brand unified** to "Open Reality Protocol" across README, openapi.yaml, both SDKs (was three different names: "Open Reality Protocol", "Object Relationship Platform", "Open Relationship Protocol").

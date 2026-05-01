@@ -49,6 +49,12 @@ rcgen = "0.13"
 # release binary.
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+# bincode 2 (NOT 3 — 3.0.0 is the doxx-incident xkcd-stub). Used for
+# RocksDB-persisted bytes in orp-stream's DLQ + FederationOutbox and for
+# the IsolationForest model in orp-ml. RUSTSEC-2025-0141 flags ALL bincode
+# versions unmaintained; we suppress it via audit.toml with an exit ramp
+# (postcard / bitcode / rkyv evaluation queued for v0.4).
+bincode = { version = "2", features = ["serde"] }
 
 [profile.release]
 opt-level = 3

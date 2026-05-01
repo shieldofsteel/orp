@@ -13,6 +13,19 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
+/// FederationOutbox version marker. Stored under [`OUTBOX_VERSION_KEY`] in the
+/// outbox RocksDB so we can detect on `open` whether the store was written by
+/// a binary using the bincode 1.3 wire format (ORP ≤ v0.2.x). The value here
+/// is `b"v2"`; absence-or-mismatch is interpreted as "legacy / unknown" and,
+/// if any non-marker entries exist, refuses to start. See
+/// `docs/upgrades/v0.3.0.md` for the operator drain procedure.
+pub const OUTBOX_WIRE_FORMAT_VERSION: &[u8] = b"v2";
+/// Reserved key under which the outbox stores its wire-format version marker.
+/// The 2-byte big-endian length prefix `0xFFFF` cannot collide with any real
+/// `(peer_id_len, peer_id, seq)` key because no peer id can be `u16::MAX`
+/// bytes followed by the magic suffix below.
+pub const OUTBOX_VERSION_KEY: &[u8] = b"\xFF\xFF__orp_outbox_wire_version__";
+
 #[derive(Debug, Error)]
 pub enum DlqError {
     #[error("RocksDB error: {0}")]
@@ -21,10 +34,23 @@ pub enum DlqError {
     Serde(#[from] serde_json::Error),
     #[error("UTF-8 error: {0}")]
     Utf8(#[from] std::str::Utf8Error),
-    #[error("Bincode error: {0}")]
-    Bincode(#[from] bincode::Error),
+    #[error("Bincode encode error: {0}")]
+    BincodeEncode(#[from] bincode::error::EncodeError),
+    #[error("Bincode decode error: {0}")]
+    BincodeDecode(#[from] bincode::error::DecodeError),
     #[error("Peer id too long: {0} bytes (max 65535)")]
     PeerIdTooLong(usize),
+    #[error(
+        "FederationOutbox at {path} is from an incompatible (pre-v0.3.0) ORP \
+        release: wire-format marker is {found:?}, expected {expected:?}. \
+        Drain the outbox with the v0.2.x binary before upgrading. See \
+        docs/upgrades/v0.3.0.md."
+    )]
+    IncompatibleOutboxVersion {
+        path: String,
+        expected: Vec<u8>,
+        found: Option<Vec<u8>>,
+    },
 }
 
 pub type DlqResult<T> = Result<T, DlqError>;
@@ -294,9 +320,16 @@ mod tests {
 //         which point they wrap and the prefix scan still works, just without
 //         strict global order.
 //
-// Value = bincode-serialised `OutboxEntry`.
+// Value = bincode 2 (`config::standard()`) serialised `OutboxEntry`.
 //
 // Default retention: `ORP_FED_OUTBOX_RETENTION_SECS` (default 7 days).
+//
+// Wire-format compatibility: ORP v0.2.x and earlier wrote bincode 1.3 bytes
+// here. v0.3.0 switches to bincode 2 (`config::standard()`); the wire format
+// is incompatible. On open, we look for a `OUTBOX_VERSION_KEY` marker and,
+// if it is missing while the store has data, refuse to start with a clear
+// error pointing operators at `docs/upgrades/v0.3.0.md`. Newly-created
+// outboxes write the marker eagerly on `open`.
 
 /// One outbound entry destined for a peer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -331,20 +364,41 @@ pub struct FederationOutbox {
     next_seq: AtomicU64,
 }
 
+impl std::fmt::Debug for FederationOutbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FederationOutbox")
+            .field("next_seq", &self.next_seq)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FederationOutbox {
     /// Open (or create) the outbox at `path`.
+    ///
+    /// Refuses to open a RocksDB store that was written by an older ORP
+    /// binary using the bincode 1.3 wire format. Concretely: if any
+    /// non-marker entry exists and the wire-format marker is absent or
+    /// mismatched, returns [`DlqError::IncompatibleOutboxVersion`]. New
+    /// stores get the marker written eagerly so subsequent opens are happy.
     pub fn open(path: &Path) -> DlqResult<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         let db = DB::open(&opts, path)?;
 
-        // Seed the sequence counter past any existing maximum so newly enqueued
-        // entries always sort after any persisted ones.
+        // Wire-format gate. Walk the store once: this also computes the
+        // sequence-counter seed so we don't pay for two iterators.
+        let stored_marker = db.get(OUTBOX_VERSION_KEY)?;
         let mut max_seq: u64 = 0;
+        let mut has_data = false;
         let iter = db.iterator(rocksdb::IteratorMode::Start);
         for item in iter {
             let (key, _) = item?;
+            // Skip the version-marker key itself.
+            if key.as_ref() == OUTBOX_VERSION_KEY {
+                continue;
+            }
+            has_data = true;
             if key.len() >= 10 {
                 let n = key.len();
                 let seq_bytes: [u8; 8] = key[n - 8..n].try_into().unwrap_or([0u8; 8]);
@@ -354,6 +408,25 @@ impl FederationOutbox {
                 }
             }
         }
+
+        match stored_marker {
+            Some(v) if v.as_slice() == OUTBOX_WIRE_FORMAT_VERSION => {
+                // OK — store was written by a v0.3.0+ binary.
+            }
+            other if has_data => {
+                return Err(DlqError::IncompatibleOutboxVersion {
+                    path: path.display().to_string(),
+                    expected: OUTBOX_WIRE_FORMAT_VERSION.to_vec(),
+                    found: other.map(|v| v.to_vec()),
+                });
+            }
+            _ => {
+                // Empty store (or no marker but no data either): stamp the
+                // marker so future opens recognise this binary's writes.
+                db.put(OUTBOX_VERSION_KEY, OUTBOX_WIRE_FORMAT_VERSION)?;
+            }
+        }
+
         Ok(Self {
             db,
             next_seq: AtomicU64::new(max_seq.saturating_add(1)),
@@ -363,7 +436,9 @@ impl FederationOutbox {
     /// Build the storage key for `(peer_id, seq)`.
     fn make_key(peer_id: &str, seq: u64) -> DlqResult<Vec<u8>> {
         let pid = peer_id.as_bytes();
-        if pid.len() > u16::MAX as usize {
+        // Cap below u16::MAX so the 2-byte length prefix can never be
+        // `[0xFF, 0xFF]`, which is reserved for the OUTBOX_VERSION_KEY.
+        if pid.len() >= u16::MAX as usize {
             return Err(DlqError::PeerIdTooLong(pid.len()));
         }
         let len = pid.len() as u16;
@@ -377,7 +452,9 @@ impl FederationOutbox {
     /// Build the prefix used to scan a single peer's entries.
     fn peer_prefix(peer_id: &str) -> DlqResult<Vec<u8>> {
         let pid = peer_id.as_bytes();
-        if pid.len() > u16::MAX as usize {
+        // Cap below u16::MAX so the 2-byte length prefix can never be
+        // `[0xFF, 0xFF]`, which is reserved for the OUTBOX_VERSION_KEY.
+        if pid.len() >= u16::MAX as usize {
             return Err(DlqError::PeerIdTooLong(pid.len()));
         }
         let len = pid.len() as u16;
@@ -396,7 +473,7 @@ impl FederationOutbox {
             payload_json: payload_json.to_string(),
             queued_at: Utc::now().timestamp(),
         };
-        let value = bincode::serialize(&entry)?;
+        let value = bincode::serde::encode_to_vec(&entry, bincode::config::standard())?;
         self.db.put(&key, value)?;
         tracing::debug!(
             peer_id = %peer_id,
@@ -426,7 +503,8 @@ impl FederationOutbox {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let entry: OutboxEntry = bincode::deserialize(&value)?;
+            let (entry, _read): (OutboxEntry, usize) =
+                bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
             results.push((key.to_vec(), entry));
             if results.len() >= max {
                 break;
@@ -478,7 +556,8 @@ impl FederationOutbox {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let entry: OutboxEntry = bincode::deserialize(&value)?;
+            let (entry, _read): (OutboxEntry, usize) =
+                bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
             if entry.queued_at < cutoff {
                 to_delete.push(key.to_vec());
             }
@@ -584,7 +663,8 @@ mod outbox_tests {
         for (key, entry) in batch.iter().take(2) {
             let mut updated = entry.clone();
             updated.queued_at = ancient;
-            let value = bincode::serialize(&updated).unwrap();
+            let value =
+                bincode::serde::encode_to_vec(&updated, bincode::config::standard()).unwrap();
             outbox.db.put(key, value).unwrap();
         }
 
@@ -629,5 +709,93 @@ mod outbox_tests {
         let batch = outbox2.next_batch("p", 10).unwrap();
         let ids: Vec<&str> = batch.iter().map(|(_, e)| e.entity_id.as_str()).collect();
         assert_eq!(ids, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn outbox_entry_bincode2_roundtrip() {
+        // Smoke-test the bincode 2 wire format directly so any future
+        // change to OutboxEntry's shape that breaks encode/decode parity
+        // surfaces here, not as a mysterious decode error in production.
+        let entry = OutboxEntry {
+            entity_id: "ship-42".to_string(),
+            payload_json: r#"{"speed":12.5,"heading":270}"#.to_string(),
+            queued_at: 1_700_000_000,
+        };
+        let bytes = bincode::serde::encode_to_vec(&entry, bincode::config::standard()).unwrap();
+        let (decoded, _read): (OutboxEntry, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn outbox_open_writes_version_marker_on_fresh_store() {
+        let (outbox, _dir) = open_tmp_outbox();
+        let marker = outbox.db.get(OUTBOX_VERSION_KEY).unwrap();
+        assert_eq!(marker.as_deref(), Some(OUTBOX_WIRE_FORMAT_VERSION));
+    }
+
+    #[test]
+    fn outbox_open_rejects_legacy_v0_2_store() {
+        // Simulate an ORP v0.2.x outbox: RocksDB has data but no version
+        // marker. Opening with the v0.3.0 binary must refuse with a clear
+        // error so an operator drains the outbox first instead of silently
+        // mis-decoding bincode 1.3 bytes.
+        let dir = TempDir::new().unwrap();
+        {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+            let db = DB::open(&opts, dir.path()).unwrap();
+            // Write an arbitrary entry under a realistic-shaped key. Content
+            // doesn't matter for this test; the version-marker check fires
+            // before any decode is attempted.
+            let mut key = Vec::new();
+            key.extend_from_slice(&(6u16).to_be_bytes());
+            key.extend_from_slice(b"peer-a");
+            key.extend_from_slice(&1u64.to_le_bytes());
+            db.put(&key, b"legacy-v1-bincode-bytes").unwrap();
+        }
+        let err = FederationOutbox::open(dir.path()).unwrap_err();
+        match err {
+            DlqError::IncompatibleOutboxVersion {
+                expected, found, ..
+            } => {
+                assert_eq!(expected, OUTBOX_WIRE_FORMAT_VERSION);
+                assert!(found.is_none(), "legacy store should have no marker");
+            }
+            other => panic!("expected IncompatibleOutboxVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outbox_open_rejects_mismatched_version_marker() {
+        // Future-proof: if a v0.4 store somehow gets opened by a v0.3 binary
+        // (or the marker is corrupted), refuse rather than mis-decode.
+        let dir = TempDir::new().unwrap();
+        {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+            let db = DB::open(&opts, dir.path()).unwrap();
+            db.put(OUTBOX_VERSION_KEY, b"v99").unwrap();
+            let mut key = Vec::new();
+            key.extend_from_slice(&(6u16).to_be_bytes());
+            key.extend_from_slice(b"peer-a");
+            key.extend_from_slice(&1u64.to_le_bytes());
+            db.put(&key, b"opaque").unwrap();
+        }
+        let err = FederationOutbox::open(dir.path()).unwrap_err();
+        assert!(matches!(err, DlqError::IncompatibleOutboxVersion { .. }));
+    }
+
+    #[test]
+    fn outbox_version_marker_does_not_show_in_pending_count() {
+        // The version marker key is excluded from peer iteration (its prefix
+        // bytes are 0xFF 0xFF, which would only collide with a peer_id of
+        // u16::MAX bytes — rejected at make_key time). Belt-and-braces: a
+        // happy-path enqueue then a count must not be off by one.
+        let (outbox, _dir) = open_tmp_outbox();
+        outbox.enqueue("peer-a", "x", "{}").unwrap();
+        assert_eq!(outbox.pending_count("peer-a").unwrap(), 1);
     }
 }
