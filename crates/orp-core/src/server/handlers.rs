@@ -1990,6 +1990,10 @@ mod tests {
             federation_registry: None,
             federation_outbox: None,
             connectors: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            local_node_id: "test-node".to_string(),
+            federation_signer: Arc::new(crate::server::federation_tls::LocalSigner::ephemeral()),
+            federation_seq: crate::server::federation_tls::OutboundSeq::new(),
+            federation_replay: None,
         })
     }
 

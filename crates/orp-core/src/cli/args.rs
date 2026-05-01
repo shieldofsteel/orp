@@ -79,6 +79,42 @@ pub enum Commands {
         /// vanish on shutdown.
         #[arg(long)]
         in_memory: bool,
+
+        /// Enable the dedicated federation mTLS listener. When set, ORP
+        /// also requires `--federation-cert`, `--federation-key`, and
+        /// `--federation-ca`.
+        #[arg(long, env = "ORP_FED_TLS")]
+        federation_tls: bool,
+
+        /// Server certificate (PEM) presented to peers connecting in over
+        /// the federation mTLS port. Required when `--federation-tls` is set.
+        #[arg(long, env = "ORP_FED_CERT", value_name = "PATH")]
+        federation_cert: Option<String>,
+
+        /// Server private key (PEM) for `--federation-cert`.
+        #[arg(long, env = "ORP_FED_KEY", value_name = "PATH")]
+        federation_key: Option<String>,
+
+        /// CA certificate (PEM) used to verify connecting peers' client
+        /// certs. Required when `--federation-tls` is set.
+        #[arg(long, env = "ORP_FED_CA", value_name = "PATH")]
+        federation_ca: Option<String>,
+
+        /// Bind address for the federation mTLS listener.
+        /// Defaults to `0.0.0.0:9443`.
+        #[arg(long, env = "ORP_FED_TLS_LISTEN", value_name = "ADDR")]
+        federation_tls_listen: Option<String>,
+
+        /// Path to the local Ed25519 signing key (32 raw bytes or 64-char
+        /// hex). Without this, ORP generates an ephemeral key at startup
+        /// and peers must be re-keyed on every restart.
+        #[arg(long, env = "ORP_FED_SIGNING_KEY", value_name = "PATH")]
+        federation_signing_key: Option<String>,
+
+        /// Stable identifier for this node when pushing federated entities
+        /// to peers. Defaults to a per-process UUID.
+        #[arg(long, env = "ORP_NODE_ID", value_name = "ID")]
+        node_id: Option<String>,
     },
 
     /// Connect a data source in one command

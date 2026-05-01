@@ -29,9 +29,31 @@ async fn main() -> Result<()> {
             headless,
             no_auth,
             in_memory,
+            federation_tls,
+            federation_cert,
+            federation_key,
+            federation_ca,
+            federation_tls_listen,
+            federation_signing_key,
+            node_id,
         } => {
-            cli::commands::run_start(config, template, port, dev, headless, no_auth, in_memory)
-                .await?;
+            cli::commands::run_start(
+                config,
+                template,
+                port,
+                dev,
+                headless,
+                no_auth,
+                in_memory,
+                federation_tls,
+                federation_cert,
+                federation_key,
+                federation_ca,
+                federation_tls_listen,
+                federation_signing_key,
+                node_id,
+            )
+            .await?;
         }
 
         cli::args::Commands::Query {

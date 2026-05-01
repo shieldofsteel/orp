@@ -254,6 +254,7 @@ fn base_url(host: &str) -> String {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 /// Start the ORP server
+#[allow(clippy::too_many_arguments)]
 pub async fn run_start(
     config_path: Option<String>,
     template: Option<String>,
@@ -262,6 +263,13 @@ pub async fn run_start(
     headless: bool,
     no_auth: bool,
     in_memory: bool,
+    federation_tls_enabled: bool,
+    federation_cert: Option<String>,
+    federation_key: Option<String>,
+    federation_ca: Option<String>,
+    federation_tls_listen: Option<String>,
+    federation_signing_key: Option<String>,
+    local_node_id: Option<String>,
 ) -> Result<()> {
     // --no-auth implies --dev and sets ORP_DEV_MODE
     let dev = dev || no_auth;
@@ -579,6 +587,19 @@ pub async fn run_start(
         tracing::info!("🔧 Headless mode: serving API + WebSocket only (no web frontend)");
     }
 
+    // Federation transport security: read CLI/env. The cert/key/ca paths
+    // are passed via --federation-{cert,key,ca} on `orp start` (and respect
+    // ORP_FED_* env vars via clap). Disabled by default for backward
+    // compatibility with v0.2.0; the warn-log on `start_server` reminds
+    // operators to flip it on in production.
+    let federation_tls = server::federation_tls::FederationTlsConfig {
+        enabled: federation_tls_enabled,
+        cert_path: federation_cert.map(std::path::PathBuf::from),
+        key_path: federation_key.map(std::path::PathBuf::from),
+        ca_path: federation_ca.map(std::path::PathBuf::from),
+        listen_addr: federation_tls_listen.unwrap_or_else(|| "0.0.0.0:9443".to_string()),
+    };
+
     server::http::start_server(server::http::ServerConfig {
         storage,
         query_executor,
@@ -592,6 +613,9 @@ pub async fn run_start(
         federation_registry: Some(server::federation::PeerRegistry::new()),
         port,
         headless,
+        federation_tls,
+        federation_signing_key_path: federation_signing_key.map(std::path::PathBuf::from),
+        local_node_id,
     })
     .await?;
 
@@ -782,12 +806,10 @@ pub async fn run_status(host: &str, format: OutputFormat) -> Result<()> {
                         } else {
                             "OK ".to_string()
                         }
+                    } else if colors_enabled() {
+                        format!("{}", "●".red())
                     } else {
-                        if colors_enabled() {
-                            format!("{}", "●".red())
-                        } else {
-                            "ERR".to_string()
-                        }
+                        "ERR".to_string()
                     };
                     println!("  {} {}{}", indicator, name, latency);
                 }

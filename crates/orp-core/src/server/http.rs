@@ -1,4 +1,5 @@
 use crate::server::federation::{self, PeerRegistry};
+use crate::server::federation_tls::{FederationTlsConfig, LocalSigner, OutboundSeq, ReplayTracker};
 use crate::server::handlers;
 use crate::server::ingest;
 use crate::server::layers;
@@ -54,6 +55,19 @@ pub struct AppState {
     /// existing processor flow — connectors push events to the processor; this
     /// registry is purely for observability.
     pub connectors: Arc<Mutex<Vec<Arc<dyn Connector>>>>,
+    /// This node's stable identifier as the federation **sender** in signed
+    /// envelopes. Defaults to a process-local UUID; operators set
+    /// `ORP_NODE_ID` in production so peers can pin one ID per cluster.
+    pub local_node_id: String,
+    /// Local Ed25519 signing key for outbound federation pushes. Optional
+    /// only because federation can be disabled entirely; when federation is
+    /// enabled this is always populated (ephemeral if no key file is set).
+    pub federation_signer: Arc<LocalSigner>,
+    /// Per-receiver outbound sequence allocator. Only used on the push path.
+    pub federation_seq: Arc<OutboundSeq>,
+    /// Per-sender highest-seq tracker for inbound replay protection. None
+    /// when federation is disabled.
+    pub federation_replay: Option<Arc<ReplayTracker>>,
 }
 
 /// Per-IP rate limiter state — token bucket with 100 req/sec.
@@ -225,6 +239,24 @@ pub struct ServerConfig {
     /// Enables deployment on servers, Raspberry Pi, embedded, and CI environments
     /// where the web UI build artefacts are absent or unwanted.
     pub headless: bool,
+    /// Optional dedicated mTLS listener for the federation push endpoint.
+    /// When `enabled` and complete (cert/key/ca all set), a separate
+    /// rustls-backed `axum-server` listener is spawned on
+    /// `tls_config.listen_addr` (default `0.0.0.0:9443`) that requires every
+    /// connecting peer to present a client certificate signed by the
+    /// configured CA. The plaintext port (this struct's `port`) continues
+    /// serving the frontend + non-federation REST API.
+    pub federation_tls: FederationTlsConfig,
+    /// Path to the local Ed25519 signing key (32-byte raw seed or 64-char
+    /// hex). When unset, an ephemeral key is generated at startup and a
+    /// warning is logged — fine for dev, not fine for production.
+    pub federation_signing_key_path: Option<std::path::PathBuf>,
+    /// Stable identifier for this node when it appears as the *sender* in
+    /// signed federation envelopes. Defaults to a fresh UUID per process.
+    /// Operators set this to a stable value (e.g. `cluster-east`) in
+    /// production so receivers can pin pubkeys per logical node, not per
+    /// process restart.
+    pub local_node_id: Option<String>,
 }
 
 pub async fn start_server(config: ServerConfig) -> Result<()> {
@@ -266,6 +298,24 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         None
     };
 
+    // Federation crypto state — only meaningful when the registry is wired,
+    // but we always allocate a signer so callers can introspect the local
+    // pubkey via `state.federation_signer.pubkey_hex()`.
+    let federation_signer = Arc::new(LocalSigner::load_or_ephemeral(
+        config.federation_signing_key_path.as_deref(),
+    ));
+    let federation_seq = OutboundSeq::new();
+    let federation_replay = if config.federation_registry.is_some() {
+        Some(ReplayTracker::new())
+    } else {
+        None
+    };
+    let local_node_id = config
+        .local_node_id
+        .clone()
+        .or_else(|| std::env::var("ORP_NODE_ID").ok())
+        .unwrap_or_else(|| format!("node-{}", uuid::Uuid::new_v4()));
+
     let state = Arc::new(AppState {
         storage: config.storage,
         query_executor: config.query_executor,
@@ -281,6 +331,10 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         federation_registry: config.federation_registry.clone(),
         federation_outbox,
         connectors: Arc::new(Mutex::new(Vec::new())),
+        local_node_id,
+        federation_signer,
+        federation_seq,
+        federation_replay,
     });
 
     // Spawn federation background sync if registry provided. Also spawn the
@@ -361,6 +415,13 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         .route("/api/v1/peers", post(federation::register_peer))
         .route("/api/v1/peers/{id}", delete(federation::remove_peer))
         .route("/api/v1/peers/{id}/sync", post(federation::sync_peer))
+        // Inbound signed-push endpoint — terminates the receiver side of
+        // the mTLS + Ed25519 envelope flow. No auth middleware: the trust
+        // is the client cert and the envelope signature, not a JWT.
+        .route(
+            "/api/v1/federation/push",
+            post(federation::receive_signed_push),
+        )
         // WebSocket
         .route("/ws/updates", get(websocket::ws_handler));
 
@@ -405,10 +466,135 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         app = app.nest("/api/v1", subrouter);
     }
 
+    // Federation mTLS listener (separate port). Spawned only when:
+    //   1. Federation is enabled (registry present)
+    //   2. `tls_config.enabled` is true
+    //   3. cert/key/ca are all configured
+    // Otherwise we log and continue with the plaintext listener only —
+    // backward compatible with v0.2.0.
+    if config.federation_registry.is_some() {
+        if config.federation_tls.enabled {
+            if config.federation_tls.is_complete() {
+                let app_for_tls = app.clone();
+                let tls_cfg = config.federation_tls.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_federation_tls(app_for_tls, tls_cfg).await {
+                        tracing::error!(error = %e, "Federation mTLS listener exited");
+                    }
+                });
+            } else {
+                tracing::warn!(
+                    "federation.tls.enabled=true but cert/key/ca not all set; \
+                     mTLS listener NOT started — federation will accept plaintext only"
+                );
+            }
+        } else {
+            tracing::warn!(
+                "Federation enabled with TLS DISABLED — peers can spoof signed pushes \
+                 if you also have not pinned signing pubkeys. Set federation.tls.enabled=true \
+                 in production."
+            );
+        }
+    }
+
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
     tracing::info!("ORP server listening on port {}", config.port);
 
     axum::serve(listener, app).await?;
 
+    Ok(())
+}
+
+/// Bring up the dedicated federation mTLS listener. Pinned to rustls (no
+/// native-tls anywhere in the workspace, per security policy) and configured
+/// to require client authentication — connections without a valid client
+/// cert signed by `tls_cfg.ca_path` are dropped before any HTTP frames are
+/// served.
+async fn serve_federation_tls(app: Router, tls_cfg: FederationTlsConfig) -> Result<()> {
+    use axum_server::tls_rustls::RustlsConfig;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::server::WebPkiClientVerifier;
+    use rustls::RootCertStore;
+
+    // Install ring crypto provider once. Idempotent — if another component
+    // already installed it, install_default returns Err which we deliberately
+    // ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let cert_path = tls_cfg
+        .cert_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("cert_path missing"))?;
+    let key_path = tls_cfg
+        .key_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("key_path missing"))?;
+    let ca_path = tls_cfg
+        .ca_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("ca_path missing"))?;
+
+    let server_certs: Vec<CertificateDer<'static>> = {
+        let pem = std::fs::read(cert_path)?;
+        rustls_pemfile::certs(&mut pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("parse server cert: {}", e))?
+    };
+    if server_certs.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no certificates found in {}",
+            cert_path.display()
+        ));
+    }
+
+    let server_key: PrivateKeyDer<'static> = {
+        let pem = std::fs::read(key_path)?;
+        rustls_pemfile::private_key(&mut pem.as_slice())
+            .map_err(|e| anyhow::anyhow!("parse server key: {}", e))?
+            .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?
+    };
+
+    let mut roots = RootCertStore::empty();
+    {
+        let pem = std::fs::read(ca_path)?;
+        for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+            let cert = cert.map_err(|e| anyhow::anyhow!("parse CA cert: {}", e))?;
+            roots.add(cert)?;
+        }
+    }
+    if roots.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no CA certificates found in {}",
+            ca_path.display()
+        ));
+    }
+
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| anyhow::anyhow!("build client verifier: {}", e))?;
+
+    let tls_server_cfg = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(server_certs, server_key)
+        .map_err(|e| anyhow::anyhow!("rustls server config: {}", e))?;
+
+    let tls_config = RustlsConfig::from_config(Arc::new(tls_server_cfg));
+
+    let addr: std::net::SocketAddr = tls_cfg
+        .listen_addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid federation TLS listen_addr: {}", e))?;
+
+    tracing::info!(
+        addr = %addr,
+        cert = %cert_path.display(),
+        ca = %ca_path.display(),
+        "Federation mTLS listener starting"
+    );
+
+    axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .await
+        .map_err(|e| anyhow::anyhow!("federation mTLS serve: {}", e))?;
     Ok(())
 }
