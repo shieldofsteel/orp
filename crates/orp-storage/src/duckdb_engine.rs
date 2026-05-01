@@ -198,6 +198,18 @@ impl DuckDbStorage {
         Ok(s)
     }
 
+    /// Borrow the underlying connection handle.
+    ///
+    /// Exposed so peer crates (e.g. `orp-audit`) can layer a sub-system on
+    /// top of the same DuckDB instance without opening a second connection
+    /// to the same file. Holding the returned `Arc<Mutex<Connection>>` does
+    /// not prevent `DuckDbStorage` from continuing to use it — DuckDB's
+    /// single-writer-per-connection semantics are preserved by the existing
+    /// `Mutex`.
+    pub fn connection(&self) -> Arc<Mutex<Connection>> {
+        Arc::clone(&self.conn)
+    }
+
     /// Return a shared graph engine, initialising it on first access.
     /// Subsequent callers reuse the same `Arc<GraphEngine>` rather than
     /// re-running graph schema setup per call.

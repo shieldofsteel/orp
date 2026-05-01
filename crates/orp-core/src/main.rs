@@ -221,6 +221,19 @@ async fn main() -> Result<()> {
                 .await?;
         }
 
+        cli::args::Commands::Audit { action } => match action {
+            cli::args::AuditAction::Verify { db, public_key } => {
+                cli::commands::run_audit_verify(&db, &public_key)?;
+            }
+            cli::args::AuditAction::Export {
+                db,
+                out,
+                public_key,
+            } => {
+                cli::commands::run_audit_export(&db, &out, public_key.as_deref())?;
+            }
+        },
+
         cli::args::Commands::Version => {
             cli::commands::run_version();
         }

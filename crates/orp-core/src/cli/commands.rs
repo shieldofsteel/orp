@@ -1,5 +1,6 @@
 use anyhow::Result;
 use colored::Colorize;
+use orp_audit::{crypto::EventSigner, AuditLogger, InMemoryAuditLog, PersistentAuditLog};
 use orp_config::{get_maritime_template, Config};
 use orp_connector::adapters::ais::AisConnector;
 use orp_connector::traits::ConnectorConfig;
@@ -305,19 +306,38 @@ pub async fn run_start(
     // Initialize storage. Persistent by default — that's the SQLite-style
     // promise of "single binary, single file". Pass `--in-memory` for tests
     // or demos where the state should vanish on shutdown.
-    let storage: Arc<dyn Storage> = if in_memory {
+    //
+    // We construct the audit log alongside storage so the two share one
+    // DuckDB connection. The `--in-memory` path uses [`InMemoryAuditLog`],
+    // matching the rest of the volatile state — there is no point persisting
+    // an audit chain pointing at entities that vanish on restart.
+    let audit_signer = Arc::new(EventSigner::new());
+    let (storage, audit_log): (Arc<dyn Storage>, Arc<dyn AuditLogger>) = if in_memory {
         tracing::warn!("Initializing DuckDB storage (in-memory). All state is lost on shutdown.");
-        Arc::new(
+        let s = Arc::new(
             DuckDbStorage::new_in_memory()
                 .map_err(|e| anyhow::anyhow!("Storage init failed: {}", e))?,
-        )
+        );
+        let log = Arc::new(InMemoryAuditLog::with_signer(audit_signer.clone()));
+        (s, log)
     } else {
         let path = &config.storage.duckdb.path;
         tracing::info!("Initializing DuckDB storage at {}", path);
-        Arc::new(
-            DuckDbStorage::new_with_path(path)
-                .map_err(|e| anyhow::anyhow!("Storage init failed at {}: {}", path, e))?,
-        )
+        let storage_obj = DuckDbStorage::new_with_path(path)
+            .map_err(|e| anyhow::anyhow!("Storage init failed at {}: {}", path, e))?;
+        let conn = storage_obj.connection();
+        let log = Arc::new(
+            PersistentAuditLog::from_connection(conn, audit_signer.clone())
+                .map_err(|e| anyhow::anyhow!("Audit log init failed: {}", e))?,
+        );
+        // Log the public key on startup so operators can record it for
+        // off-machine signature verification later.
+        tracing::info!(
+            "Audit log signer pubkey: {}",
+            hex::encode(audit_signer.public_key_bytes())
+        );
+        let s: Arc<dyn Storage> = Arc::new(storage_obj);
+        (s, log)
     };
 
     // Load demo data (ports)
@@ -587,7 +607,8 @@ pub async fn run_start(
         auth_state,
         abac_engine,
         api_key_service,
-        audit_signer: None,
+        audit_signer: Some(audit_signer),
+        audit_log: Some(audit_log),
         layer_registry: Some(layer_registry),
         federation_registry: Some(server::federation::PeerRegistry::new()),
         port,
@@ -782,12 +803,10 @@ pub async fn run_status(host: &str, format: OutputFormat) -> Result<()> {
                         } else {
                             "OK ".to_string()
                         }
+                    } else if colors_enabled() {
+                        format!("{}", "●".red())
                     } else {
-                        if colors_enabled() {
-                            format!("{}", "●".red())
-                        } else {
-                            "ERR".to_string()
-                        }
+                        "ERR".to_string()
                     };
                     println!("  {} {}{}", indicator, name, latency);
                 }
@@ -1875,5 +1894,124 @@ pub async fn run_export(
         }
     }
 
+    Ok(())
+}
+
+// ── Audit subcommands ─────────────────────────────────────────────────────────
+
+/// Verify the audit chain inside a DuckDB file using a caller-supplied public
+/// key. Reads `audit_log` directly — does not require a running ORP process.
+pub fn run_audit_verify(db_path: &str, public_key_hex: &str) -> Result<()> {
+    use orp_audit::traits::VerifyKey;
+
+    let conn = duckdb::Connection::open(db_path)
+        .map_err(|e| anyhow::anyhow!("Cannot open '{}': {}", db_path, e))?;
+    // Tolerate brand-new DBs by ensuring the schema exists; the table is
+    // created idempotently and an empty audit log reports "0 rows verified"
+    // rather than an opaque catalog error.
+    conn.execute_batch(orp_audit::persistent::AUDIT_LOG_SCHEMA)
+        .map_err(|e| anyhow::anyhow!("Failed to ensure audit_log schema: {}", e))?;
+    let entries = orp_audit::PersistentAuditLog::read_all(&conn)
+        .map_err(|e| anyhow::anyhow!("Failed to read audit_log: {}", e))?;
+    if entries.is_empty() {
+        print_success("Audit log is empty — nothing to verify.");
+        return Ok(());
+    }
+    let vk = VerifyKey::from_hex(public_key_hex)
+        .map_err(|e| anyhow::anyhow!("Invalid --public-key: {}", e))?;
+
+    let mut prev = orp_audit::entry::GENESIS_PREV_HASH.to_string();
+    for (i, entry) in entries.iter().enumerate() {
+        let expected_seq = (i as u64) + 1;
+        if entry.sequence_number != expected_seq {
+            print_error(&format!(
+                "Chain corrupt at seq {}: expected {}, got {}",
+                entry.sequence_number, expected_seq, entry.sequence_number
+            ));
+            std::process::exit(1);
+        }
+        if entry.previous_hash != prev {
+            print_error(&format!(
+                "Chain corrupt at seq {}: previous_hash mismatch",
+                entry.sequence_number
+            ));
+            std::process::exit(1);
+        }
+        let preimage = orp_audit::canonical_preimage(
+            entry.sequence_number,
+            &entry.timestamp,
+            &entry.operation,
+            entry.entity_type.as_deref(),
+            entry.entity_id.as_deref(),
+            entry.user_id.as_deref(),
+            &entry.details,
+        );
+        let expected_hash = orp_audit::entry::compute_content_hash(&entry.previous_hash, &preimage);
+        if expected_hash != entry.content_hash {
+            print_error(&format!(
+                "Chain corrupt at seq {}: content_hash mismatch",
+                entry.sequence_number
+            ));
+            std::process::exit(1);
+        }
+        if !vk.verify_signature(&entry.content_hash, &entry.signature) {
+            print_error(&format!(
+                "Bad signature at seq {} — wrong --public-key, or row tampered",
+                entry.sequence_number
+            ));
+            std::process::exit(1);
+        }
+        prev = entry.content_hash.clone();
+    }
+
+    print_success(&format!(
+        "Audit chain verified: {} rows, hash + signature intact.",
+        entries.len()
+    ));
+    Ok(())
+}
+
+/// Export the audit chain to JSONL. With a public key, every line carries
+/// `verified: true|false`; without one, lines are emitted with `verified:
+/// false` and only the chain-hash is checked client-side.
+pub fn run_audit_export(
+    db_path: &str,
+    output_path: &str,
+    public_key_hex: Option<&str>,
+) -> Result<()> {
+    use orp_audit::traits::VerifyKey;
+
+    let conn = duckdb::Connection::open(db_path)
+        .map_err(|e| anyhow::anyhow!("Cannot open '{}': {}", db_path, e))?;
+    conn.execute_batch(orp_audit::persistent::AUDIT_LOG_SCHEMA)
+        .map_err(|e| anyhow::anyhow!("Failed to ensure audit_log schema: {}", e))?;
+
+    let verifier = match public_key_hex {
+        Some(hex_str) => Some(
+            VerifyKey::from_hex(hex_str)
+                .map_err(|e| anyhow::anyhow!("Invalid --public-key: {}", e))?,
+        ),
+        None => None,
+    };
+
+    let count = if output_path == "-" {
+        let stdout = std::io::stdout();
+        let handle = stdout.lock();
+        orp_audit::persistent::export_jsonl(&conn, verifier.as_ref(), handle)
+            .map_err(|e| anyhow::anyhow!("Export failed: {}", e))?
+    } else {
+        let file = std::fs::File::create(output_path)
+            .map_err(|e| anyhow::anyhow!("Cannot create '{}': {}", output_path, e))?;
+        let bw = std::io::BufWriter::new(file);
+        orp_audit::persistent::export_jsonl(&conn, verifier.as_ref(), bw)
+            .map_err(|e| anyhow::anyhow!("Export failed: {}", e))?
+    };
+
+    if output_path != "-" {
+        print_success(&format!(
+            "Exported {} audit rows to '{}'.",
+            count, output_path
+        ));
+    }
     Ok(())
 }
