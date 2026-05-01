@@ -3,10 +3,10 @@ use crate::server::handlers;
 use crate::server::ingest;
 use crate::server::layers;
 use crate::server::websocket;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::StatusCode,
+    http::{HeaderName, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -20,10 +20,12 @@ use orp_storage::traits::Storage;
 use orp_stream::{FederationOutbox, MonitorEngine, StreamProcessor};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 pub struct AppState {
@@ -205,6 +207,20 @@ async fn rate_limit_middleware(
     }
 }
 
+/// TLS configuration for the inbound HTTP server. When `Some`, the server
+/// terminates TLS via `rustls`; when `None`, it serves plain HTTP.
+#[derive(Clone, Debug)]
+pub struct TlsConfig {
+    /// Path to the PEM-encoded server certificate (chain).
+    pub cert_path: PathBuf,
+    /// Path to the PEM-encoded server private key.
+    pub key_path: PathBuf,
+    /// Optional path to a PEM bundle of trusted client CAs. When set, the
+    /// server requires clients to present a certificate signed by one of
+    /// these CAs (mTLS).
+    pub client_ca_path: Option<PathBuf>,
+}
+
 /// Configuration for starting the HTTP server.
 pub struct ServerConfig {
     pub storage: Arc<dyn Storage>,
@@ -225,6 +241,12 @@ pub struct ServerConfig {
     /// Enables deployment on servers, Raspberry Pi, embedded, and CI environments
     /// where the web UI build artefacts are absent or unwanted.
     pub headless: bool,
+    /// Optional TLS configuration. When `Some`, the server serves HTTPS; when
+    /// `None`, it serves plain HTTP and emits a startup warning.
+    pub tls: Option<TlsConfig>,
+    /// When TLS is active and this is `Some`, spawn a second listener on the
+    /// given port that 301-redirects every request to the HTTPS origin.
+    pub redirect_http_port: Option<u16>,
 }
 
 pub async fn start_server(config: ServerConfig) -> Result<()> {
@@ -364,51 +386,416 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         // WebSocket
         .route("/ws/updates", get(websocket::ws_handler));
 
+    // HSTS layer — only attached when TLS is active. The header tells
+    // compliant browsers to refuse HTTP for one year, mitigating downgrade
+    // attacks. We set it unconditionally on TLS responses (no
+    // `includeSubDomains` / `preload` by default — operators add those
+    // explicitly via reverse proxy when they own the apex domain).
+    let hsts_layer = config.tls.as_ref().map(|_| {
+        SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("strict-transport-security"),
+            HeaderValue::from_static("max-age=31536000"),
+        )
+    });
+
     // In headless mode we skip static file serving entirely — no frontend/dist
     // required, making ORP deployable on Raspberry Pi, servers, and embedded.
-    let mut app: Router = if config.headless {
+    let base_router: Router<Arc<AppState>> = if config.headless {
         tracing::info!("Headless mode: static frontend disabled");
         api_routes
-            .layer(axum::middleware::from_fn_with_state(
-                rate_limiter,
-                rate_limit_middleware,
-            ))
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                inject_auth_state,
-            ))
-            .layer(cors)
-            .layer(TraceLayer::new_for_http())
-            .with_state(state)
     } else {
-        api_routes
-            // Frontend — serve built Vite assets from frontend/dist/
-            .fallback_service(
-                ServeDir::new("frontend/dist")
-                    .not_found_service(ServeFile::new("frontend/dist/index.html")),
-            )
-            .layer(axum::middleware::from_fn_with_state(
-                rate_limiter,
-                rate_limit_middleware,
-            ))
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                inject_auth_state,
-            ))
-            .layer(cors)
-            .layer(TraceLayer::new_for_http())
-            .with_state(state)
+        api_routes.fallback_service(
+            ServeDir::new("frontend/dist")
+                .not_found_service(ServeFile::new("frontend/dist/index.html")),
+        )
     };
 
-    // Nest the layers sub-router if registry is available
+    let stateful: Router<Arc<AppState>> = base_router
+        .layer(axum::middleware::from_fn_with_state(
+            rate_limiter,
+            rate_limit_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            inject_auth_state,
+        ))
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
+
+    let mut app: Router = stateful.with_state(state);
+
+    if let Some(layer) = hsts_layer {
+        app = app.layer(layer);
+    }
+
+    // Nest the layers sub-router if registry is available. It's a stateless
+    // `Router<()>` so this only works once the main router has had its state
+    // resolved via `with_state(state)` above.
     if let Some(subrouter) = layers_subrouter {
         app = app.nest("/api/v1", subrouter);
     }
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
-    tracing::info!("ORP server listening on port {}", config.port);
+    let addr: SocketAddr = format!("0.0.0.0:{}", config.port)
+        .parse()
+        .context("invalid bind address")?;
 
-    axum::serve(listener, app).await?;
+    match config.tls.as_ref() {
+        Some(tls) => {
+            tracing::info!(
+                cert = %tls.cert_path.display(),
+                key  = %tls.key_path.display(),
+                mtls = tls.client_ca_path.is_some(),
+                "Starting HTTPS server on {}",
+                addr,
+            );
+            let rustls = build_rustls_config(tls).await?;
+
+            // Optional plain-HTTP redirector. Returns 301 to the HTTPS origin
+            // for every request. Spawned as a background task so the main
+            // listener controls process lifetime.
+            if let Some(redirect_port) = config.redirect_http_port {
+                spawn_http_to_https_redirect(redirect_port, config.port);
+            }
+
+            axum_server::bind_rustls(addr, rustls)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .context("HTTPS server error")?;
+        }
+        None => {
+            tracing::warn!(
+                "Starting plain HTTP server on {} — TLS is DISABLED. Pass --tls-cert and \
+                 --tls-key to enable HTTPS, or run `orp gen-cert` for a dev cert.",
+                addr,
+            );
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
+        }
+    }
 
     Ok(())
+}
+
+/// Build a `rustls`-backed `axum_server` config from PEM files on disk. When
+/// `client_ca_path` is provided, the resulting config requires clients to
+/// present a certificate signed by one of the CAs in that bundle (mTLS).
+pub async fn build_rustls_config(tls: &TlsConfig) -> Result<axum_server::tls_rustls::RustlsConfig> {
+    use axum_server::tls_rustls::RustlsConfig;
+
+    // Ensure a default CryptoProvider is installed. axum-server-rustls picks
+    // the process-wide provider; calling install on every start is idempotent
+    // (Err means a provider is already installed, which is fine).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    if let Some(ca_path) = tls.client_ca_path.as_ref() {
+        let server_config = build_mtls_server_config(&tls.cert_path, &tls.key_path, ca_path)
+            .context("failed to build mTLS rustls server config")?;
+        Ok(RustlsConfig::from_config(Arc::new(server_config)))
+    } else {
+        RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load TLS cert={} key={}",
+                    tls.cert_path.display(),
+                    tls.key_path.display()
+                )
+            })
+    }
+}
+
+/// Build a rustls `ServerConfig` that requires clients to present a
+/// certificate signed by one of the CAs in `client_ca_path`. Used when mTLS
+/// is enabled.
+fn build_mtls_server_config(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    client_ca_path: &std::path::Path,
+) -> Result<rustls::ServerConfig> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::BufReader;
+
+    let cert_file = std::fs::File::open(cert_path)
+        .with_context(|| format!("failed to open cert {}", cert_path.display()))?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::result::Result<_, _>>()
+        .with_context(|| format!("failed to parse cert PEM {}", cert_path.display()))?;
+    if cert_chain.is_empty() {
+        anyhow::bail!("no certificates found in {}", cert_path.display());
+    }
+
+    let key_file = std::fs::File::open(key_path)
+        .with_context(|| format!("failed to open key {}", key_path.display()))?;
+    let mut key_reader = BufReader::new(key_file);
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
+        .with_context(|| format!("failed to parse key PEM {}", key_path.display()))?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
+
+    let ca_file = std::fs::File::open(client_ca_path)
+        .with_context(|| format!("failed to open client CA {}", client_ca_path.display()))?;
+    let mut ca_reader = BufReader::new(ca_file);
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in rustls_pemfile::certs(&mut ca_reader) {
+        let ca = ca.with_context(|| {
+            format!("failed to parse client CA PEM {}", client_ca_path.display())
+        })?;
+        roots
+            .add(ca)
+            .context("failed to add client CA to root store")?;
+    }
+    if roots.is_empty() {
+        anyhow::bail!(
+            "no certificates found in client CA bundle {}",
+            client_ca_path.display()
+        );
+    }
+
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .context("failed to build client cert verifier")?;
+
+    rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, key)
+        .context("failed to assemble rustls ServerConfig")
+}
+
+/// Spawn a tiny background server on `port` that 301-redirects every request
+/// to the same path on the HTTPS origin. Used when the operator passes
+/// `--redirect-http`.
+fn spawn_http_to_https_redirect(port: u16, https_port: u16) {
+    use axum::extract::Host;
+    use axum::http::Uri;
+    use axum::response::Redirect;
+
+    let redirect_addr: SocketAddr = match format!("0.0.0.0:{}", port).parse() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "Invalid HTTP-to-HTTPS redirect address; skipping");
+            return;
+        }
+    };
+
+    let app = Router::new().fallback(move |Host(host): Host, uri: Uri| async move {
+        // Strip any port the client sent and append the HTTPS port.
+        let host_no_port = host.split(':').next().unwrap_or(&host).to_string();
+        let path = uri
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/")
+            .to_string();
+        let target = if https_port == 443 {
+            format!("https://{}{}", host_no_port, path)
+        } else {
+            format!("https://{}:{}{}", host_no_port, https_port, path)
+        };
+        Redirect::permanent(&target)
+    });
+
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(redirect_addr).await {
+            Ok(listener) => {
+                tracing::info!(
+                    "HTTP-to-HTTPS redirector listening on {} → :{}",
+                    redirect_addr,
+                    https_port
+                );
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::warn!(error = %e, "HTTP redirector exited");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, addr = %redirect_addr, "HTTP redirector bind failed");
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tls_tests {
+    //! Inbound TLS tests. We exercise `build_rustls_config` against a real
+    //! loopback `axum_server` listener with rcgen-generated certs.
+    use super::*;
+    use axum::routing::get;
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+    use std::path::Path;
+
+    /// rcgen helper — write a self-signed cert+key into `dir`. Returns the
+    /// PEM cert and the on-disk paths.
+    fn write_self_signed(dir: &Path, cn: &str) -> (String, PathBuf, PathBuf) {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn.to_string());
+        params.distinguished_name = dn;
+        params
+            .subject_alt_names
+            .push(SanType::DnsName(cn.to_string().try_into().unwrap()));
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let cert_pem = cert.pem();
+        let key_pem = key.serialize_pem();
+        let cert_path = dir.join(format!("{cn}-cert.pem"));
+        let key_path = dir.join(format!("{cn}-key.pem"));
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        (cert_pem, cert_path, key_path)
+    }
+
+    /// Spawn an axum-server listener on an ephemeral loopback port. Returns
+    /// the bound address. The listener stops when the test exits.
+    async fn spawn_https_server(
+        rustls_cfg: axum_server::tls_rustls::RustlsConfig,
+        app: Router,
+    ) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let handle_for_task = handle.clone();
+        tokio::spawn(async move {
+            let _ = axum_server::from_tcp_rustls(listener, rustls_cfg)
+                .handle(handle_for_task)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .await;
+        });
+        handle.listening().await;
+        addr
+    }
+
+    fn hello_app() -> Router {
+        Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .layer(SetResponseHeaderLayer::if_not_present(
+                HeaderName::from_static("strict-transport-security"),
+                HeaderValue::from_static("max-age=31536000"),
+            ))
+    }
+
+    #[tokio::test]
+    async fn test_tls_server_serves_https() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_pem, cert_path, key_path) = write_self_signed(dir.path(), "localhost");
+        let cfg = build_rustls_config(&TlsConfig {
+            cert_path,
+            key_path,
+            client_ca_path: None,
+        })
+        .await
+        .expect("rustls config");
+        let addr = spawn_https_server(cfg, hello_app()).await;
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let resp = client
+            .get(format!("https://{addr}/health"))
+            .send()
+            .await
+            .expect("https request");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn test_tls_rejects_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_pem, cert_path, key_path) = write_self_signed(dir.path(), "localhost");
+        let cfg = build_rustls_config(&TlsConfig {
+            cert_path,
+            key_path,
+            client_ca_path: None,
+        })
+        .await
+        .unwrap();
+        let addr = spawn_https_server(cfg, hello_app()).await;
+
+        let result = reqwest::Client::builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/health"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+        assert!(
+            result.is_err(),
+            "plain HTTP must fail against a TLS listener, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hsts_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_pem, cert_path, key_path) = write_self_signed(dir.path(), "localhost");
+        let cfg = build_rustls_config(&TlsConfig {
+            cert_path,
+            key_path,
+            client_ca_path: None,
+        })
+        .await
+        .unwrap();
+        let addr = spawn_https_server(cfg, hello_app()).await;
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let resp = client
+            .get(format!("https://{addr}/health"))
+            .send()
+            .await
+            .unwrap();
+        let hsts = resp
+            .headers()
+            .get("strict-transport-security")
+            .expect("HSTS header present on TLS responses")
+            .to_str()
+            .unwrap();
+        assert!(
+            hsts.starts_with("max-age=31536000"),
+            "unexpected HSTS value: {hsts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mtls_requires_client_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_server_pem, server_cert, server_key) = write_self_signed(dir.path(), "localhost");
+        // Use a separate self-signed cert as the trusted client-CA bundle.
+        // The point is that the test client presents *no* cert at all, so
+        // the handshake fails regardless of which CAs are trusted.
+        let (ca_pem, _ca_cert, _ca_key) = write_self_signed(dir.path(), "test-client-ca");
+        let ca_bundle = dir.path().join("client-ca.pem");
+        std::fs::write(&ca_bundle, &ca_pem).unwrap();
+
+        let cfg = build_rustls_config(&TlsConfig {
+            cert_path: server_cert,
+            key_path: server_key,
+            client_ca_path: Some(ca_bundle),
+        })
+        .await
+        .expect("mTLS rustls config");
+        let addr = spawn_https_server(cfg, hello_app()).await;
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let result = client.get(format!("https://{addr}/health")).send().await;
+        assert!(
+            result.is_err(),
+            "mTLS server must reject clients without a cert, got {:?}",
+            result
+        );
+    }
 }

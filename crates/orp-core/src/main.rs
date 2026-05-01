@@ -29,9 +29,25 @@ async fn main() -> Result<()> {
             headless,
             no_auth,
             in_memory,
+            tls_cert,
+            tls_key,
+            tls_client_ca,
+            redirect_http,
         } => {
-            cli::commands::run_start(config, template, port, dev, headless, no_auth, in_memory)
-                .await?;
+            cli::commands::run_start(cli::commands::StartArgs {
+                config_path: config,
+                template,
+                port_override: port,
+                dev,
+                headless,
+                no_auth,
+                in_memory,
+                tls_cert,
+                tls_key,
+                tls_client_ca,
+                redirect_http,
+            })
+            .await?;
         }
 
         cli::args::Commands::Query {
@@ -227,6 +243,26 @@ async fn main() -> Result<()> {
 
         cli::args::Commands::Completions { shell } => {
             cli::commands::run_completions(shell);
+        }
+
+        cli::args::Commands::GenCert {
+            cert_out,
+            key_out,
+            out_dir,
+            cn,
+            sans,
+            days,
+            force,
+        } => {
+            cli::commands::run_gen_cert(cli::commands::GenCertArgs {
+                cert_out,
+                key_out,
+                out_dir,
+                cn,
+                sans,
+                days,
+                force,
+            })?;
         }
     }
 
