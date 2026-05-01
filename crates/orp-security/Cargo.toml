@@ -16,6 +16,11 @@ axum = { workspace = true }
 tower = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
+# CSRF cookie HMAC + constant-time compare. Closes P-audit Wave 2 F5:
+# the previous SHA256(state||secret) was length-extension forgeable, and
+# the verifier used String == (variable-time, leaks-by-timing).
+hmac = "0.12"
+subtle = "2.5"
 
 # JWT
 jsonwebtoken = "9"

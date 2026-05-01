@@ -921,29 +921,40 @@ pub fn oidc_router(state: AuthRouterState) -> Router {
         .with_state(state)
 }
 
-/// Build a signed CSRF cookie value: state|HMAC(state, secret).
+/// Build a signed CSRF cookie value: `state|HEX(HMAC-SHA256(secret, state))`.
+///
+/// Closes P-audit F5. Previously this used `SHA256(state || secret)`, which
+/// is length-extension forgeable: an attacker who can read one valid
+/// (state, signature) pair can extend `state` and forge a valid signature
+/// without knowing `secret`. HMAC eliminates that family of attacks.
 fn sign_csrf_state(state_val: &str, secret: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(state_val.as_bytes());
-    hasher.update(secret.as_bytes());
-    let sig = hex::encode(hasher.finalize());
-    format!("{}|{}", state_val, sig)
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC-SHA256 accepts arbitrary-length keys");
+    mac.update(state_val.as_bytes());
+    let tag = mac.finalize().into_bytes();
+    format!("{}|{}", state_val, hex::encode(tag))
 }
 
 /// Verify and extract the CSRF state from a signed cookie value.
+///
+/// Compares the candidate signature against the recomputed HMAC tag in
+/// constant time via `hmac::Mac::verify_slice`. The previous string `==`
+/// branch could leak the matching prefix length through timing.
 fn verify_csrf_cookie(cookie_val: &str, secret: &str) -> Option<String> {
-    let parts: Vec<&str> = cookie_val.splitn(2, '|').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let state_val = parts[0];
-    let expected = sign_csrf_state(state_val, secret);
-    if expected == cookie_val {
-        Some(state_val.to_string())
-    } else {
-        None
-    }
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let (state_val, tag_hex) = cookie_val.split_once('|')?;
+    // Hex parse is fine in variable time — the tag isn't secret per se,
+    // but its acceptance/rejection signal must be ct.
+    let candidate = hex::decode(tag_hex).ok()?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(state_val.as_bytes());
+    mac.verify_slice(&candidate).ok()?;
+    Some(state_val.to_string())
 }
 
 /// CSRF cookie secret — derived from client_secret or a fixed dev key.
@@ -1321,6 +1332,82 @@ mod tests {
             assert_eq!(raw.len(), 32, "state must encode 32 bytes");
             assert!(seen.insert(s), "duplicate CSRF state — RNG is broken");
         }
+    }
+
+    // ── F5 regression: CSRF HMAC + constant-time compare ─────────────────
+
+    #[test]
+    fn csrf_sign_verify_roundtrip_succeeds() {
+        let state = "abcDEF123_-";
+        let secret = "shared-secret-deadbeef";
+        let signed = sign_csrf_state(state, secret);
+        let recovered = verify_csrf_cookie(&signed, secret).expect("verify succeeds");
+        assert_eq!(recovered, state);
+    }
+
+    #[test]
+    fn csrf_verify_rejects_tampered_signature_byte() {
+        let state = "abcDEF123_-";
+        let secret = "shared-secret-deadbeef";
+        let signed = sign_csrf_state(state, secret);
+        // Flip one byte of the hex tag.
+        let (s, tag) = signed.split_once('|').unwrap();
+        let mut tag_bytes: Vec<u8> = tag.bytes().collect();
+        tag_bytes[0] ^= 0x01;
+        let tampered = format!("{s}|{}", String::from_utf8(tag_bytes).unwrap());
+        assert!(verify_csrf_cookie(&tampered, secret).is_none());
+    }
+
+    #[test]
+    fn csrf_verify_rejects_tampered_state() {
+        let state = "abcDEF123_-";
+        let secret = "shared-secret-deadbeef";
+        let signed = sign_csrf_state(state, secret);
+        let (_, tag) = signed.split_once('|').unwrap();
+        let tampered = format!("EvILstate|{tag}");
+        assert!(verify_csrf_cookie(&tampered, secret).is_none());
+    }
+
+    #[test]
+    fn csrf_verify_rejects_wrong_secret() {
+        let state = "abcDEF123_-";
+        let secret_real = "real";
+        let secret_fake = "fake";
+        let signed = sign_csrf_state(state, secret_real);
+        assert!(verify_csrf_cookie(&signed, secret_fake).is_none());
+    }
+
+    #[test]
+    fn csrf_verify_rejects_missing_separator() {
+        // No '|' → splitn returns one element → split_once returns None.
+        assert!(verify_csrf_cookie("no-separator-here", "secret").is_none());
+    }
+
+    #[test]
+    fn csrf_verify_rejects_non_hex_tag() {
+        // Tag must be hex; non-hex chars → hex::decode fails → None.
+        assert!(verify_csrf_cookie("state|not-hex-XYZ", "secret").is_none());
+    }
+
+    #[test]
+    fn csrf_signature_changes_when_state_changes() {
+        // The signature depends on the state, so two distinct states with
+        // the same secret must produce different tags. Catches a regression
+        // where someone "optimises" the HMAC into a constant.
+        let secret = "shared";
+        let s1 = sign_csrf_state("alpha", secret);
+        let s2 = sign_csrf_state("beta", secret);
+        let tag1 = s1.split_once('|').unwrap().1;
+        let tag2 = s2.split_once('|').unwrap().1;
+        assert_ne!(tag1, tag2);
+    }
+
+    #[test]
+    fn csrf_signature_changes_when_secret_changes() {
+        let state = "alpha";
+        let s1 = sign_csrf_state(state, "secret-1");
+        let s2 = sign_csrf_state(state, "secret-2");
+        assert_ne!(s1, s2);
     }
 
     #[test]
