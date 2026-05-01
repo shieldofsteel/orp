@@ -30,6 +30,13 @@ async fn main() -> Result<()> {
             no_auth,
             in_memory,
             bootstrap_admin_key,
+            federation_tls,
+            federation_cert,
+            federation_key,
+            federation_ca,
+            federation_tls_listen,
+            federation_signing_key,
+            node_id,
         } => {
             cli::commands::run_start(
                 config,
@@ -40,6 +47,13 @@ async fn main() -> Result<()> {
                 no_auth,
                 in_memory,
                 bootstrap_admin_key,
+                federation_tls,
+                federation_cert,
+                federation_key,
+                federation_ca,
+                federation_tls_listen,
+                federation_signing_key,
+                node_id,
             )
             .await?;
         }
