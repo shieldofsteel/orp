@@ -1,0 +1,4 @@
+-- Industrial sensor count grouped by reported status. Fast health-of-fleet view.
+MATCH (s:sensor)
+RETURN s.status, COUNT(*) AS n
+ORDER BY n DESC

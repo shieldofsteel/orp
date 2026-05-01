@@ -6,6 +6,48 @@ This project follows [Semantic Versioning](https://semver.org/) and [Conventiona
 
 ---
 
+## [Unreleased] — 2026-05-01 v0.3.0 devex wave 1
+
+### New CLI subcommand
+
+- **`orp doctor`** — first-time-user preflight diagnostics. Six checks with green/yellow/red status, exit code 0 on green/yellow and 1 on red:
+  1. `protoc` available on PATH (matters only for source builds; yellow if missing).
+  2. DuckDB writable at `storage.duckdb.path` (open + `SELECT 42` round-trip).
+  3. RocksDB-compatible directory writable at `storage.rocksdb.path`'s parent.
+  4. `server.port` (or 9090) is bindable on loopback.
+  5. `config.yaml` (if present) parses and validates.
+  6. Cert chain validity — only when `--https-url <url>` is supplied; skipped otherwise.
+
+  Lives at `crates/orp-core/src/cli/doctor.rs` with 7 unit tests covering rank ordering, builder pattern, missing config, non-HTTPS rejection, and path parent resolution.
+
+### Developer experience — docs and examples
+
+- **`docs/QUICKSTART.md`** — 10-minute, copy-pasteable, "from zero to ingesting your own data" guide. Six sections: install (one-liner + brew + cargo), first run, first ingest via `/api/v1/ingest`, query with ORP-QL, connect a real adapter (AISStream / NMEA), federate two nodes on localhost. Verified against the actual binary surface.
+- **`docs/RECIPES.md`** — eight copy-paste recipes: AIS via AISStream.io, Zeek `conn.log` watcher, MAVLink heartbeat, ADS-B from a local SDR, Modbus polling, audit-log export for security review, two-node federation, saved query as continuous monitor.
+- **`docs/CONFIG.md`** — full reference for every config field: type, default, env-var equivalent, CLI flag equivalent, semantic description. Generated from `crates/orp-config/src/schema.rs` and `crates/orp-core/src/cli/args.rs`. Includes a worked production-style YAML example.
+- **`examples/quickstart-ais/`** — runnable end-to-end demo: boots `orp --in-memory`, ingests `vessels.json` (16 records), runs three saved `.orpql` queries, tears down. Single `run.sh` driver, `set -euo pipefail`, signal-safe cleanup.
+- **`examples/two-node-federation/`** — two-node localhost demo: starts alpha + beta, registers them as peers, ingests on each, observes federation sync after `ORP_FED_BASE_INTERVAL_SECS=5`. Plus a `docker-compose.yml` for the Docker variant.
+- **`examples/saved-queries/`** — pattern for keeping `.orpql` files in version control. `run.sh` ingests demo data, runs queries from the `queries/` directory, registers monitor rules from `monitors.yaml`.
+- **`examples/adapter-config/`** — annotated `config.yaml` showing six adapters configured side-by-side (aisstream / adsb / mavlink / modbus / zeek / http_poll) with extensive in-line comments. Reference, not runnable.
+
+### Installer
+
+- **`scripts/install.sh`** — already present and verified: detects OS+arch, downloads from GitHub Releases, verifies SHA-256 checksums, installs to `/usr/local/bin` (sudo) or `~/.local/bin` (fallback), updates shell PATH.
+
+### README polish
+
+- **README.md** — tightened to a 3-line elevator pitch ("single 45 MB binary, 30+ protocols, no JVM/Postgres/Kubernetes"). New 30-second demo transcript replaces the missing GIF as a placeholder. New "What slot does this fill?" comparison table vs SQLite / Postgres / Lattice OS / Maven OS / Anduril. Long sections moved/linked to `docs/`. Added documentation map and examples table.
+
+### CLI surface
+
+- `orp` help output (`orp --help`, `orp doctor --help`, `orp start --help`) now reads cleanly with examples and exit-code documentation on every subcommand. The clap docstrings on `Cli` / `Commands` / `ConnectorAction` etc. were already present; this wave validated them and added `Doctor`.
+
+### Constraints kept
+
+- No new runtime dependencies beyond `which` (for `protoc` detection) and `reqwest`'s `blocking` feature (for the `--https-url` cert-chain probe in doctor). All examples actually work — no aspirational config — and every shell script uses `set -euo pipefail`.
+
+---
+
 ## [Unreleased] — 2026-05-01 audit/fix wave
 
 ### New crate

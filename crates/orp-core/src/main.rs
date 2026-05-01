@@ -225,6 +225,13 @@ async fn main() -> Result<()> {
             cli::commands::run_version();
         }
 
+        cli::args::Commands::Doctor { config, https_url } => {
+            let status = cli::doctor::run_doctor(config.as_deref(), https_url.as_deref())?;
+            if status == cli::doctor::DoctorStatus::Red {
+                std::process::exit(1);
+            }
+        }
+
         cli::args::Commands::Completions { shell } => {
             cli::commands::run_completions(shell);
         }
