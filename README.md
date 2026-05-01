@@ -2,14 +2,15 @@
 
 # ORP — Open Reality Protocol
 
-### A single Rust binary that fuses 30+ protocols into one queryable real-time picture.
+### A single Rust binary that fuses 39+ protocols into one cryptographically-signed real-time picture.
 
-[![Tests](https://img.shields.io/badge/tests-1122%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
+[![Tests](https://img.shields.io/badge/tests-1362%20passing-brightgreen?style=flat-square)](https://github.com/shieldofsteel/orp/actions)
 [![Binary Size](https://img.shields.io/badge/binary-45MB-blue?style=flat-square)](https://github.com/shieldofsteel/orp/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square)](https://www.rust-lang.org)
 [![Crates](https://img.shields.io/badge/crates-13%20workspace%20crates-red?style=flat-square)](crates/)
-[![Adapters](https://img.shields.io/badge/adapters-34-purple?style=flat-square)](crates/orp-connector/src/adapters/)
+[![Adapters](https://img.shields.io/badge/adapters-39-purple?style=flat-square)](crates/orp-connector/src/adapters/)
+[![Security](https://img.shields.io/badge/security-mTLS%20%7C%20OIDC%20%7C%20Argon2id-darkgreen?style=flat-square)](docs/SECURITY.md)
 
 </div>
 
@@ -17,7 +18,7 @@
 
 ## What it is, in three lines
 
-ORP is a single 45 MB Rust binary that ingests AIS, ADS-B, MAVLink, OPC-UA, MQTT, Modbus, Zeek, syslog, GRIB and 25 more protocols into one queryable real-time graph — with an ORP-QL query language, federation mesh sync, signed audit log, and a built-in COP map. **No JVM. No Postgres. No Kubernetes.** Just `./orp start` and you're ingesting in 30 seconds. The slot it fills: *the new SQLite/Postgres for real-time multi-source backends*.
+ORP is a single 45 MB Rust binary that ingests AIS, ADS-B, MAVLink, OPC-UA, MQTT, Modbus, Zeek, syslog, GRIB, CoT, KLV (MISB ST 0601), CCSDS+SGP4, HL7 v2.5, Kafka, NATS and 25 more protocols into one queryable real-time graph — with an ORP-QL query language, **mTLS-secured federation mesh**, **Ed25519-signed tamper-evident audit log**, **OIDC JWKS verification (RS256/ES256)**, **Argon2id keystore**, and a built-in COP map. **No JVM. No Postgres. No Kubernetes.** Just `./orp start` and you're ingesting in 30 seconds. The slot it fills: *the new SQLite/Postgres for real-time multi-source backends — but military-grade out of the box*.
 
 ---
 
@@ -62,7 +63,7 @@ A new shape of system needs a new comparison set. ORP is **not** a database, **n
 | Single binary, no daemons | ✅ | ❌ | ❌ | ❌ | **✅** |
 | Embeddable in another process | ✅ | ⚠️ libpq | ❌ | ❌ | **✅ (via orp-core crate)** |
 | First-class real-time ingest | ❌ | ❌ partial (LISTEN/NOTIFY) | ✅ | ✅ | **✅ (50k events/s)** |
-| Protocol adapters out of the box | 0 | 0 | proprietary | proprietary | **34 open** |
+| Protocol adapters out of the box | 0 | 0 | proprietary | proprietary | **39 open** |
 | Graph query language | ❌ | extensions only | proprietary | proprietary | **ORP-QL (open)** |
 | Live federation mesh | ❌ | logical replication only | ✅ closed | ✅ closed | **✅ open** |
 | Edge / Raspberry Pi capable | ✅ | ⚠️ | ❌ | ❌ | **✅ 45 MB, ARM64** |
@@ -103,7 +104,7 @@ For copy-paste recipes (AIS, ADS-B, MAVLink, Modbus, Zeek, audit-log export, fed
 
 ## What ORP Does
 
-**Fuses data from any source** — 34 protocol adapters, a universal JSON ingest endpoint, and a connector SDK. If it outputs data, ORP can consume it.
+**Fuses data from any source** — 39 protocol adapters, a universal JSON ingest endpoint, and a connector SDK. If it outputs data, ORP can consume it.
 
 **Builds a live knowledge graph** — every entity (ship, aircraft, vehicle, sensor, threat) becomes a node. Relationships auto-form. The graph updates in real time.
 
@@ -117,9 +118,57 @@ For copy-paste recipes (AIS, ADS-B, MAVLink, Modbus, Zeek, audit-log export, fed
 
 ---
 
+## Security Posture (v0.3.0)
+
+ORP ships with the cryptographic primitives a defense / federal procurement reviewer expects, all in the single binary, all configurable via flags or env vars:
+
+| Capability | What it does | How to turn on |
+|---|---|---|
+| **Inbound TLS** | `axum-server` + `rustls` (no native-tls / openssl) terminates HTTPS for the REST + WebSocket API. | `--tls-cert <pem> --tls-key <pem>` (or `orp gen-cert` for dev). |
+| **Inbound mTLS** | Optional client-cert auth — server requires every caller to present a cert signed by your CA. | `--tls-client-ca <pem>` |
+| **HSTS** | `Strict-Transport-Security: max-age=31536000` when TLS is active. | Automatic when `--tls-cert` is set. |
+| **Federation mTLS** | Dedicated rustls listener on a separate port (default 9443) requires connecting peers to present a client cert signed by the federation CA. | `--federation-tls --federation-cert/key/ca <pem>` |
+| **Federation Ed25519 signing** | Each federated payload carries a signature over `(timestamp \|\| peer_id \|\| canonical_json(payload))`; receivers verify against the sending peer's pinned pubkey. | `--federation-signing-key <pem>` and per-peer `signing_pubkey` in config. |
+| **Federation replay protection** | Per-peer monotonic sequence numbers; receiver rejects `seq <= last_seen`. | Automatic with federation TLS. |
+| **Federation confidence cap** | Receiver clamps incoming `confidence` to a per-peer max (default 0.9) so a compromised peer can't overwrite truth-of-record. | `peers[].max_confidence_cap` in config. |
+| **OIDC JWKS verification** | Real RS256 / ES256 verification of JWTs against `discovery.jwks_uri`; caches the JWKS with TTL + refresh-on-`kid`-miss; multi-IdP routing by `iss`. | `oidc.providers[]` in config (Keycloak, Auth0, Okta, Azure AD). |
+| **Argon2id API key store** | OWASP-2023 floor (m=19 MiB, t=2, p=1), PHC strings, persisted to a separate `*-auth.duckdb` file with `last_used_at` + revoke. | `--bootstrap-admin-key` on first start, then `orp api-keys` subcommands. |
+| **Argon2id password hashing** | Same floor, fresh `OsRng` salt per call, PHC strings (no SHA-256 / no `thread_rng`). | Active when the user-management module is wired. |
+| **Signed audit log** | Every state change is Ed25519-signed and chained (each entry signs `prev_hash`); chain is replayed on startup; `audit verify` and `audit export` CLI subcommands let an external auditor prove tamper-evidence without ORP running. | Default on for persistent storage; `audit export --out audit.jsonl --public-key <hex>`. |
+| **SSRF defence** | Outbound HTTP from notification webhooks (Webhook/Slack/Telegram), HTTP poller, and OIDC discovery is gated by a validate-then-pin client (rejects loopback / RFC1918 / cloud-metadata addresses unless explicitly opted in). | Automatic; `allow_private_targets: true` per channel for legitimate localhost integrations. |
+| **WebSocket identity propagation** | JWT `sub` / `permissions` / `org_id` flow through every broadcast event; ABAC sees the real caller (no hardcoded `"ws-client"+["admin"]`). | Automatic when JWT or API-key auth is configured. |
+| **Notification circuit breaker** | Per-channel breaker after 5 consecutive failures (5 min cooldown) + ±25% retry jitter via `OsRng`. | Automatic; configurable per channel. |
+| **CSRF cookie** | OIDC CSRF state generated via `OsRng::fill_bytes(32)` → URL-safe base64 (~256 bits of entropy). | Active when OIDC is configured. |
+
+Closed in v0.3.0 (from the project's own audit reports):
+- ✅ Federation has TLS + payload integrity (was plain HTTP, no peer auth)
+- ✅ Inbound HTTP supports TLS (was `axum::serve` on plain TCP)
+- ✅ OIDC verifies external JWTs against the IdP's JWKS (was discovered-then-ignored)
+- ✅ Notifications no longer SSRF (was missing the guard `http_poller` got)
+- ✅ WebSocket no longer hands every JWT holder admin events (was discarding claims)
+- ✅ API keys + passwords use Argon2id (was unsalted SHA-256)
+
+Pending v0.4 hardening: at-rest encryption opt-in for DuckDB / RocksDB, persistent Ed25519 audit signing key (currently regenerated per process), CSRF cookie HMAC (currently unbounded length-extension surface), SMTP STARTTLS, sanctions list signature verification, FIPS-mode build, SBOM in CI.
+
+Full audit history: [docs/SECURITY.md](docs/SECURITY.md) · [docs/TLS.md](docs/TLS.md) · [docs/OIDC.md](docs/OIDC.md) · [docs/FEDERATION_TLS.md](docs/FEDERATION_TLS.md)
+
+---
+
 ## Protocol Support — at a Glance
 
-ORP speaks the languages your sensors already use. 34 protocol adapters across maritime (NMEA 0183, AIS, NMEA 2000, ACARS), aviation (ADS-B / Mode S, ASTERIX, GRIB), drone autonomy (MAVLink v2), military / tactical (CoT, STIX/TAXII, NFFI, CEF), industrial / IoT (OPC-UA, Modbus TCP/RTU, MQTT, SparkplugB, DNP3, CAN/J1939, BACnet, LoRaWAN), cyber / network (Syslog, PCAP, Zeek, NetFlow / IPFIX), weather / environment (METAR, CAP), transport (GTFS-RT), and a universal-ingest endpoint that accepts any JSON.
+ORP speaks the languages your sensors already use. **39 protocol adapters** across:
+
+- **Maritime** — NMEA 0183, AIS (msg types 1–5, 9, 18, 27), AISStream, NMEA 2000, ACARS
+- **Aviation** — ADS-B / Mode S, ASTERIX, GRIB (Section 7 unpacking incl. simple/grid/CCSDS), METAR
+- **Drone autonomy** — MAVLink v2 (heartbeat, global_position_int, attitude, status_text, battery, GPS_RAW)
+- **Space** — CCSDS + SGP4 (TLE-based orbit propagation)
+- **Military / tactical / ISR** — CoT (bidirectional, TAK Server compatible), STIX/TAXII, NFFI (STANAG 5527), CEF, MISB ST 0601 KLV (tags 1–25, video metadata)
+- **Industrial / IoT** — OPC-UA, Modbus TCP/RTU, MQTT, SparkplugB, DNP3, CAN/J1939, BACnet, LoRaWAN
+- **Cyber / network** — Syslog (RFC 3164/5424), PCAP, Zeek, NetFlow / IPFIX
+- **Streaming / messaging** — Apache Kafka (feature-gated), NATS / JetStream (feature-gated)
+- **Healthcare** — HL7 v2.5 over MLLP
+- **Civic / disaster** — CAP (Common Alerting Protocol), GTFS-RT
+- **Universal** — HTTP poller (with SSRF guard + DNS-rebinding pinning), WebSocket client, CSV watcher, Database tail, GeoJSON, generic JSON API
 
 Full per-protocol detail and status table → [docs/PROTOCOLS.md](docs/PROTOCOLS.md) *(generated from the adapters list — see also [crates/orp-connector/src/adapters/](crates/orp-connector/src/adapters/))*.
 
@@ -247,7 +296,7 @@ source ~/.cargo/env
 # 3. Clone and build
 git clone https://github.com/shieldofsteel/orp
 cd orp
-cargo test --workspace            # 1,122 tests
+cargo test --workspace            # 1,362 tests
 cargo build --release             # target/release/orp (~45 MB, statically linked)
 
 # 4. Cross-compile for Raspberry Pi (ARM64)
@@ -279,7 +328,7 @@ execution can't `sh`, `apt`, `curl`, etc.), and always runs as the pre-baked
 | Modern web UI | ❌ Android-first | ❌ | ✅ | **✅** |
 | Maritime domain | Minimal | Minimal | Limited | **First-class** |
 | Aviation domain | ❌ | ❌ | Limited | **✅ ADS-B, ASTERIX** |
-| Protocol parsers | CoT only | CoT only | Proprietary | **34 open adapters** |
+| Protocol parsers | CoT only | CoT only | Proprietary | **39 open adapters** |
 | Multi-tenant SaaS | ❌ | ❌ | ✅ | **✅** |
 | AI/anomaly detection | ❌ | ❌ | ✅ | **✅** |
 | Edge / Raspberry Pi | ❌ | ⚠️ | ❌ | **✅ 45MB, headless** |
@@ -294,8 +343,8 @@ execution can't `sh`, `apt`, `curl`, etc.), and always runs as the pre-baked
 ORP is early. The protocol universe is large. Help is welcome.
 
 **Highest-impact contributions:**
-1. **New protocol adapters** — See [docs/CONNECTOR_GUIDE.md](docs/CONNECTOR_GUIDE.md) — a basic adapter is ~50 lines of Rust. Wishlist: ROS 2 / DDS, IEC 61850, MISB ST 0601 KLV (started), Apache Kafka (started), ARINC 429, CCSDS (started), HL7/FHIR (started), SAE J2735.
-2. **Test coverage** — 1,122 tests is a start. More protocol parsing tests, more edge cases.
+1. **New protocol adapters** — See [docs/CONNECTOR_GUIDE.md](docs/CONNECTOR_GUIDE.md) — a basic adapter is ~50 lines of Rust. Wishlist: ROS 2 / DDS, IEC 61850, ARINC 429, SAE J2735, Link 16 (J-series via JREAP), STANAG 4586. *Already shipped: MISB ST 0601 KLV, Apache Kafka, NATS, CCSDS+SGP4, HL7 v2.5, MAVLink v2.*
+2. **Test coverage** — 1,362 tests and growing. More protocol parsing tests, more edge cases, more fuzz harnesses on parser adapters welcome.
 3. **Frontend features** — React/TypeScript. See [frontend/src/components/](frontend/src/components/).
 4. **Documentation** — real-world deployment guides, integration recipes.
 5. **Performance** — benchmarks, profiling, optimization.
