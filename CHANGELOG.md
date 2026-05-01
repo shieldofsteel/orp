@@ -33,6 +33,13 @@ This project follows [Semantic Versioning](https://semver.org/) and [Conventiona
 
 - **`crates/orp-security/src/classification.rs`** — multi-domain classification labels (`Level::U/CUI/NR/C/NC/S/NS/TS/CTS`) with full ordering, SCI compartments, dissemination controls (`NOFORN`, `REL TO …`), and NATO `ATOMAL`. CAPCO-format `banner()` for `X-Classification` headers, WS subprotocols, CLI. `Classification::dominates()` for ABAC clearance checks.
 
+### TAK Protocol v1 — first Rust implementation
+
+- **`crates/orp-tak`** — wire codec for TAK Protocol v1, the binary envelope ATAK / WinTAK / iTAK clients use to wrap CoT XML over UDP multicast (mesh) and TCP/TLS (stream). Reference impls are Python (`takproto`) and Go (`gotak`); this crate ports their framing layer to Rust. No first-class Rust TAK crate existed before.
+- **Wire formats** — Mesh `[0xBF, 0x01, 0xBF, <CoT XML>]` (UDP datagram-bounded) and Stream `[0xBF, varint(N), <CoT XML[N]>]` (length-prefixed for TCP). Encode + decode functions for both flavours, plus a `TakFrameKind::classify(buf)` dispatcher for adapters that accept both on the same port.
+- **Hardened** — `MAX_VARINT_BYTES=5` + `MAX_PAYLOAD_BYTES=1 MiB` ceilings reject hostile or runaway length prefixes before any allocation; partial reads return `PayloadTruncated` so callers can accumulate from a TCP socket and retry.
+- **20 unit tests + 2 doc tests** — varint round-trips, both framings happy/sad paths, two-frames-in-one-buffer parsing, oversize rejection, the 0x01-byte disambiguation case where mesh and stream framings collide on the third byte.
+
 ### Release supply-chain
 
 - **CycloneDX 1.5 SBOM in `release.yml`.** New `attest` job runs `cargo cyclonedx`, signs each artifact + SBOM with sigstore cosign keyless OIDC (Fulcio + Rekor), and uploads to the GitHub Release. Satisfies SLSA-3 provenance for federal RFPs.

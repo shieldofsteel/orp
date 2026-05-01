@@ -1,0 +1,15 @@
+[package]
+name = "orp-tak"
+version.workspace = true
+edition.workspace = true
+description = "TAK Protocol v1 (mesh + stream) wire codec — first Rust implementation."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+quick-xml = { version = "0.37", features = ["serialize"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

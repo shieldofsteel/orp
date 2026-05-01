@@ -12,6 +12,7 @@ members = [
     "crates/orp-proto",
     "crates/orp-geospatial",
     "crates/orp-security",
+    "crates/orp-tak",
     "crates/orp-testbed",
     "crates/orp-ml",
 ]
